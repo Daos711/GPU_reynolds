@@ -1,0 +1,6 @@
+"""Physics layer: stencil coefficient builders for different Reynolds equation variants."""
+
+from reynolds_solver.physics.standard import StandardReynolds
+from reynolds_solver.physics.standard_dynamic import StandardReynoldsDynamic
+
+__all__ = ["StandardReynolds", "StandardReynoldsDynamic"]
