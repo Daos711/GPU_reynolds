@@ -29,18 +29,17 @@ extern "C" __global__ void rb_sor_step(
     const int color
 )
 {
-    // j — индекс по φ (столбцы), i — индекс по Z (строки)
-    int j = blockIdx.x * blockDim.x + threadIdx.x + 1;   // от 1 до N_phi-2
-    int i = blockIdx.y * blockDim.y + threadIdx.y + 1;   // от 1 до N_Z-2
+    int j = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    int i = blockIdx.y * blockDim.y + threadIdx.y + 1;
 
     if (i >= N_Z - 1 || j >= N_phi - 1) return;
 
-    // Шахматная раскраска: пропускаем точки другого цвета
+    // checkerboard coloring: skip points of the other color
     if ((i + j) % 2 != color) return;
 
     int idx = i * N_phi + j;
 
-    // Соседи по φ с учётом периодичности
+    // periodic neighbors along phi
     int j_plus  = (j + 1 < N_phi - 1) ? j + 1 : 1;
     int j_minus = (j - 1 >= 1)        ? j - 1 : N_phi - 2;
 
@@ -52,13 +51,13 @@ extern "C" __global__ void rb_sor_step(
                   + D_arr[idx] * P[(i - 1) * N_phi + j]
                   - F_arr[idx]) / E_arr[idx];
 
-    // Условие кавитации
+    // cavitation condition
     if (P_new < 0.0) P_new = 0.0;
 
-    // SOR-релаксация
+    // SOR relaxation
     P[idx] = P_old + omega_sor * (P_new - P_old);
 
-    // Невязка (атомарная аккумуляция)
+    // residual (atomic accumulation)
     double diff = fabs(P[idx] - P_old);
     atomicAdd(&delta_arr[0], diff);
     atomicAdd(&delta_arr[1], fabs(P[idx]));
@@ -77,14 +76,14 @@ extern "C" __global__ void apply_bc(
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // Периодичность по φ: для каждой строки i
+    // periodic BC along phi: for each row i
     if (tid < N_Z) {
         int i = tid;
         P[i * N_phi + 0]           = P[i * N_phi + (N_phi - 2)];
         P[i * N_phi + (N_phi - 1)] = P[i * N_phi + 1];
     }
 
-    // Дирихле по Z: для каждого столбца j
+    // Dirichlet BC along Z: for each column j
     if (tid < N_phi) {
         int j = tid;
         P[0 * N_phi + j]           = 0.0;
