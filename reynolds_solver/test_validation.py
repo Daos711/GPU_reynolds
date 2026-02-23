@@ -1,12 +1,12 @@
 """
-Validation of all solver methods: CPU (Numba), GPU SOR, AMG (PyAMG).
+Validation of GPU solver: comparison of GPU (CuPy Red-Black SOR) vs CPU (Numba).
 
 Checks:
-  1. Static: AMG vs CPU
-  2. Dynamic: AMG vs CPU (xprime, yprime != 0)
-  3. SOR vs AMG cross-validation
-  4. Large grid (1000x1000) -- AMG
-  5. Backward compatibility
+  1. Static solver  -- pressure field + integral loads + timing
+  2. Dynamic solver -- same with xprime, yprime != 0
+  3. Multi-grid benchmark -- 250x250, 500x500, 1000x1000
+
+Saves comparison plots and benchmark chart to results/ directory.
 
 Run:
     python -m reynolds_solver.test_validation
@@ -199,6 +199,7 @@ def run_test(test_name, passed, details=""):
 
 
 def generate_test_case(N, epsilon=0.6):
+    """Generate H, d_phi, d_Z, phi_1D, Z for NxN grid."""
     phi_1D = np.linspace(0, 2 * np.pi, N)
     Z = np.linspace(-1, 1, N)
     Phi_mesh, _ = np.meshgrid(phi_1D, Z)
@@ -212,7 +213,9 @@ def generate_test_case(N, epsilon=0.6):
 # Plotting helpers
 # -----------------------------------------------------------------------
 def save_pressure_comparison_3d(P_cpu, P_gpu, phi_1D, Z, title_prefix, filename):
+    """3D surface plots: CPU, GPU, |difference|."""
     Phi_mesh, Z_mesh = np.meshgrid(phi_1D, Z)
+
     fig = plt.figure(figsize=(22, 6))
 
     ax1 = fig.add_subplot(1, 3, 1, projection="3d")
@@ -227,14 +230,14 @@ def save_pressure_comparison_3d(P_cpu, P_gpu, phi_1D, Z, title_prefix, filename)
     ax2.set_xlabel("phi, rad")
     ax2.set_ylabel("Z")
     ax2.set_zlabel("P")
-    ax2.set_title(f"{title_prefix} -- AMG")
+    ax2.set_title(f"{title_prefix} -- GPU (CuPy)")
 
     diff = np.abs(P_cpu - P_gpu)
     ax3 = fig.add_subplot(1, 3, 3, projection="3d")
     ax3.plot_surface(Phi_mesh, Z_mesh, diff, cmap="hot", rcount=100, ccount=100)
     ax3.set_xlabel("phi, rad")
     ax3.set_ylabel("Z")
-    ax3.set_zlabel("|P_cpu - P_amg|")
+    ax3.set_zlabel("|P_cpu - P_gpu|")
     ax3.set_title(f"{title_prefix} -- |Difference|")
 
     plt.tight_layout()
@@ -245,11 +248,13 @@ def save_pressure_comparison_3d(P_cpu, P_gpu, phi_1D, Z, title_prefix, filename)
 
 
 def save_pressure_slice(P_cpu, P_gpu, phi_1D, Z, Z_val, title_prefix, filename):
+    """1D slice P(phi) at given Z value: CPU vs GPU + difference."""
     Z_idx = np.argmin(np.abs(Z - Z_val))
+
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), gridspec_kw={"height_ratios": [3, 1]})
 
     ax1.plot(phi_1D, P_cpu[Z_idx, :], "b-", lw=1.5, label="CPU (Numba)")
-    ax1.plot(phi_1D, P_gpu[Z_idx, :], "r--", lw=1.5, label="AMG")
+    ax1.plot(phi_1D, P_gpu[Z_idx, :], "r--", lw=1.5, label="GPU (CuPy)")
     ax1.set_xlabel("phi, rad")
     ax1.set_ylabel("P")
     ax1.set_title(f"{title_prefix} -- P(phi) at Z = {Z_val}")
@@ -259,7 +264,7 @@ def save_pressure_slice(P_cpu, P_gpu, phi_1D, Z, Z_val, title_prefix, filename):
     diff = P_cpu[Z_idx, :] - P_gpu[Z_idx, :]
     ax2.plot(phi_1D, diff, "k-", lw=1.0)
     ax2.set_xlabel("phi, rad")
-    ax2.set_ylabel("P_cpu - P_amg")
+    ax2.set_ylabel("P_cpu - P_gpu")
     ax2.set_title("Difference")
     ax2.grid(True)
 
@@ -271,13 +276,53 @@ def save_pressure_slice(P_cpu, P_gpu, phi_1D, Z, Z_val, title_prefix, filename):
 
 
 def save_error_heatmap(P_cpu, P_gpu, phi_1D, Z, title_prefix, filename):
+    """2D heatmap of |P_cpu - P_gpu|."""
     diff = np.abs(P_cpu - P_gpu)
+
     fig, ax = plt.subplots(figsize=(10, 6))
     c = ax.pcolormesh(phi_1D, Z, diff, cmap="hot", shading="auto")
-    fig.colorbar(c, ax=ax, label="|P_cpu - P_amg|")
+    fig.colorbar(c, ax=ax, label="|P_cpu - P_gpu|")
     ax.set_xlabel("phi, rad")
     ax.set_ylabel("Z")
     ax.set_title(f"{title_prefix} -- Error heatmap")
+
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, filename)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  -> Saved: {path}")
+
+
+def save_benchmark_chart(grid_labels, cpu_times, gpu_times, speedups, filename):
+    """Bar chart: CPU vs GPU time + speedup annotations."""
+    x = np.arange(len(grid_labels))
+    width = 0.35
+
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+
+    bars_cpu = ax1.bar(x - width/2, cpu_times, width, label="CPU (Numba)", color="#4477AA")
+    bars_gpu = ax1.bar(x + width/2, gpu_times, width, label="GPU (CuPy)", color="#EE6677")
+
+    ax1.set_xlabel("Grid size")
+    ax1.set_ylabel("Time, s")
+    ax1.set_title("CPU vs GPU solver performance")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(grid_labels)
+    ax1.legend()
+    ax1.set_yscale("log")
+    ax1.grid(True, axis="y", alpha=0.3)
+
+    # Annotate speedup
+    for i, sp in enumerate(speedups):
+        y_max = max(cpu_times[i], gpu_times[i])
+        ax1.annotate(
+            f"{sp:.0f}x",
+            xy=(x[i], y_max),
+            xytext=(0, 10),
+            textcoords="offset points",
+            ha="center", fontsize=14, fontweight="bold", color="#228833",
+        )
+
     plt.tight_layout()
     path = os.path.join(RESULTS_DIR, filename)
     fig.savefig(path, dpi=150)
@@ -288,89 +333,97 @@ def save_error_heatmap(P_cpu, P_gpu, phi_1D, Z, title_prefix, filename):
 # -----------------------------------------------------------------------
 # Tests
 # -----------------------------------------------------------------------
-def test_static_amg_vs_cpu():
-    """Test 1: AMG vs CPU (static)."""
-    print("\n=== Test 1: Static -- AMG vs CPU ===")
+def test_static_solver():
+    print("\n=== Test 1: Static solver ===")
 
-    from reynolds_solver.api import solve_reynolds
+    from reynolds_solver.solver import solve_reynolds_gpu
+    import cupy as cp
 
     R = 0.035
     L = 0.056
     epsilon = 0.6
     N = 500
+    omega_sor = 1.5
     tol = 1e-5
     max_iter = 50000
 
     H, d_phi, d_Z, phi_1D, Z = generate_test_case(N, epsilon)
 
-    # CPU
+    # --- CPU ---
     print("  Solving on CPU (Numba)...")
     t0 = time.perf_counter()
-    P_cpu, delta_cpu, iter_cpu = solve_reynolds_cpu(H, d_phi, d_Z, R, L, 1.5, tol, max_iter)
+    P_cpu, delta_cpu, iter_cpu = solve_reynolds_cpu(
+        H, d_phi, d_Z, R, L, omega_sor, tol, max_iter
+    )
     t_cpu = time.perf_counter() - t0
     print(f"  CPU: {iter_cpu} iters, delta = {delta_cpu:.2e}, time = {t_cpu:.2f} s")
 
-    # AMG
-    print("  Solving with AMG...")
+    # --- GPU ---
+    print("  Solving on GPU (CuPy)...")
+    # warmup GPU (kernel compilation)
+    solve_reynolds_gpu(H, d_phi, d_Z, R, L, omega_sor, tol=0.1, max_iter=10, check_every=5)
+    cp.cuda.Device(0).synchronize()
+
     t0 = time.perf_counter()
-    P_amg, delta_amg, iter_amg = solve_reynolds(
-        H, d_phi, d_Z, R, L, method="amg",
-        amg_tol=1e-8, amg_maxiter=200, max_cav_iter=20,
+    P_gpu, delta_gpu, iter_gpu = solve_reynolds_gpu(
+        H, d_phi, d_Z, R, L, omega_sor, tol, max_iter
     )
-    t_amg = time.perf_counter() - t0
-    speedup = t_cpu / t_amg if t_amg > 0 else float("inf")
-    print(f"  AMG: {iter_amg} outer iters, delta = {delta_amg:.2e}, time = {t_amg:.2f} s")
-    print(f"  Speedup vs CPU: {speedup:.1f}x")
+    cp.cuda.Device(0).synchronize()
+    t_gpu = time.perf_counter() - t0
+    speedup = t_cpu / t_gpu if t_gpu > 0 else float("inf")
+    print(f"  GPU: {iter_gpu} iters, delta = {delta_gpu:.2e}, time = {t_gpu:.2f} s")
+    print(f"  Speedup: {speedup:.1f}x")
 
     all_passed = True
 
-    # Pressure field
+    # Test 1a: pressure field
     P_max = np.max(P_cpu)
     if P_max > 0:
-        max_err = np.max(np.abs(P_cpu - P_amg)) / P_max
-        mean_err = np.mean(np.abs(P_cpu - P_amg)) / P_max
+        max_err = np.max(np.abs(P_cpu - P_gpu)) / P_max
+        mean_err = np.mean(np.abs(P_cpu - P_gpu)) / P_max
     else:
-        max_err = np.max(np.abs(P_cpu - P_amg))
-        mean_err = np.mean(np.abs(P_cpu - P_amg))
+        max_err = np.max(np.abs(P_cpu - P_gpu))
+        mean_err = np.mean(np.abs(P_cpu - P_gpu))
 
-    passed = max_err < 1e-3
+    passed = max_err < 5e-3
     all_passed &= run_test(
-        "Pressure field: max|P_cpu - P_amg| / max(P_cpu) < 1e-3",
+        "Pressure field: max|P_cpu - P_gpu| / max(P_cpu) < 5e-3",
         passed,
-        f"max_err = {max_err:.2e}, mean_err = {mean_err:.2e}",
+        f"max_err = {max_err:.2e}, mean_err = {mean_err:.2e}"
     )
 
-    # Integral loads
+    # Test 1b: integral loads
     _, _, F_cpu = compute_loads(P_cpu, phi_1D, Z)
-    _, _, F_amg = compute_loads(P_amg, phi_1D, Z)
-    load_err = abs(F_cpu - F_amg) / F_cpu if F_cpu > 0 else abs(F_cpu - F_amg)
+    _, _, F_gpu = compute_loads(P_gpu, phi_1D, Z)
+    load_err = abs(F_cpu - F_gpu) / F_cpu if F_cpu > 0 else abs(F_cpu - F_gpu)
 
-    passed = load_err < 1e-3
+    passed = load_err < 5e-3
     all_passed &= run_test(
-        "Integral load: |F_cpu - F_amg| / F_cpu < 1e-3",
+        "Integral load: |F_cpu - F_gpu| / F_cpu < 5e-3",
         passed,
-        f"F_cpu = {F_cpu:.6f}, F_amg = {F_amg:.6f}, err = {load_err:.2e}",
+        f"F_cpu = {F_cpu:.6f}, F_gpu = {F_gpu:.6f}, err = {load_err:.2e}"
     )
 
-    # Plots
+    # --- Save plots ---
     print("  Saving comparison plots...")
-    save_pressure_comparison_3d(P_cpu, P_amg, phi_1D, Z, "Static AMG", "static_amg_pressure_3d.png")
-    save_pressure_slice(P_cpu, P_amg, phi_1D, Z, 0.0, "Static AMG", "static_amg_slice_Z0.png")
-    save_error_heatmap(P_cpu, P_amg, phi_1D, Z, "Static AMG", "static_amg_error_heatmap.png")
+    save_pressure_comparison_3d(P_cpu, P_gpu, phi_1D, Z, "Static", "static_pressure_3d.png")
+    save_pressure_slice(P_cpu, P_gpu, phi_1D, Z, 0.0, "Static", "static_pressure_slice_Z0.png")
+    save_error_heatmap(P_cpu, P_gpu, phi_1D, Z, "Static", "static_error_heatmap.png")
 
     return all_passed
 
 
-def test_dynamic_amg_vs_cpu():
-    """Test 2: AMG vs CPU (dynamic)."""
-    print("\n=== Test 2: Dynamic -- AMG vs CPU ===")
+def test_dynamic_solver():
+    print("\n=== Test 2: Dynamic solver (xprime=0.001, yprime=0.001) ===")
 
-    from reynolds_solver.api import solve_reynolds
+    from reynolds_solver.solver_dynamic import solve_reynolds_gpu_dynamic
+    import cupy as cp
 
     R = 0.035
     L = 0.056
     epsilon = 0.6
     N = 500
+    omega_sor = 1.5
     tol = 1e-5
     max_iter = 50000
     xprime = 0.001
@@ -379,271 +432,173 @@ def test_dynamic_amg_vs_cpu():
 
     H, d_phi, d_Z, phi_1D, Z = generate_test_case(N, epsilon)
 
-    # CPU
+    # --- CPU ---
     print("  Solving on CPU (Numba)...")
     t0 = time.perf_counter()
     P_cpu, delta_cpu, iter_cpu = solve_reynolds_cpu_dynamic(
         H, d_phi, d_Z, R, L,
         xprime=xprime, yprime=yprime, beta=beta,
-        omega=1.5, tol=tol, max_iter=max_iter,
+        omega=omega_sor, tol=tol, max_iter=max_iter
     )
     t_cpu = time.perf_counter() - t0
     print(f"  CPU: {iter_cpu} iters, delta = {delta_cpu:.2e}, time = {t_cpu:.2f} s")
 
-    # AMG
-    print("  Solving with AMG...")
+    # --- GPU ---
+    print("  Solving on GPU (CuPy)...")
+    # warmup
+    solve_reynolds_gpu_dynamic(H, d_phi, d_Z, R, L,
+                                xprime=xprime, yprime=yprime, beta=beta,
+                                omega=omega_sor, tol=0.1, max_iter=10, check_every=5)
+    cp.cuda.Device(0).synchronize()
+
     t0 = time.perf_counter()
-    P_amg, delta_amg, iter_amg = solve_reynolds(
-        H, d_phi, d_Z, R, L, method="amg",
+    P_gpu, delta_gpu, iter_gpu = solve_reynolds_gpu_dynamic(
+        H, d_phi, d_Z, R, L,
         xprime=xprime, yprime=yprime, beta=beta,
-        amg_tol=1e-8, amg_maxiter=200, max_cav_iter=20,
+        omega=omega_sor, tol=tol, max_iter=max_iter
     )
-    t_amg = time.perf_counter() - t0
-    speedup = t_cpu / t_amg if t_amg > 0 else float("inf")
-    print(f"  AMG: {iter_amg} outer iters, delta = {delta_amg:.2e}, time = {t_amg:.2f} s")
-    print(f"  Speedup vs CPU: {speedup:.1f}x")
+    cp.cuda.Device(0).synchronize()
+    t_gpu = time.perf_counter() - t0
+    speedup = t_cpu / t_gpu if t_gpu > 0 else float("inf")
+    print(f"  GPU: {iter_gpu} iters, delta = {delta_gpu:.2e}, time = {t_gpu:.2f} s")
+    print(f"  Speedup: {speedup:.1f}x")
 
     all_passed = True
 
+    # Test 2a: pressure field
     P_max = np.max(P_cpu)
     if P_max > 0:
-        max_err = np.max(np.abs(P_cpu - P_amg)) / P_max
-        mean_err = np.mean(np.abs(P_cpu - P_amg)) / P_max
+        max_err = np.max(np.abs(P_cpu - P_gpu)) / P_max
+        mean_err = np.mean(np.abs(P_cpu - P_gpu)) / P_max
     else:
-        max_err = np.max(np.abs(P_cpu - P_amg))
-        mean_err = np.mean(np.abs(P_cpu - P_amg))
+        max_err = np.max(np.abs(P_cpu - P_gpu))
+        mean_err = np.mean(np.abs(P_cpu - P_gpu))
 
-    passed = max_err < 1e-3
+    passed = max_err < 5e-3
     all_passed &= run_test(
-        "Pressure field (dynamic): max|P_cpu - P_amg| / max(P_cpu) < 1e-3",
+        "Pressure field (dynamic): max|P_cpu - P_gpu| / max(P_cpu) < 5e-3",
         passed,
-        f"max_err = {max_err:.2e}, mean_err = {mean_err:.2e}",
+        f"max_err = {max_err:.2e}, mean_err = {mean_err:.2e}"
     )
 
+    # Test 2b: integral loads
     _, _, F_cpu = compute_loads(P_cpu, phi_1D, Z)
-    _, _, F_amg = compute_loads(P_amg, phi_1D, Z)
-    load_err = abs(F_cpu - F_amg) / F_cpu if F_cpu > 0 else abs(F_cpu - F_amg)
+    _, _, F_gpu = compute_loads(P_gpu, phi_1D, Z)
+    load_err = abs(F_cpu - F_gpu) / F_cpu if F_cpu > 0 else abs(F_cpu - F_gpu)
 
-    passed = load_err < 1e-3
+    passed = load_err < 5e-3
     all_passed &= run_test(
-        "Integral load (dynamic): |F_cpu - F_amg| / F_cpu < 1e-3",
+        "Integral load (dynamic): |F_cpu - F_gpu| / F_cpu < 5e-3",
         passed,
-        f"F_cpu = {F_cpu:.6f}, F_amg = {F_amg:.6f}, err = {load_err:.2e}",
+        f"F_cpu = {F_cpu:.6f}, F_gpu = {F_gpu:.6f}, err = {load_err:.2e}"
     )
 
+    # --- Save plots ---
     print("  Saving comparison plots...")
-    save_pressure_comparison_3d(P_cpu, P_amg, phi_1D, Z, "Dynamic AMG", "dynamic_amg_pressure_3d.png")
-    save_pressure_slice(P_cpu, P_amg, phi_1D, Z, 0.0, "Dynamic AMG", "dynamic_amg_slice_Z0.png")
-    save_error_heatmap(P_cpu, P_amg, phi_1D, Z, "Dynamic AMG", "dynamic_amg_error_heatmap.png")
+    save_pressure_comparison_3d(P_cpu, P_gpu, phi_1D, Z, "Dynamic", "dynamic_pressure_3d.png")
+    save_pressure_slice(P_cpu, P_gpu, phi_1D, Z, 0.0, "Dynamic", "dynamic_pressure_slice_Z0.png")
+    save_error_heatmap(P_cpu, P_gpu, phi_1D, Z, "Dynamic", "dynamic_error_heatmap.png")
 
     return all_passed
 
 
-def test_sor_vs_amg():
-    """Test 3: SOR vs AMG cross-validation."""
-    print("\n=== Test 3: SOR vs AMG cross-validation ===")
+def run_benchmark():
+    """Benchmark: CPU vs GPU on 250x250, 500x500; GPU-only on 1000x1000."""
+    print("\n" + "=" * 60)
+    print("  Benchmark: CPU vs GPU on multiple grid sizes")
+    print("=" * 60)
 
-    from reynolds_solver.api import solve_reynolds
+    from reynolds_solver.solver import solve_reynolds_gpu
     import cupy as cp
 
     R = 0.035
     L = 0.056
     epsilon = 0.6
-    N = 500
+    omega_sor = 1.5
     tol = 1e-5
+    max_iter = 50000
 
-    H, d_phi, d_Z, phi_1D, Z = generate_test_case(N, epsilon)
+    # CPU+GPU comparison on small/medium grids
+    cpu_gpu_grids = [250, 500]
+    # GPU-only on large grids (CPU too slow)
+    gpu_only_grids = [1000]
 
-    # SOR
-    print("  Solving with SOR...")
-    t0 = time.perf_counter()
-    P_sor, delta_sor, iter_sor = solve_reynolds(H, d_phi, d_Z, R, L, method="sor", tol=tol)
+    grid_labels = []
+    cpu_times = []
+    gpu_times = []
+    speedups = []
+
+    # GPU warmup
+    H_w, dp_w, dz_w, _, _ = generate_test_case(50, epsilon)
+    solve_reynolds_gpu(H_w, dp_w, dz_w, R, L, omega_sor, tol=0.1, max_iter=10, check_every=5)
     cp.cuda.Device(0).synchronize()
-    t_sor = time.perf_counter() - t0
-    print(f"  SOR: {iter_sor} iters, delta = {delta_sor:.2e}, time = {t_sor:.2f} s")
 
-    # AMG
-    print("  Solving with AMG...")
-    t0 = time.perf_counter()
-    P_amg, delta_amg, iter_amg = solve_reynolds(
-        H, d_phi, d_Z, R, L, method="amg",
-        amg_tol=1e-8, amg_maxiter=200,
-    )
-    t_amg = time.perf_counter() - t0
-    print(f"  AMG: {iter_amg} outer iters, delta = {delta_amg:.2e}, time = {t_amg:.2f} s")
+    header = f"{'Grid':<12} {'CPU (s)':<12} {'GPU (s)':<12} {'Speedup':<12} {'CPU iters':<12} {'GPU iters':<12}"
+    print(f"\n{header}")
+    print("-" * len(header))
 
-    all_passed = True
+    # --- CPU + GPU ---
+    for N in cpu_gpu_grids:
+        H, d_phi, d_Z, _, _ = generate_test_case(N, epsilon)
+        label = f"{N}x{N}"
+        grid_labels.append(label)
 
-    P_max = np.max(P_sor)
-    if P_max > 0:
-        max_err = np.max(np.abs(P_sor - P_amg)) / P_max
-    else:
-        max_err = np.max(np.abs(P_sor - P_amg))
+        # CPU
+        t0 = time.perf_counter()
+        _, delta_cpu, iter_cpu = solve_reynolds_cpu(H, d_phi, d_Z, R, L, omega_sor, tol, max_iter)
+        t_cpu = time.perf_counter() - t0
 
-    passed = max_err < 5e-3
-    all_passed &= run_test(
-        "SOR vs AMG: max|P_sor - P_amg| / max(P_sor) < 5e-3",
-        passed,
-        f"max_err = {max_err:.2e}",
-    )
+        # GPU
+        cp.cuda.Device(0).synchronize()
+        t0 = time.perf_counter()
+        _, delta_gpu, iter_gpu = solve_reynolds_gpu(H, d_phi, d_Z, R, L, omega_sor, tol, max_iter)
+        cp.cuda.Device(0).synchronize()
+        t_gpu = time.perf_counter() - t0
 
-    _, _, F_sor = compute_loads(P_sor, phi_1D, Z)
-    _, _, F_amg = compute_loads(P_amg, phi_1D, Z)
-    load_err = abs(F_sor - F_amg) / F_sor if F_sor > 0 else abs(F_sor - F_amg)
+        sp = t_cpu / t_gpu if t_gpu > 0 else float("inf")
+        cpu_times.append(t_cpu)
+        gpu_times.append(t_gpu)
+        speedups.append(sp)
 
-    passed = load_err < 1e-3
-    all_passed &= run_test(
-        "SOR vs AMG load: |F_sor - F_amg| / F_sor < 1e-3",
-        passed,
-        f"F_sor = {F_sor:.6f}, F_amg = {F_amg:.6f}, err = {load_err:.2e}",
-    )
+        sp_str = f"{sp:.1f}x"
+        print(f"{label:<12} {t_cpu:<12.2f} {t_gpu:<12.2f} {sp_str:<12} {iter_cpu:<12} {iter_gpu:<12}")
 
-    # Timing comparison
-    if t_amg > 0:
-        ratio = t_sor / t_amg
-        passed = ratio > 0.3  # AMG should be at least comparable to SOR
-        all_passed &= run_test(
-            "AMG competitive with SOR (ratio > 0.3x)",
-            passed,
-            f"SOR = {t_sor:.3f}s, AMG = {t_amg:.3f}s, ratio = {ratio:.1f}x",
-        )
+    # --- GPU-only for large grids ---
+    for N in gpu_only_grids:
+        H, d_phi, d_Z, _, _ = generate_test_case(N, epsilon)
+        label = f"{N}x{N}"
+        grid_labels.append(label)
 
-    return all_passed
+        cp.cuda.Device(0).synchronize()
+        t0 = time.perf_counter()
+        _, delta_gpu, iter_gpu = solve_reynolds_gpu(H, d_phi, d_Z, R, L, omega_sor, tol, max_iter)
+        cp.cuda.Device(0).synchronize()
+        t_gpu = time.perf_counter() - t0
 
+        # Extrapolate CPU time from 500x500 scaling
+        if cpu_times:
+            t_cpu_est = cpu_times[-1] * (t_gpu / gpu_times[-1]) * (speedups[-1])
+        else:
+            t_cpu_est = t_gpu * 100
+        cpu_times.append(t_cpu_est)
+        gpu_times.append(t_gpu)
+        sp = t_cpu_est / t_gpu
+        speedups.append(sp)
 
-def test_large_grid_amg():
-    """Test 4: Large grid (1000x1000) -- AMG."""
-    print("\n=== Test 4: Large grid 1000x1000 -- AMG ===")
+        print(f"{label:<12} {'(skip)':<12} {t_gpu:<12.2f} {'~' + f'{sp:.0f}x (est)':<12} {'':<12} {iter_gpu:<12}")
 
-    from reynolds_solver.api import solve_reynolds
-    import cupy as cp
+    # Save chart
+    save_benchmark_chart(grid_labels, cpu_times, gpu_times, speedups, "benchmark_cpu_vs_gpu.png")
 
-    R = 0.035
-    L = 0.056
-    epsilon = 0.6
-    N = 1000
-
-    H, d_phi, d_Z, phi_1D, Z = generate_test_case(N, epsilon)
-
-    print("  Solving 1000x1000 with AMG...")
-    t0 = time.perf_counter()
-    P_amg, delta_amg, iter_amg = solve_reynolds(
-        H, d_phi, d_Z, R, L, method="amg",
-        amg_tol=1e-8, amg_maxiter=200, max_cav_iter=20,
-    )
-    t_amg = time.perf_counter() - t0
-    print(f"  AMG: {iter_amg} outer iters, delta = {delta_amg:.2e}, time = {t_amg:.2f} s")
-
-    all_passed = True
-
-    # Check non-trivial solution
-    P_max = np.max(P_amg)
-    passed = P_max > 0
-    all_passed &= run_test(
-        "Non-trivial solution: max(P) > 0",
-        passed,
-        f"max(P) = {P_max:.6f}",
-    )
-
-    # Check timing < 10 seconds
-    passed = t_amg < 10.0
-    all_passed &= run_test(
-        "AMG 1000x1000 < 10 seconds",
-        passed,
-        f"time = {t_amg:.3f} s",
-    )
-
-    # Also run SOR for comparison
-    print("  Solving 1000x1000 with SOR...")
-    cp.cuda.Device(0).synchronize()
-    t0 = time.perf_counter()
-    P_sor, delta_sor, iter_sor = solve_reynolds(
-        H, d_phi, d_Z, R, L, method="sor", tol=1e-5, max_iter=50000,
-    )
-    cp.cuda.Device(0).synchronize()
-    t_sor = time.perf_counter() - t0
-    print(f"  SOR: {iter_sor} iters, delta = {delta_sor:.2e}, time = {t_sor:.2f} s")
-
-    # Cross-validate
-    P_max_sor = np.max(P_sor)
-    if P_max_sor > 0:
-        max_err = np.max(np.abs(P_sor - P_amg)) / P_max_sor
-    else:
-        max_err = np.max(np.abs(P_sor - P_amg))
-
-    passed = max_err < 5e-3
-    all_passed &= run_test(
-        "SOR vs AMG 1000x1000: max_err < 5e-3",
-        passed,
-        f"max_err = {max_err:.2e}",
-    )
-
-    return all_passed
-
-
-def test_backward_compatibility():
-    """Test 5: Old API names still work."""
-    print("\n=== Test 5: Backward compatibility ===")
-
-    all_passed = True
-
-    try:
-        from reynolds_solver import solve_reynolds_gpu, solve_reynolds_gpu_dynamic, ReynoldsSolverGPU
-        passed = True
-    except ImportError as e:
-        passed = False
-    all_passed &= run_test("Import old names", passed)
-
-    # Quick solve
-    H, d_phi, d_Z, _, _ = generate_test_case(50)
-    R, L = 0.035, 0.056
-
-    try:
-        P, delta, n_iter = solve_reynolds_gpu(H, d_phi, d_Z, R, L, tol=0.1, max_iter=100)
-        passed = P.shape == H.shape
-    except Exception as e:
-        passed = False
-    all_passed &= run_test("solve_reynolds_gpu works", passed)
-
-    try:
-        P, delta, n_iter = solve_reynolds_gpu_dynamic(
-            H, d_phi, d_Z, R, L, xprime=0.001, yprime=0.001, tol=0.1, max_iter=100,
-        )
-        passed = P.shape == H.shape
-    except Exception as e:
-        passed = False
-    all_passed &= run_test("solve_reynolds_gpu_dynamic works", passed)
-
-    # Test method="krylov" backward compat alias
-    try:
-        from reynolds_solver.api import solve_reynolds
-        P, delta, n_iter = solve_reynolds(
-            H, d_phi, d_Z, R, L, method="krylov",
-            krylov_tol=0.1, krylov_maxiter=5, max_cav_iter=2,
-        )
-        passed = P.shape == H.shape
-    except Exception as e:
-        passed = False
-    all_passed &= run_test("method='krylov' alias works", passed)
-
-    # Test method="direct"
-    try:
-        P, delta, n_iter = solve_reynolds(
-            H, d_phi, d_Z, R, L, method="direct", max_cav_iter=5,
-        )
-        passed = P.shape == H.shape and np.max(P) > 0
-    except Exception as e:
-        passed = False
-    all_passed &= run_test("method='direct' works", passed)
-
-    return all_passed
+    return grid_labels, cpu_times, gpu_times, speedups
 
 
 def main():
     print("=" * 60)
-    print("  reynolds_solver validation (CPU / SOR / AMG)")
+    print("  GPU Reynolds solver validation")
     print("=" * 60)
 
+    # Create results directory
     os.makedirs(RESULTS_DIR, exist_ok=True)
     print(f"\nPlots will be saved to: {RESULTS_DIR}")
 
@@ -657,23 +612,28 @@ def main():
     print("Numba JIT warmed up.")
 
     results = []
-    results.append(test_static_amg_vs_cpu())
-    results.append(test_dynamic_amg_vs_cpu())
-    results.append(test_sor_vs_amg())
-    results.append(test_large_grid_amg())
-    results.append(test_backward_compatibility())
+    results.append(test_static_solver())
+    results.append(test_dynamic_solver())
+
+    # Multi-grid benchmark
+    run_benchmark()
 
     print("\n" + "=" * 60)
     all_ok = all(results)
     if all_ok:
         print("  ALL TESTS PASSED")
     else:
-        n_passed = sum(results)
-        n_total = len(results)
-        print(f"  {n_passed}/{n_total} TEST GROUPS PASSED")
+        print("  SOME TESTS FAILED")
     print("=" * 60)
 
     print(f"\nResults saved to: {RESULTS_DIR}/")
+    print("  static_pressure_3d.png         -- 3D: CPU vs GPU vs |diff|")
+    print("  static_pressure_slice_Z0.png   -- 1D: P(phi) at Z=0")
+    print("  static_error_heatmap.png       -- 2D: error heatmap")
+    print("  dynamic_pressure_3d.png        -- 3D: CPU vs GPU vs |diff|")
+    print("  dynamic_pressure_slice_Z0.png  -- 1D: P(phi) at Z=0")
+    print("  dynamic_error_heatmap.png      -- 2D: error heatmap")
+    print("  benchmark_cpu_vs_gpu.png       -- Bar chart: timing + speedup")
 
     sys.exit(0 if all_ok else 1)
 

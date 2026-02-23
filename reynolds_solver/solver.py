@@ -1,17 +1,16 @@
 """
-Red-Black SOR solver -- wrapper around existing CuPy RawKernel code.
+GPU solver for the Reynolds equation (static version).
 
-Provides:
-  - ReynoldsSolverGPU: class with cached GPU buffers
-  - solve_reynolds_sor: stateless static solver
-  - solve_reynolds_sor_dynamic: stateless dynamic solver
+Method: Red-Black SOR (Successive Over-Relaxation) via CuPy RawKernel.
+Residual computed on host side via CuPy array ops every check_every iterations.
+Caches GPU buffers between calls with the same grid size.
 """
 
 import numpy as np
 import cupy as cp
 
 from reynolds_solver.kernels import get_rb_sor_kernel, get_apply_bc_kernel
-from reynolds_solver.utils import precompute_coefficients_gpu, add_dynamic_rhs_gpu
+from reynolds_solver.utils import precompute_coefficients_gpu
 
 
 class ReynoldsSolverGPU:
@@ -103,6 +102,19 @@ class ReynoldsSolverGPU:
         """
         Solve the static Reynolds equation on GPU.
 
+        Parameters
+        ----------
+        H : np.ndarray, shape (N_Z, N_phi), float64
+        d_phi, d_Z : float
+        R, L : float
+        omega : float
+            SOR relaxation parameter (1.0-1.9).
+        tol : float
+            Convergence criterion (relative residual).
+        max_iter : int
+        check_every : int
+            How often to check convergence (iterations).
+
         Returns
         -------
         P : np.ndarray, shape (N_Z, N_phi), float64
@@ -113,9 +125,11 @@ class ReynoldsSolverGPU:
         assert N_Z == self.N_Z and N_phi == self.N_phi, \
             f"Grid size mismatch: solver ({self.N_Z}x{self.N_phi}) vs input ({N_Z}x{N_phi})"
 
+        # 1. Transfer H to GPU and precompute coefficients
         H_gpu = cp.asarray(H, dtype=cp.float64)
         A, B, C, D, E, F = precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L)
 
+        # Copy into cached buffers
         self._A[:] = A
         self._B[:] = B
         self._C[:] = C
@@ -124,26 +138,32 @@ class ReynoldsSolverGPU:
         self._F[:] = F
         self._P[:] = 0.0
 
+        # 2. Get compiled kernels
         sor_kernel = get_rb_sor_kernel()
         bc_kernel = get_apply_bc_kernel()
 
+        # 3. Iterative Red-Black SOR loop
         delta = 1.0
         iteration = 0
 
         while iteration < max_iter:
             need_check = ((iteration + 1) % check_every == 0) or (iteration == 0)
 
+            # Save P before iterations if we need to check residual
             if need_check:
                 self._P_old[:] = self._P
 
+            # Run SOR iteration (no atomicAdd — pure update)
             self._run_sor_iteration(sor_kernel, bc_kernel, N_Z, N_phi, omega)
             iteration += 1
 
+            # Compute residual via CuPy array ops
             if need_check:
                 delta = self._compute_residual()
                 if delta < tol:
                     break
 
+        # 4. Transfer result to CPU
         P_cpu = cp.asnumpy(self._P)
         return P_cpu, float(delta), iteration
 
@@ -165,7 +185,7 @@ class ReynoldsSolverGPU:
         Internal method: solve with pre-computed coefficients on GPU.
         Used by the dynamic solver variant.
 
-        Returns (P_gpu, delta, n_iter) -- P stays on GPU.
+        Returns (P_gpu, delta, n_iter) — P stays on GPU.
         """
         N_Z, N_phi = self.N_Z, self.N_phi
 
@@ -214,7 +234,7 @@ def _get_solver(N_Z: int, N_phi: int) -> ReynoldsSolverGPU:
     return _solver_cache[key]
 
 
-def solve_reynolds_sor(
+def solve_reynolds_gpu(
     H: np.ndarray,
     d_phi: float,
     d_Z: float,
@@ -226,7 +246,19 @@ def solve_reynolds_sor(
     check_every: int = 500,
 ) -> tuple:
     """
-    Solve the static Reynolds equation on GPU via Red-Black SOR.
+    Drop-in replacement for solve_reynolds_gauss_seidel_numba().
+
+    Solves the static Reynolds equation on GPU via Red-Black SOR.
+
+    Parameters
+    ----------
+    H : np.ndarray, shape (N_Z, N_phi), float64
+    d_phi, d_Z : float
+    R, L : float
+    omega : float
+    tol : float
+    max_iter : int
+    check_every : int
 
     Returns
     -------
@@ -237,43 +269,3 @@ def solve_reynolds_sor(
     N_Z, N_phi = H.shape
     solver = _get_solver(N_Z, N_phi)
     return solver.solve(H, d_phi, d_Z, R, L, omega, tol, max_iter, check_every)
-
-
-def solve_reynolds_sor_dynamic(
-    H: np.ndarray,
-    d_phi: float,
-    d_Z: float,
-    R: float,
-    L: float,
-    xprime: float = 0.0,
-    yprime: float = 0.0,
-    beta: float = 2.0,
-    omega: float = 1.5,
-    tol: float = 1e-5,
-    max_iter: int = 50000,
-    check_every: int = 500,
-) -> tuple:
-    """
-    Solve the dynamic Reynolds equation on GPU via Red-Black SOR.
-
-    Returns
-    -------
-    P : np.ndarray, shape (N_Z, N_phi), float64
-    delta : float
-    n_iter : int
-    """
-    N_Z, N_phi = H.shape
-    solver = _get_solver(N_Z, N_phi)
-
-    H_gpu = cp.asarray(H, dtype=cp.float64)
-    A, B, C, D, E, F_full = precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L)
-
-    add_dynamic_rhs_gpu(F_full, d_phi, N_Z, N_phi, xprime, yprime, beta)
-
-    P_gpu, delta, n_iter = solver.solve_with_rhs(
-        H_gpu, F_full, A, B, C, D, E,
-        omega=omega, tol=tol, max_iter=max_iter, check_every=check_every,
-    )
-
-    P_cpu = cp.asnumpy(P_gpu)
-    return P_cpu, delta, n_iter
