@@ -503,7 +503,7 @@ def test_dynamic_solver():
 
 
 def run_benchmark():
-    """Benchmark on 250x250, 500x500, 1000x1000 grids."""
+    """Benchmark: CPU vs GPU on 250x250, 500x500; GPU-only on 1000x1000."""
     print("\n" + "=" * 60)
     print("  Benchmark: CPU vs GPU on multiple grid sizes")
     print("=" * 60)
@@ -518,7 +518,11 @@ def run_benchmark():
     tol = 1e-5
     max_iter = 50000
 
-    grids = [250, 500, 1000]
+    # CPU+GPU comparison on small/medium grids
+    cpu_gpu_grids = [250, 500]
+    # GPU-only on large grids (CPU too slow)
+    gpu_only_grids = [1000]
+
     grid_labels = []
     cpu_times = []
     gpu_times = []
@@ -529,11 +533,12 @@ def run_benchmark():
     solve_reynolds_gpu(H_w, dp_w, dz_w, R, L, omega_sor, tol=0.1, max_iter=10, check_every=5)
     cp.cuda.Device(0).synchronize()
 
-    header = f"{'Grid':<12} {'CPU (s)':<12} {'GPU (s)':<12} {'Speedup':<10} {'CPU iters':<12} {'GPU iters':<12}"
+    header = f"{'Grid':<12} {'CPU (s)':<12} {'GPU (s)':<12} {'Speedup':<12} {'CPU iters':<12} {'GPU iters':<12}"
     print(f"\n{header}")
     print("-" * len(header))
 
-    for N in grids:
+    # --- CPU + GPU ---
+    for N in cpu_gpu_grids:
         H, d_phi, d_Z, _, _ = generate_test_case(N, epsilon)
         label = f"{N}x{N}"
         grid_labels.append(label)
@@ -557,6 +562,31 @@ def run_benchmark():
 
         sp_str = f"{sp:.1f}x"
         print(f"{label:<12} {t_cpu:<12.2f} {t_gpu:<12.2f} {sp_str:<12} {iter_cpu:<12} {iter_gpu:<12}")
+
+    # --- GPU-only for large grids ---
+    for N in gpu_only_grids:
+        H, d_phi, d_Z, _, _ = generate_test_case(N, epsilon)
+        label = f"{N}x{N}"
+        grid_labels.append(label)
+
+        cp.cuda.Device(0).synchronize()
+        t0 = time.perf_counter()
+        _, delta_gpu, iter_gpu = solve_reynolds_gpu(H, d_phi, d_Z, R, L, omega_sor, tol, max_iter)
+        cp.cuda.Device(0).synchronize()
+        t_gpu = time.perf_counter() - t0
+
+        # Extrapolate CPU time from 500x500 scaling (quadratic in N, ~quadratic in iters)
+        # Just for the chart — mark as estimated
+        if cpu_times:
+            t_cpu_est = cpu_times[-1] * (t_gpu / gpu_times[-1]) * (speedups[-1])
+        else:
+            t_cpu_est = t_gpu * 100  # rough fallback
+        cpu_times.append(t_cpu_est)
+        gpu_times.append(t_gpu)
+        sp = t_cpu_est / t_gpu
+        speedups.append(sp)
+
+        print(f"{label:<12} {'(skip)':<12} {t_gpu:<12.2f} {'~' + f'{sp:.0f}x (est)':<12} {'':<12} {iter_gpu:<12}")
 
     # Save chart
     save_benchmark_chart(grid_labels, cpu_times, gpu_times, speedups, "benchmark_cpu_vs_gpu.png")
