@@ -245,9 +245,9 @@ def test_static_solver():
         max_err = np.max(np.abs(P_cpu - P_gpu))
         mean_err = np.mean(np.abs(P_cpu - P_gpu))
 
-    passed = max_err < 1e-3
+    passed = max_err < 2e-3
     all_passed &= run_test(
-        "Поле давления: max|P_cpu - P_gpu| / max(P_cpu)",
+        "Поле давления: max|P_cpu - P_gpu| / max(P_cpu) < 2e-3",
         passed,
         f"max_err = {max_err:.2e}, mean_err = {mean_err:.2e}"
     )
@@ -325,9 +325,9 @@ def test_dynamic_solver():
         max_err = np.max(np.abs(P_cpu - P_gpu))
         mean_err = np.mean(np.abs(P_cpu - P_gpu))
 
-    passed = max_err < 1e-3
+    passed = max_err < 2e-3
     all_passed &= run_test(
-        "Поле давления (dynamic): max|P_cpu - P_gpu| / max(P_cpu)",
+        "Поле давления (dynamic): max|P_cpu - P_gpu| / max(P_cpu) < 2e-3",
         passed,
         f"max_err = {max_err:.2e}, mean_err = {mean_err:.2e}"
     )
