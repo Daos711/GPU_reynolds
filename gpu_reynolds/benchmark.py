@@ -156,7 +156,7 @@ def run_benchmark():
                 cp.cuda.Device(0).synchronize()
                 t0 = time.perf_counter()
                 P_gpu, gpu_delta, gpu_iters = solve_reynolds_gpu(
-                    H, d_phi, d_Z, R, L, omega_sor, tol, max_iter, check_every=100
+                    H, d_phi, d_Z, R, L, omega_sor, tol, max_iter
                 )
                 cp.cuda.Device(0).synchronize()
                 t1 = time.perf_counter()

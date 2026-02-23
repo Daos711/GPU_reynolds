@@ -4,8 +4,9 @@ Validation of GPU solver: comparison of GPU (CuPy Red-Black SOR) vs CPU (Numba).
 Checks:
   1. Static solver  -- pressure field + integral loads + timing
   2. Dynamic solver -- same with xprime, yprime != 0
+  3. Multi-grid benchmark -- 250x250, 500x500, 1000x1000
 
-Saves comparison plots to results/ directory.
+Saves comparison plots and benchmark chart to results/ directory.
 
 Run:
     python -m gpu_reynolds.test_validation
@@ -16,7 +17,7 @@ import sys
 import time
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")          # headless backend -- no GUI needed
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from numba import njit
 
@@ -197,6 +198,17 @@ def run_test(test_name, passed, details=""):
     return passed
 
 
+def generate_test_case(N, epsilon=0.6):
+    """Generate H, d_phi, d_Z, phi_1D, Z for NxN grid."""
+    phi_1D = np.linspace(0, 2 * np.pi, N)
+    Z = np.linspace(-1, 1, N)
+    Phi_mesh, _ = np.meshgrid(phi_1D, Z)
+    H = 1.0 + epsilon * np.cos(Phi_mesh)
+    d_phi = phi_1D[1] - phi_1D[0]
+    d_Z = Z[1] - Z[0]
+    return H, d_phi, d_Z, phi_1D, Z
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Plotting helpers
 # ───────────────────────────────────────────────────────────────────────────
@@ -281,6 +293,43 @@ def save_error_heatmap(P_cpu, P_gpu, phi_1D, Z, title_prefix, filename):
     print(f"  -> Saved: {path}")
 
 
+def save_benchmark_chart(grid_labels, cpu_times, gpu_times, speedups, filename):
+    """Bar chart: CPU vs GPU time + speedup annotations."""
+    x = np.arange(len(grid_labels))
+    width = 0.35
+
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+
+    bars_cpu = ax1.bar(x - width/2, cpu_times, width, label="CPU (Numba)", color="#4477AA")
+    bars_gpu = ax1.bar(x + width/2, gpu_times, width, label="GPU (CuPy)", color="#EE6677")
+
+    ax1.set_xlabel("Grid size")
+    ax1.set_ylabel("Time, s")
+    ax1.set_title("CPU vs GPU solver performance")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(grid_labels)
+    ax1.legend()
+    ax1.set_yscale("log")
+    ax1.grid(True, axis="y", alpha=0.3)
+
+    # Annotate speedup
+    for i, sp in enumerate(speedups):
+        y_max = max(cpu_times[i], gpu_times[i])
+        ax1.annotate(
+            f"{sp:.0f}x",
+            xy=(x[i], y_max),
+            xytext=(0, 10),
+            textcoords="offset points",
+            ha="center", fontsize=14, fontweight="bold", color="#228833",
+        )
+
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, filename)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  -> Saved: {path}")
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Tests
 # ───────────────────────────────────────────────────────────────────────────
@@ -293,17 +342,12 @@ def test_static_solver():
     R = 0.035
     L = 0.056
     epsilon = 0.6
-    N_Z, N_phi = 500, 500
+    N = 500
     omega_sor = 1.5
     tol = 1e-5
     max_iter = 50000
 
-    phi_1D = np.linspace(0, 2 * np.pi, N_phi)
-    Z = np.linspace(-1, 1, N_Z)
-    Phi_mesh, _ = np.meshgrid(phi_1D, Z)
-    H = 1.0 + epsilon * np.cos(Phi_mesh)
-    d_phi = phi_1D[1] - phi_1D[0]
-    d_Z = Z[1] - Z[0]
+    H, d_phi, d_Z, phi_1D, Z = generate_test_case(N, epsilon)
 
     # --- CPU ---
     print("  Solving on CPU (Numba)...")
@@ -322,7 +366,7 @@ def test_static_solver():
 
     t0 = time.perf_counter()
     P_gpu, delta_gpu, iter_gpu = solve_reynolds_gpu(
-        H, d_phi, d_Z, R, L, omega_sor, tol, max_iter, check_every=100
+        H, d_phi, d_Z, R, L, omega_sor, tol, max_iter
     )
     cp.cuda.Device(0).synchronize()
     t_gpu = time.perf_counter() - t0
@@ -378,7 +422,7 @@ def test_dynamic_solver():
     R = 0.035
     L = 0.056
     epsilon = 0.6
-    N_Z, N_phi = 500, 500
+    N = 500
     omega_sor = 1.5
     tol = 1e-5
     max_iter = 50000
@@ -386,12 +430,7 @@ def test_dynamic_solver():
     yprime = 0.001
     beta = 2.0
 
-    phi_1D = np.linspace(0, 2 * np.pi, N_phi)
-    Z = np.linspace(-1, 1, N_Z)
-    Phi_mesh, _ = np.meshgrid(phi_1D, Z)
-    H = 1.0 + epsilon * np.cos(Phi_mesh)
-    d_phi = phi_1D[1] - phi_1D[0]
-    d_Z = Z[1] - Z[0]
+    H, d_phi, d_Z, phi_1D, Z = generate_test_case(N, epsilon)
 
     # --- CPU ---
     print("  Solving on CPU (Numba)...")
@@ -416,7 +455,7 @@ def test_dynamic_solver():
     P_gpu, delta_gpu, iter_gpu = solve_reynolds_gpu_dynamic(
         H, d_phi, d_Z, R, L,
         xprime=xprime, yprime=yprime, beta=beta,
-        omega=omega_sor, tol=tol, max_iter=max_iter, check_every=100
+        omega=omega_sor, tol=tol, max_iter=max_iter
     )
     cp.cuda.Device(0).synchronize()
     t_gpu = time.perf_counter() - t0
@@ -463,6 +502,67 @@ def test_dynamic_solver():
     return all_passed
 
 
+def run_benchmark():
+    """Benchmark on 250x250, 500x500, 1000x1000 grids."""
+    print("\n" + "=" * 60)
+    print("  Benchmark: CPU vs GPU on multiple grid sizes")
+    print("=" * 60)
+
+    from gpu_reynolds.solver import solve_reynolds_gpu
+    import cupy as cp
+
+    R = 0.035
+    L = 0.056
+    epsilon = 0.6
+    omega_sor = 1.5
+    tol = 1e-5
+    max_iter = 50000
+
+    grids = [250, 500, 1000]
+    grid_labels = []
+    cpu_times = []
+    gpu_times = []
+    speedups = []
+
+    # GPU warmup
+    H_w, dp_w, dz_w, _, _ = generate_test_case(50, epsilon)
+    solve_reynolds_gpu(H_w, dp_w, dz_w, R, L, omega_sor, tol=0.1, max_iter=10, check_every=5)
+    cp.cuda.Device(0).synchronize()
+
+    header = f"{'Grid':<12} {'CPU (s)':<12} {'GPU (s)':<12} {'Speedup':<10} {'CPU iters':<12} {'GPU iters':<12}"
+    print(f"\n{header}")
+    print("-" * len(header))
+
+    for N in grids:
+        H, d_phi, d_Z, _, _ = generate_test_case(N, epsilon)
+        label = f"{N}x{N}"
+        grid_labels.append(label)
+
+        # CPU
+        t0 = time.perf_counter()
+        _, delta_cpu, iter_cpu = solve_reynolds_cpu(H, d_phi, d_Z, R, L, omega_sor, tol, max_iter)
+        t_cpu = time.perf_counter() - t0
+
+        # GPU
+        cp.cuda.Device(0).synchronize()
+        t0 = time.perf_counter()
+        _, delta_gpu, iter_gpu = solve_reynolds_gpu(H, d_phi, d_Z, R, L, omega_sor, tol, max_iter)
+        cp.cuda.Device(0).synchronize()
+        t_gpu = time.perf_counter() - t0
+
+        sp = t_cpu / t_gpu if t_gpu > 0 else float("inf")
+        cpu_times.append(t_cpu)
+        gpu_times.append(t_gpu)
+        speedups.append(sp)
+
+        print(f"{label:<12} {t_cpu:<12.2f} {t_gpu:<12.2f} {sp:<10.1f}x {iter_cpu:<12} {iter_gpu:<12}")
+
+    # Save chart
+    save_benchmark_chart(grid_labels, cpu_times, gpu_times, speedups, "benchmark_cpu_vs_gpu.png")
+
+    return grid_labels, cpu_times, gpu_times, speedups
+
+
 def main():
     print("=" * 60)
     print("  GPU Reynolds solver validation")
@@ -485,6 +585,9 @@ def main():
     results.append(test_static_solver())
     results.append(test_dynamic_solver())
 
+    # Multi-grid benchmark
+    run_benchmark()
+
     print("\n" + "=" * 60)
     all_ok = all(results)
     if all_ok:
@@ -500,6 +603,7 @@ def main():
     print("  dynamic_pressure_3d.png        -- 3D: CPU vs GPU vs |diff|")
     print("  dynamic_pressure_slice_Z0.png  -- 1D: P(phi) at Z=0")
     print("  dynamic_error_heatmap.png      -- 2D: error heatmap")
+    print("  benchmark_cpu_vs_gpu.png       -- Bar chart: timing + speedup")
 
     sys.exit(0 if all_ok else 1)
 

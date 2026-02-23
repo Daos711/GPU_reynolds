@@ -1,17 +1,17 @@
 """
-CUDA C ядра для Red-Black SOR решения уравнения Рейнольдса.
+CUDA C kernels for Red-Black SOR solution of the Reynolds equation.
 
-Содержит:
-  - rb_sor_step:  один полушаг Red-Black SOR (обновление точек одного цвета)
-  - apply_bc:     применение граничных условий (периодичность по φ, Дирихле по Z)
+Contains:
+  - rb_sor_step:  one half-step of Red-Black SOR (no residual computation)
+  - apply_bc:     boundary conditions (periodic in phi, Dirichlet in Z)
 
-Все ядра компилируются через CuPy RawKernel при первом вызове и кэшируются.
+All kernels are compiled via CuPy RawKernel on first call and cached.
 """
 
 import cupy as cp
 
 # ---------------------------------------------------------------------------
-# CUDA-ядро: один полушаг Red-Black SOR
+# CUDA kernel: one Red-Black SOR half-step (NO atomicAdd — pure update)
 # ---------------------------------------------------------------------------
 _RB_SOR_KERNEL_CODE = r"""
 extern "C" __global__ void rb_sor_step(
@@ -22,7 +22,6 @@ extern "C" __global__ void rb_sor_step(
     const double* __restrict__ D_arr,
     const double* __restrict__ E_arr,
     const double* __restrict__ F_arr,
-    double* __restrict__ delta_arr,
     const int N_Z,
     const int N_phi,
     const double omega_sor,
@@ -56,16 +55,11 @@ extern "C" __global__ void rb_sor_step(
 
     // SOR relaxation
     P[idx] = P_old + omega_sor * (P_new - P_old);
-
-    // residual (atomic accumulation)
-    double diff = fabs(P[idx] - P_old);
-    atomicAdd(&delta_arr[0], diff);
-    atomicAdd(&delta_arr[1], fabs(P[idx]));
 }
 """
 
 # ---------------------------------------------------------------------------
-# CUDA-ядро: применение граничных условий
+# CUDA kernel: boundary conditions
 # ---------------------------------------------------------------------------
 _APPLY_BC_KERNEL_CODE = r"""
 extern "C" __global__ void apply_bc(
@@ -93,14 +87,14 @@ extern "C" __global__ void apply_bc(
 """
 
 # ---------------------------------------------------------------------------
-# Скомпилированные ядра (ленивая инициализация)
+# Compiled kernels (lazy init)
 # ---------------------------------------------------------------------------
 _rb_sor_kernel = None
 _apply_bc_kernel = None
 
 
 def get_rb_sor_kernel():
-    """Возвращает скомпилированное CUDA-ядро Red-Black SOR (кэшируется)."""
+    """Returns compiled CUDA Red-Black SOR kernel (cached)."""
     global _rb_sor_kernel
     if _rb_sor_kernel is None:
         _rb_sor_kernel = cp.RawKernel(_RB_SOR_KERNEL_CODE, "rb_sor_step")
@@ -108,7 +102,7 @@ def get_rb_sor_kernel():
 
 
 def get_apply_bc_kernel():
-    """Возвращает скомпилированное CUDA-ядро граничных условий (кэшируется)."""
+    """Returns compiled CUDA boundary conditions kernel (cached)."""
     global _apply_bc_kernel
     if _apply_bc_kernel is None:
         _apply_bc_kernel = cp.RawKernel(_APPLY_BC_KERNEL_CODE, "apply_bc")

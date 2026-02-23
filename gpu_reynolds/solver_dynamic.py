@@ -25,7 +25,7 @@ def solve_reynolds_gpu_dynamic(
     omega: float = 1.5,
     tol: float = 1e-5,
     max_iter: int = 50000,
-    check_every: int = 100,
+    check_every: int = 500,
 ) -> tuple:
     """
     Drop-in замена для solve_reynolds_gauss_seidel_numba_dynamic().
