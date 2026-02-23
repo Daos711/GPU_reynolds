@@ -1,25 +1,31 @@
 """
-Валидация GPU-солвера: сравнение результатов GPU (CuPy Red-Black SOR) vs CPU (Numba).
+Validation of GPU solver: comparison of GPU (CuPy Red-Black SOR) vs CPU (Numba).
 
-Проверяет:
-  1. Статический солвер — поле давления и интегральные нагрузки
-  2. Динамический солвер — то же с xprime, yprime != 0
+Checks:
+  1. Static solver  -- pressure field + integral loads + timing
+  2. Dynamic solver -- same with xprime, yprime != 0
 
-Критерии приёмки:
-  - max|P_cpu - P_gpu| / max(P_cpu) < 1e-3  (0.1% относительная ошибка)
-  - |F_cpu - F_gpu| / F_cpu < 1e-3
+Saves comparison plots to results/ directory.
 
-Запуск:
+Run:
     python -m gpu_reynolds.test_validation
 """
 
+import os
 import sys
+import time
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")          # headless backend -- no GUI needed
+import matplotlib.pyplot as plt
 from numba import njit
 
 
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "results")
+
+
 # ───────────────────────────────────────────────────────────────────────────
-# CPU-референс: статический солвер
+# CPU reference: static solver
 # ───────────────────────────────────────────────────────────────────────────
 @njit
 def solve_reynolds_cpu(H, d_phi, d_Z, R, L, omega=1.5, tol=1e-5, max_iter=20000):
@@ -89,7 +95,7 @@ def solve_reynolds_cpu(H, d_phi, d_Z, R, L, omega=1.5, tol=1e-5, max_iter=20000)
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# CPU-референс: динамический солвер
+# CPU reference: dynamic solver
 # ───────────────────────────────────────────────────────────────────────────
 @njit
 def solve_reynolds_cpu_dynamic(H, d_phi, d_Z, R, L,
@@ -127,13 +133,11 @@ def solve_reynolds_cpu_dynamic(H, d_phi, d_Z, R, L,
 
     E = A_full + B_full + C_full + D_full
 
-    # Статическая часть правой части
     static_part = d_phi * (H_i_plus_half - H_i_minus_half)
     F_full = np.zeros((N_Z, N_phi))
     F_full[:, :-1] = static_part
     F_full[:, -1] = static_part[:, 0]
 
-    # Динамический вклад
     for j in range(N_phi):
         phi_local = j * d_phi
         phi_global = phi_local + np.pi / 4.0
@@ -173,21 +177,19 @@ def solve_reynolds_cpu_dynamic(H, d_phi, d_Z, R, L,
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Вспомогательные функции
+# Helpers
 # ───────────────────────────────────────────────────────────────────────────
 def compute_loads(P, phi_1D, Z):
-    """Вычисляет интегральные нагрузки F_r, F_t, F_total."""
-    Phi_mesh, Z_mesh = np.meshgrid(phi_1D, Z)
+    Phi_mesh, _ = np.meshgrid(phi_1D, Z)
     cos_phi = np.cos(Phi_mesh)
     sin_phi = np.sin(Phi_mesh)
-    F_r = np.trapz(np.trapz(P * cos_phi, phi_1D, axis=1), Z)
-    F_t = np.trapz(np.trapz(P * sin_phi, phi_1D, axis=1), Z)
+    F_r = np.trapezoid(np.trapezoid(P * cos_phi, phi_1D, axis=1), Z)
+    F_t = np.trapezoid(np.trapezoid(P * sin_phi, phi_1D, axis=1), Z)
     F_total = np.sqrt(F_r**2 + F_t**2)
     return F_r, F_t, F_total
 
 
 def run_test(test_name, passed, details=""):
-    """Печатает результат теста."""
     status = "PASS" if passed else "FAIL"
     print(f"  [{status}] {test_name}")
     if details:
@@ -196,15 +198,98 @@ def run_test(test_name, passed, details=""):
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Основные тесты
+# Plotting helpers
+# ───────────────────────────────────────────────────────────────────────────
+def save_pressure_comparison_3d(P_cpu, P_gpu, phi_1D, Z, title_prefix, filename):
+    """3D surface plots: CPU, GPU, |difference|."""
+    Phi_mesh, Z_mesh = np.meshgrid(phi_1D, Z)
+
+    fig = plt.figure(figsize=(22, 6))
+
+    ax1 = fig.add_subplot(1, 3, 1, projection="3d")
+    ax1.plot_surface(Phi_mesh, Z_mesh, P_cpu, cmap="plasma", rcount=100, ccount=100)
+    ax1.set_xlabel("phi, rad")
+    ax1.set_ylabel("Z")
+    ax1.set_zlabel("P")
+    ax1.set_title(f"{title_prefix} -- CPU (Numba)")
+
+    ax2 = fig.add_subplot(1, 3, 2, projection="3d")
+    ax2.plot_surface(Phi_mesh, Z_mesh, P_gpu, cmap="plasma", rcount=100, ccount=100)
+    ax2.set_xlabel("phi, rad")
+    ax2.set_ylabel("Z")
+    ax2.set_zlabel("P")
+    ax2.set_title(f"{title_prefix} -- GPU (CuPy)")
+
+    diff = np.abs(P_cpu - P_gpu)
+    ax3 = fig.add_subplot(1, 3, 3, projection="3d")
+    ax3.plot_surface(Phi_mesh, Z_mesh, diff, cmap="hot", rcount=100, ccount=100)
+    ax3.set_xlabel("phi, rad")
+    ax3.set_ylabel("Z")
+    ax3.set_zlabel("|P_cpu - P_gpu|")
+    ax3.set_title(f"{title_prefix} -- |Difference|")
+
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, filename)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  -> Saved: {path}")
+
+
+def save_pressure_slice(P_cpu, P_gpu, phi_1D, Z, Z_val, title_prefix, filename):
+    """1D slice P(phi) at given Z value: CPU vs GPU + difference."""
+    Z_idx = np.argmin(np.abs(Z - Z_val))
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), gridspec_kw={"height_ratios": [3, 1]})
+
+    ax1.plot(phi_1D, P_cpu[Z_idx, :], "b-", lw=1.5, label="CPU (Numba)")
+    ax1.plot(phi_1D, P_gpu[Z_idx, :], "r--", lw=1.5, label="GPU (CuPy)")
+    ax1.set_xlabel("phi, rad")
+    ax1.set_ylabel("P")
+    ax1.set_title(f"{title_prefix} -- P(phi) at Z = {Z_val}")
+    ax1.legend()
+    ax1.grid(True)
+
+    diff = P_cpu[Z_idx, :] - P_gpu[Z_idx, :]
+    ax2.plot(phi_1D, diff, "k-", lw=1.0)
+    ax2.set_xlabel("phi, rad")
+    ax2.set_ylabel("P_cpu - P_gpu")
+    ax2.set_title("Difference")
+    ax2.grid(True)
+
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, filename)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  -> Saved: {path}")
+
+
+def save_error_heatmap(P_cpu, P_gpu, phi_1D, Z, title_prefix, filename):
+    """2D heatmap of |P_cpu - P_gpu|."""
+    diff = np.abs(P_cpu - P_gpu)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    c = ax.pcolormesh(phi_1D, Z, diff, cmap="hot", shading="auto")
+    fig.colorbar(c, ax=ax, label="|P_cpu - P_gpu|")
+    ax.set_xlabel("phi, rad")
+    ax.set_ylabel("Z")
+    ax.set_title(f"{title_prefix} -- Error heatmap")
+
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, filename)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  -> Saved: {path}")
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Tests
 # ───────────────────────────────────────────────────────────────────────────
 def test_static_solver():
-    """Тест 1: Статический солвер — сравнение GPU vs CPU."""
-    print("\n=== Тест 1: Статический солвер ===")
+    print("\n=== Test 1: Static solver ===")
 
     from gpu_reynolds.solver import solve_reynolds_gpu
+    import cupy as cp
 
-    # Параметры
     R = 0.035
     L = 0.056
     epsilon = 0.6
@@ -220,23 +305,34 @@ def test_static_solver():
     d_phi = phi_1D[1] - phi_1D[0]
     d_Z = Z[1] - Z[0]
 
-    # CPU
-    print("  Решаем на CPU (Numba)...")
+    # --- CPU ---
+    print("  Solving on CPU (Numba)...")
+    t0 = time.perf_counter()
     P_cpu, delta_cpu, iter_cpu = solve_reynolds_cpu(
         H, d_phi, d_Z, R, L, omega_sor, tol, max_iter
     )
-    print(f"  CPU: {iter_cpu} итераций, delta = {delta_cpu:.2e}")
+    t_cpu = time.perf_counter() - t0
+    print(f"  CPU: {iter_cpu} iters, delta = {delta_cpu:.2e}, time = {t_cpu:.2f} s")
 
-    # GPU
-    print("  Решаем на GPU (CuPy)...")
+    # --- GPU ---
+    print("  Solving on GPU (CuPy)...")
+    # warmup GPU (kernel compilation)
+    solve_reynolds_gpu(H, d_phi, d_Z, R, L, omega_sor, tol=0.1, max_iter=10, check_every=5)
+    cp.cuda.Device(0).synchronize()
+
+    t0 = time.perf_counter()
     P_gpu, delta_gpu, iter_gpu = solve_reynolds_gpu(
         H, d_phi, d_Z, R, L, omega_sor, tol, max_iter, check_every=100
     )
-    print(f"  GPU: {iter_gpu} итераций, delta = {delta_gpu:.2e}")
+    cp.cuda.Device(0).synchronize()
+    t_gpu = time.perf_counter() - t0
+    speedup = t_cpu / t_gpu if t_gpu > 0 else float("inf")
+    print(f"  GPU: {iter_gpu} iters, delta = {delta_gpu:.2e}, time = {t_gpu:.2f} s")
+    print(f"  Speedup: {speedup:.1f}x")
 
     all_passed = True
 
-    # Тест 1a: Относительная ошибка поля давления
+    # Test 1a: pressure field
     P_max = np.max(P_cpu)
     if P_max > 0:
         max_err = np.max(np.abs(P_cpu - P_gpu)) / P_max
@@ -247,37 +343,38 @@ def test_static_solver():
 
     passed = max_err < 2e-3
     all_passed &= run_test(
-        "Поле давления: max|P_cpu - P_gpu| / max(P_cpu) < 2e-3",
+        "Pressure field: max|P_cpu - P_gpu| / max(P_cpu) < 2e-3",
         passed,
         f"max_err = {max_err:.2e}, mean_err = {mean_err:.2e}"
     )
 
-    # Тест 1b: Интегральные нагрузки
+    # Test 1b: integral loads
     _, _, F_cpu = compute_loads(P_cpu, phi_1D, Z)
     _, _, F_gpu = compute_loads(P_gpu, phi_1D, Z)
-
-    if F_cpu > 0:
-        load_err = abs(F_cpu - F_gpu) / F_cpu
-    else:
-        load_err = abs(F_cpu - F_gpu)
+    load_err = abs(F_cpu - F_gpu) / F_cpu if F_cpu > 0 else abs(F_cpu - F_gpu)
 
     passed = load_err < 1e-3
     all_passed &= run_test(
-        "Интегральная нагрузка: |F_cpu - F_gpu| / F_cpu",
+        "Integral load: |F_cpu - F_gpu| / F_cpu < 1e-3",
         passed,
         f"F_cpu = {F_cpu:.6f}, F_gpu = {F_gpu:.6f}, err = {load_err:.2e}"
     )
+
+    # --- Save plots ---
+    print("  Saving comparison plots...")
+    save_pressure_comparison_3d(P_cpu, P_gpu, phi_1D, Z, "Static", "static_pressure_3d.png")
+    save_pressure_slice(P_cpu, P_gpu, phi_1D, Z, 0.0, "Static", "static_pressure_slice_Z0.png")
+    save_error_heatmap(P_cpu, P_gpu, phi_1D, Z, "Static", "static_error_heatmap.png")
 
     return all_passed
 
 
 def test_dynamic_solver():
-    """Тест 2: Динамический солвер — сравнение GPU vs CPU."""
-    print("\n=== Тест 2: Динамический солвер (xprime=0.001, yprime=0.001) ===")
+    print("\n=== Test 2: Dynamic solver (xprime=0.001, yprime=0.001) ===")
 
     from gpu_reynolds.solver_dynamic import solve_reynolds_gpu_dynamic
+    import cupy as cp
 
-    # Параметры
     R = 0.035
     L = 0.056
     epsilon = 0.6
@@ -296,27 +393,40 @@ def test_dynamic_solver():
     d_phi = phi_1D[1] - phi_1D[0]
     d_Z = Z[1] - Z[0]
 
-    # CPU
-    print("  Решаем на CPU (Numba)...")
+    # --- CPU ---
+    print("  Solving on CPU (Numba)...")
+    t0 = time.perf_counter()
     P_cpu, delta_cpu, iter_cpu = solve_reynolds_cpu_dynamic(
         H, d_phi, d_Z, R, L,
         xprime=xprime, yprime=yprime, beta=beta,
         omega=omega_sor, tol=tol, max_iter=max_iter
     )
-    print(f"  CPU: {iter_cpu} итераций, delta = {delta_cpu:.2e}")
+    t_cpu = time.perf_counter() - t0
+    print(f"  CPU: {iter_cpu} iters, delta = {delta_cpu:.2e}, time = {t_cpu:.2f} s")
 
-    # GPU
-    print("  Решаем на GPU (CuPy)...")
+    # --- GPU ---
+    print("  Solving on GPU (CuPy)...")
+    # warmup
+    solve_reynolds_gpu_dynamic(H, d_phi, d_Z, R, L,
+                                xprime=xprime, yprime=yprime, beta=beta,
+                                omega=omega_sor, tol=0.1, max_iter=10, check_every=5)
+    cp.cuda.Device(0).synchronize()
+
+    t0 = time.perf_counter()
     P_gpu, delta_gpu, iter_gpu = solve_reynolds_gpu_dynamic(
         H, d_phi, d_Z, R, L,
         xprime=xprime, yprime=yprime, beta=beta,
         omega=omega_sor, tol=tol, max_iter=max_iter, check_every=100
     )
-    print(f"  GPU: {iter_gpu} итераций, delta = {delta_gpu:.2e}")
+    cp.cuda.Device(0).synchronize()
+    t_gpu = time.perf_counter() - t0
+    speedup = t_cpu / t_gpu if t_gpu > 0 else float("inf")
+    print(f"  GPU: {iter_gpu} iters, delta = {delta_gpu:.2e}, time = {t_gpu:.2f} s")
+    print(f"  Speedup: {speedup:.1f}x")
 
     all_passed = True
 
-    # Тест 2a: Поле давления
+    # Test 2a: pressure field
     P_max = np.max(P_cpu)
     if P_max > 0:
         max_err = np.max(np.abs(P_cpu - P_gpu)) / P_max
@@ -327,43 +437,49 @@ def test_dynamic_solver():
 
     passed = max_err < 2e-3
     all_passed &= run_test(
-        "Поле давления (dynamic): max|P_cpu - P_gpu| / max(P_cpu) < 2e-3",
+        "Pressure field (dynamic): max|P_cpu - P_gpu| / max(P_cpu) < 2e-3",
         passed,
         f"max_err = {max_err:.2e}, mean_err = {mean_err:.2e}"
     )
 
-    # Тест 2b: Интегральные нагрузки
+    # Test 2b: integral loads
     _, _, F_cpu = compute_loads(P_cpu, phi_1D, Z)
     _, _, F_gpu = compute_loads(P_gpu, phi_1D, Z)
-
-    if F_cpu > 0:
-        load_err = abs(F_cpu - F_gpu) / F_cpu
-    else:
-        load_err = abs(F_cpu - F_gpu)
+    load_err = abs(F_cpu - F_gpu) / F_cpu if F_cpu > 0 else abs(F_cpu - F_gpu)
 
     passed = load_err < 1e-3
     all_passed &= run_test(
-        "Интегральная нагрузка (dynamic): |F_cpu - F_gpu| / F_cpu",
+        "Integral load (dynamic): |F_cpu - F_gpu| / F_cpu < 1e-3",
         passed,
         f"F_cpu = {F_cpu:.6f}, F_gpu = {F_gpu:.6f}, err = {load_err:.2e}"
     )
+
+    # --- Save plots ---
+    print("  Saving comparison plots...")
+    save_pressure_comparison_3d(P_cpu, P_gpu, phi_1D, Z, "Dynamic", "dynamic_pressure_3d.png")
+    save_pressure_slice(P_cpu, P_gpu, phi_1D, Z, 0.0, "Dynamic", "dynamic_pressure_slice_Z0.png")
+    save_error_heatmap(P_cpu, P_gpu, phi_1D, Z, "Dynamic", "dynamic_error_heatmap.png")
 
     return all_passed
 
 
 def main():
     print("=" * 60)
-    print("  Валидация GPU-солвера уравнения Рейнольдса")
+    print("  GPU Reynolds solver validation")
     print("=" * 60)
 
-    # Прогрев Numba
-    print("\nПрогрев Numba JIT...")
+    # Create results directory
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    print(f"\nPlots will be saved to: {RESULTS_DIR}")
+
+    # Numba warmup
+    print("\nWarming up Numba JIT...")
     H_w = 1.0 + 0.6 * np.cos(np.linspace(0, 2*np.pi, 50)[np.newaxis, :] * np.ones((50, 1)))
     solve_reynolds_cpu(H_w, 0.1, 0.1, 0.035, 0.056, 1.5, 0.1, 10)
     solve_reynolds_cpu_dynamic(H_w, 0.1, 0.1, 0.035, 0.056,
                                 xprime=0.001, yprime=0.001, beta=2.0,
                                 omega=1.5, tol=0.1, max_iter=10)
-    print("Numba JIT прогрет.")
+    print("Numba JIT warmed up.")
 
     results = []
     results.append(test_static_solver())
@@ -372,10 +488,18 @@ def main():
     print("\n" + "=" * 60)
     all_ok = all(results)
     if all_ok:
-        print("  ВСЕ ТЕСТЫ ПРОЙДЕНЫ (PASS)")
+        print("  ALL TESTS PASSED")
     else:
-        print("  ЕСТЬ ПРОВАЛЫ (FAIL)")
+        print("  SOME TESTS FAILED")
     print("=" * 60)
+
+    print(f"\nResults saved to: {RESULTS_DIR}/")
+    print("  static_pressure_3d.png         -- 3D: CPU vs GPU vs |diff|")
+    print("  static_pressure_slice_Z0.png   -- 1D: P(phi) at Z=0")
+    print("  static_error_heatmap.png       -- 2D: error heatmap")
+    print("  dynamic_pressure_3d.png        -- 3D: CPU vs GPU vs |diff|")
+    print("  dynamic_pressure_slice_Z0.png  -- 1D: P(phi) at Z=0")
+    print("  dynamic_error_heatmap.png      -- 2D: error heatmap")
 
     sys.exit(0 if all_ok else 1)
 
