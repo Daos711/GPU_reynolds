@@ -1,26 +1,24 @@
 """Abstract interface for linear solvers."""
 
 from abc import ABC, abstractmethod
-import cupy as cp
-import cupyx.scipy.sparse as cusparse
 
 
 class LinearSolver(ABC):
-    """Base class for GPU linear solvers."""
+    """Base class for linear solvers."""
 
     @abstractmethod
-    def solve(self, M: cusparse.csr_matrix, f: cp.ndarray) -> tuple:
+    def solve(self, M, f) -> tuple:
         """
         Solve M @ p = f.
 
         Parameters
         ----------
-        M : cupyx.scipy.sparse.csr_matrix
-        f : cp.ndarray, shape (N,)
+        M : sparse matrix (scipy or cupyx)
+        f : array, shape (N,)
 
         Returns
         -------
-        p : cp.ndarray, shape (N,)
+        p : array, shape (N,)
         info : int
             0 = success, >0 = did not converge.
         """

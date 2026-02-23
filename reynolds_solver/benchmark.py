@@ -1,5 +1,5 @@
 """
-Benchmark: CPU (Numba) vs GPU SOR vs GPU Krylov on multiple grid sizes.
+Benchmark: CPU (Numba) vs GPU SOR vs AMG (PyAMG) on multiple grid sizes.
 
 Run:
     python -m reynolds_solver.benchmark
@@ -118,18 +118,23 @@ def run_benchmark():
         print("Warming up GPU...")
         H_warmup_gpu, dp_w, dz_w = generate_test_H(50, 50, epsilon)
         solve_reynolds_sor(H_warmup_gpu, dp_w, dz_w, R, L, omega_sor, tol=0.1, max_iter=10)
-        solve_reynolds(H_warmup_gpu, dp_w, dz_w, R, L, method="krylov",
-                       krylov_tol=0.1, krylov_maxiter=5, max_cav_iter=2)
         cp.cuda.Device(0).synchronize()
         print("GPU warmed up.\n")
+
+        # AMG warmup
+        print("Warming up AMG...")
+        solve_reynolds(H_warmup_gpu, dp_w, dz_w, R, L, method="amg",
+                       amg_tol=0.1, amg_maxiter=5, max_cav_iter=2)
+        print("AMG warmed up.\n")
+
         gpu_available = True
     except Exception as e:
         print(f"GPU unavailable: {e}\n")
         gpu_available = False
 
     header = (
-        f"{'Grid':<12} {'CPU (s)':<12} {'SOR (s)':<12} {'Krylov (s)':<12} "
-        f"{'SOR iters':<12} {'Krylov iters':<14} {'Best speedup':<14}"
+        f"{'Grid':<12} {'CPU (s)':<12} {'SOR (s)':<12} {'AMG (s)':<12} "
+        f"{'SOR iters':<12} {'AMG iters':<14} {'Best speedup':<14}"
     )
     print(header)
     print("-" * len(header))
@@ -179,45 +184,43 @@ def run_benchmark():
             sor_str = "N/A"
             sor_iters = "-"
 
-        # --- GPU Krylov ---
+        # --- AMG ---
         if gpu_available:
             from reynolds_solver.api import solve_reynolds
 
-            krylov_times = []
-            krylov_iters = 0
+            amg_times = []
+            amg_iters = 0
             for run in range(n_runs):
-                cp.cuda.Device(0).synchronize()
                 t0 = time.perf_counter()
-                _, krylov_delta, krylov_iters = solve_reynolds(
-                    H, d_phi, d_Z, R, L, method="krylov", tol=tol,
-                    krylov_tol=1e-6, krylov_maxiter=2000, max_cav_iter=20,
+                _, amg_delta, amg_iters = solve_reynolds(
+                    H, d_phi, d_Z, R, L, method="amg", tol=tol,
+                    amg_tol=1e-8, amg_maxiter=200, max_cav_iter=20,
                 )
-                cp.cuda.Device(0).synchronize()
                 t1 = time.perf_counter()
-                krylov_times.append(t1 - t0)
-            krylov_avg = np.mean(krylov_times)
-            krylov_str = f"{krylov_avg:.3f}"
+                amg_times.append(t1 - t0)
+            amg_avg = np.mean(amg_times)
+            amg_str = f"{amg_avg:.3f}"
         else:
-            krylov_avg = None
-            krylov_str = "N/A"
-            krylov_iters = "-"
+            amg_avg = None
+            amg_str = "N/A"
+            amg_iters = "-"
 
         # Best speedup
-        if cpu_avg is not None and krylov_avg is not None and krylov_avg > 0:
-            best_speedup = cpu_avg / krylov_avg
+        if cpu_avg is not None and amg_avg is not None and amg_avg > 0:
+            best_speedup = cpu_avg / amg_avg
             speedup_str = f"{best_speedup:.0f}x"
         elif cpu_avg is not None and sor_avg is not None and sor_avg > 0:
             best_speedup = cpu_avg / sor_avg
             speedup_str = f"{best_speedup:.0f}x"
-        elif sor_avg is not None and krylov_avg is not None:
-            ratio = sor_avg / krylov_avg if krylov_avg > 0 else 0
-            speedup_str = f"SOR/Krylov={ratio:.1f}x"
+        elif sor_avg is not None and amg_avg is not None:
+            ratio = sor_avg / amg_avg if amg_avg > 0 else 0
+            speedup_str = f"SOR/AMG={ratio:.1f}x"
         else:
             speedup_str = "N/A"
 
         print(
-            f"{grid_str:<12} {cpu_str:<12} {sor_str:<12} {krylov_str:<12} "
-            f"{str(sor_iters):<12} {str(krylov_iters):<14} {speedup_str:<14}"
+            f"{grid_str:<12} {cpu_str:<12} {sor_str:<12} {amg_str:<12} "
+            f"{str(sor_iters):<12} {str(amg_iters):<14} {speedup_str:<14}"
         )
 
     print("\nBenchmark complete.")

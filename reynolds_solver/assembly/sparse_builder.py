@@ -20,43 +20,18 @@ import cupyx.scipy.sparse as cusparse
 import scipy.sparse as sp
 
 
-def build_sparse_matrix_gpu(A, B, C, D, E, F, N_Z, N_phi):
+def _build_sparse_core(A_cpu, B_cpu, C_cpu, D_cpu, E_cpu, F_cpu, N_Z, N_phi):
     """
-    Build sparse matrix M and RHS vector f from stencil coefficients.
-
-    Stencil equation:
-        A[i,j]*P[i,j+1] + B[i,j]*P[i,j-1] + C[i,j]*P[i+1,j] + D[i,j]*P[i-1,j]
-        - E[i,j]*P[i,j] = F[i,j]
-
-    Transforms to: M @ p = f, where f = F (right-hand side).
-    Matrix entries:
-        - Diagonal: -E[i,j]
-        - Right neighbor (j+1): A[i,j]
-        - Left neighbor (j-1): B[i,j]
-        - Below neighbor (i+1): C[i,j]
-        - Above neighbor (i-1): D[i,j]
-
-    Parameters
-    ----------
-    A, B, C, D, E, F : cp.ndarray, shape (N_Z, N_phi)
-    N_Z, N_phi : int
+    Build sparse matrix from numpy stencil coefficient arrays.
 
     Returns
     -------
-    M : cupyx.scipy.sparse.csr_matrix, shape (N_inner, N_inner)
-    f : cp.ndarray, shape (N_inner,)
+    M_cpu : scipy.sparse.csr_matrix, shape (N_inner, N_inner)
+    f_cpu : np.ndarray, shape (N_inner,)
     """
     N_inner_Z = N_Z - 2
     N_inner_phi = N_phi - 2
     N_total = N_inner_Z * N_inner_phi
-
-    # Transfer to CPU for assembly (done once, not a bottleneck)
-    A_cpu = cp.asnumpy(A)
-    B_cpu = cp.asnumpy(B)
-    C_cpu = cp.asnumpy(C)
-    D_cpu = cp.asnumpy(D)
-    E_cpu = cp.asnumpy(E)
-    F_cpu = cp.asnumpy(F)
 
     # Vectorized index grids for interior nodes
     i_idx, j_idx = np.mgrid[1:N_Z - 1, 1:N_phi - 1]
@@ -98,15 +73,69 @@ def build_sparse_matrix_gpu(A, B, C, D, E, F, N_Z, N_phi):
     all_cols = np.concatenate([k_flat, right_cols, left_cols, below_cols, above_cols])
     all_vals = np.concatenate([diag_vals, right_vals, left_vals, below_vals, above_vals])
 
-    # Build CSR on CPU, transfer to GPU
+    # Build CSR on CPU
     M_cpu = sp.coo_matrix(
         (all_vals, (all_rows, all_cols)), shape=(N_total, N_total)
     ).tocsr()
 
-    M_gpu = cusparse.csr_matrix(M_cpu)
-
     # RHS vector
     f_cpu = F_cpu[i_flat, j_flat]
+
+    return M_cpu, f_cpu
+
+
+def build_sparse_matrix_gpu(A, B, C, D, E, F, N_Z, N_phi):
+    """
+    Build sparse matrix M and RHS vector f from stencil coefficients.
+
+    Returns (cupyx CSR, cupy array) for GPU solvers.
+
+    Parameters
+    ----------
+    A, B, C, D, E, F : cp.ndarray, shape (N_Z, N_phi)
+    N_Z, N_phi : int
+
+    Returns
+    -------
+    M : cupyx.scipy.sparse.csr_matrix, shape (N_inner, N_inner)
+    f : cp.ndarray, shape (N_inner,)
+    """
+    A_cpu = cp.asnumpy(A)
+    B_cpu = cp.asnumpy(B)
+    C_cpu = cp.asnumpy(C)
+    D_cpu = cp.asnumpy(D)
+    E_cpu = cp.asnumpy(E)
+    F_cpu = cp.asnumpy(F)
+
+    M_cpu, f_cpu = _build_sparse_core(A_cpu, B_cpu, C_cpu, D_cpu, E_cpu, F_cpu, N_Z, N_phi)
+
+    M_gpu = cusparse.csr_matrix(M_cpu)
     f_gpu = cp.asarray(f_cpu)
 
     return M_gpu, f_gpu
+
+
+def build_sparse_matrix_cpu(A, B, C, D, E, F, N_Z, N_phi):
+    """
+    Build sparse matrix M and RHS vector f from stencil coefficients.
+
+    Returns (scipy CSR, numpy array) for CPU solvers (AMG, direct).
+
+    Parameters
+    ----------
+    A, B, C, D, E, F : cp.ndarray, shape (N_Z, N_phi)
+    N_Z, N_phi : int
+
+    Returns
+    -------
+    M : scipy.sparse.csr_matrix, shape (N_inner, N_inner)
+    f : np.ndarray, shape (N_inner,)
+    """
+    A_cpu = cp.asnumpy(A)
+    B_cpu = cp.asnumpy(B)
+    C_cpu = cp.asnumpy(C)
+    D_cpu = cp.asnumpy(D)
+    E_cpu = cp.asnumpy(E)
+    F_cpu = cp.asnumpy(F)
+
+    return _build_sparse_core(A_cpu, B_cpu, C_cpu, D_cpu, E_cpu, F_cpu, N_Z, N_phi)

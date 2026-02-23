@@ -11,6 +11,7 @@ dependencies = [
     "numpy>=1.22",
     "cupy-cuda12x>=13.0",
     "scipy>=1.10",
+    "pyamg>=5.0",
 ]
 
 [project.optional-dependencies]
