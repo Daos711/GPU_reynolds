@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reynolds-solver"
+version = "0.2.0"
+description = "GPU-accelerated Reynolds equation solver for hydrodynamic bearings"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.22",
+    "cupy-cuda12x>=13.0",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+dev = ["numba", "matplotlib"]
+
+[tool.setuptools.packages.find]
+include = ["reynolds_solver*"]
