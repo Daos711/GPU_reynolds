@@ -9,8 +9,8 @@ Caches GPU buffers between calls with the same grid size.
 import numpy as np
 import cupy as cp
 
-from gpu_reynolds.kernels import get_rb_sor_kernel, get_apply_bc_kernel
-from gpu_reynolds.utils import precompute_coefficients_gpu
+from reynolds_solver.kernels import get_rb_sor_kernel, get_apply_bc_kernel
+from reynolds_solver.utils import precompute_coefficients_gpu
 
 
 class ReynoldsSolverGPU:

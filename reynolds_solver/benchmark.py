@@ -1,5 +1,5 @@
 """
-Benchmark: CPU (Numba) vs GPU SOR vs AMG (PyAMG) on multiple grid sizes.
+Benchmark: CPU (Numba) vs GPU (CuPy Red-Black SOR) on different grid sizes.
 
 Run:
     python -m reynolds_solver.benchmark
@@ -108,119 +108,71 @@ def run_benchmark():
     solve_reynolds_cpu(H_warmup, dp_w, dz_w, R, L, omega_sor, tol=0.1, max_iter=10)
     print("Numba JIT warmed up.\n")
 
-    # Import GPU solvers
+    # Import GPU solver
     try:
         import cupy as cp
-        from reynolds_solver.linear_solvers.gpu_sor import solve_reynolds_sor
-        from reynolds_solver.api import solve_reynolds
+        from reynolds_solver.solver import solve_reynolds_gpu
 
-        # GPU warmup
+        # GPU warmup (kernel compilation + allocations)
         print("Warming up GPU...")
         H_warmup_gpu, dp_w, dz_w = generate_test_H(50, 50, epsilon)
-        solve_reynolds_sor(H_warmup_gpu, dp_w, dz_w, R, L, omega_sor, tol=0.1, max_iter=10)
+        solve_reynolds_gpu(H_warmup_gpu, dp_w, dz_w, R, L, omega_sor, tol=0.1, max_iter=10)
         cp.cuda.Device(0).synchronize()
         print("GPU warmed up.\n")
-
-        # AMG warmup
-        print("Warming up AMG...")
-        solve_reynolds(H_warmup_gpu, dp_w, dz_w, R, L, method="amg",
-                       amg_tol=0.1, amg_maxiter=5, max_cav_iter=2)
-        print("AMG warmed up.\n")
-
         gpu_available = True
     except Exception as e:
         print(f"GPU unavailable: {e}\n")
         gpu_available = False
 
-    header = (
-        f"{'Grid':<12} {'CPU (s)':<12} {'SOR (s)':<12} {'AMG (s)':<12} "
-        f"{'SOR iters':<12} {'AMG iters':<14} {'Best speedup':<14}"
-    )
+    header = f"{'Grid':<12} {'CPU (s)':<12} {'GPU (s)':<12} {'Speedup':<10} {'Iters':<10} {'CPU delta':<14} {'GPU delta':<14}"
     print(header)
     print("-" * len(header))
 
-    skip_cpu_threshold = 500  # Skip CPU for grids larger than this
-
     for N_Z, N_phi in grids:
         H, d_phi, d_Z = generate_test_H(N_Z, N_phi, epsilon)
-        grid_str = f"{N_Z}x{N_phi}"
 
         # --- CPU ---
-        if N_Z <= skip_cpu_threshold:
-            cpu_times = []
-            for run in range(n_runs):
-                t0 = time.perf_counter()
-                P_cpu, cpu_delta, cpu_iters = solve_reynolds_cpu(
-                    H, d_phi, d_Z, R, L, omega_sor, tol, max_iter
-                )
-                t1 = time.perf_counter()
-                cpu_times.append(t1 - t0)
-            cpu_avg = np.mean(cpu_times)
-            cpu_str = f"{cpu_avg:.2f}"
-        else:
-            cpu_avg = None
-            cpu_str = "(skip)"
+        cpu_times = []
+        cpu_delta = 0.0
+        cpu_iters = 0
+        for run in range(n_runs):
+            t0 = time.perf_counter()
+            P_cpu, cpu_delta, cpu_iters = solve_reynolds_cpu(
+                H, d_phi, d_Z, R, L, omega_sor, tol, max_iter
+            )
+            t1 = time.perf_counter()
+            cpu_times.append(t1 - t0)
+        cpu_avg = np.mean(cpu_times)
 
-        # --- GPU SOR ---
+        # --- GPU ---
         if gpu_available:
-            import cupy as cp
-            from reynolds_solver.linear_solvers.gpu_sor import solve_reynolds_sor
-
-            sor_times = []
-            sor_iters = 0
+            gpu_times = []
+            gpu_delta = 0.0
+            gpu_iters = 0
             for run in range(n_runs):
                 cp.cuda.Device(0).synchronize()
                 t0 = time.perf_counter()
-                _, sor_delta, sor_iters = solve_reynolds_sor(
+                P_gpu, gpu_delta, gpu_iters = solve_reynolds_gpu(
                     H, d_phi, d_Z, R, L, omega_sor, tol, max_iter
                 )
                 cp.cuda.Device(0).synchronize()
                 t1 = time.perf_counter()
-                sor_times.append(t1 - t0)
-            sor_avg = np.mean(sor_times)
-            sor_str = f"{sor_avg:.3f}"
+                gpu_times.append(t1 - t0)
+            gpu_avg = np.mean(gpu_times)
+            speedup = cpu_avg / gpu_avg
+            gpu_str = f"{gpu_avg:.3f}"
+            speedup_str = f"{speedup:.1f}x"
+            gpu_delta_str = f"{gpu_delta:.2e}"
         else:
-            sor_avg = None
-            sor_str = "N/A"
-            sor_iters = "-"
-
-        # --- AMG ---
-        if gpu_available:
-            from reynolds_solver.api import solve_reynolds
-
-            amg_times = []
-            amg_iters = 0
-            for run in range(n_runs):
-                t0 = time.perf_counter()
-                _, amg_delta, amg_iters = solve_reynolds(
-                    H, d_phi, d_Z, R, L, method="amg", tol=tol,
-                    amg_tol=1e-8, amg_maxiter=200, max_cav_iter=20,
-                )
-                t1 = time.perf_counter()
-                amg_times.append(t1 - t0)
-            amg_avg = np.mean(amg_times)
-            amg_str = f"{amg_avg:.3f}"
-        else:
-            amg_avg = None
-            amg_str = "N/A"
-            amg_iters = "-"
-
-        # Best speedup
-        if cpu_avg is not None and amg_avg is not None and amg_avg > 0:
-            best_speedup = cpu_avg / amg_avg
-            speedup_str = f"{best_speedup:.0f}x"
-        elif cpu_avg is not None and sor_avg is not None and sor_avg > 0:
-            best_speedup = cpu_avg / sor_avg
-            speedup_str = f"{best_speedup:.0f}x"
-        elif sor_avg is not None and amg_avg is not None:
-            ratio = sor_avg / amg_avg if amg_avg > 0 else 0
-            speedup_str = f"SOR/AMG={ratio:.1f}x"
-        else:
+            gpu_str = "N/A"
             speedup_str = "N/A"
+            gpu_delta_str = "N/A"
+            gpu_iters = "-"
 
+        grid_str = f"{N_Z}x{N_phi}"
         print(
-            f"{grid_str:<12} {cpu_str:<12} {sor_str:<12} {amg_str:<12} "
-            f"{str(sor_iters):<12} {str(amg_iters):<14} {speedup_str:<14}"
+            f"{grid_str:<12} {cpu_avg:<12.3f} {gpu_str:<12} {speedup_str:<10} "
+            f"{cpu_iters:<10} {cpu_delta:<14.2e} {gpu_delta_str:<14}"
         )
 
     print("\nBenchmark complete.")
