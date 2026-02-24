@@ -11,7 +11,8 @@ class StandardReynoldsDynamic(StandardReynolds):
         xprime = kwargs.get("xprime", 0.0)
         yprime = kwargs.get("yprime", 0.0)
         beta = kwargs.get("beta", 2.0)
+        phase_shift = kwargs.get("phase_shift", 0.0)
         if abs(xprime) > 1e-15 or abs(yprime) > 1e-15:
             N_Z, N_phi = H_gpu.shape
-            add_dynamic_rhs_gpu(F, d_phi, N_Z, N_phi, xprime, yprime, beta)
+            add_dynamic_rhs_gpu(F, d_phi, N_Z, N_phi, xprime, yprime, beta, phase_shift)
         return A, B, C, D, E, F

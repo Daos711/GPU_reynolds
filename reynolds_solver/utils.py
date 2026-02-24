@@ -35,18 +35,13 @@ def precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L):
     H_i_minus_half[:, 1:] = H_i_plus_half[:, :-1]
     H_i_minus_half[:, 0] = H_i_plus_half[:, -1]
 
-    H_j_plus_half = 0.5 * (H_gpu[:-1, :] + H_gpu[1:, :])
-    H_j_minus_half = cp.empty_like(H_j_plus_half)
-    H_j_minus_half[1:, :] = H_j_plus_half[:-1, :]
-    H_j_minus_half[0, :] = H_j_plus_half[-1, :]
+    H_j_plus_half = 0.5 * (H_gpu[:-1, :] + H_gpu[1:, :])  # (N_Z-1, N_phi)
 
     D_over_L = 2.0 * R / L
     alpha_sq = (D_over_L * d_phi / d_Z) ** 2
 
     A_half = H_i_plus_half ** 3
     B_half = H_i_minus_half ** 3
-    C_half = alpha_sq * H_j_plus_half ** 3
-    D_half = alpha_sq * H_j_minus_half ** 3
 
     A_full = cp.zeros((N_Z, N_phi), dtype=cp.float64)
     B_full = cp.zeros((N_Z, N_phi), dtype=cp.float64)
@@ -59,11 +54,12 @@ def precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L):
     B_full[:, 1:] = B_half
     B_full[:, 0] = B_half[:, -1]
 
-    C_full[:-1, :] = C_half
-    C_full[-1, :] = C_half[0, :]
-
-    D_full[1:, :] = D_half
-    D_full[0, :] = D_half[-1, :]
+    # Z-direction: Dirichlet BC (P=0 at boundaries), no periodic wrap.
+    # For internal nodes i = 1..N_Z-2:
+    #   C[i] uses interface (i, i+1) -> H_j_plus_half[i]
+    #   D[i] uses interface (i-1, i) -> H_j_plus_half[i-1]
+    C_full[1:-1, :] = alpha_sq * (H_j_plus_half[1:, :] ** 3)
+    D_full[1:-1, :] = alpha_sq * (H_j_plus_half[:-1, :] ** 3)
 
     E_full = A_full + B_full + C_full + D_full
 
@@ -75,16 +71,27 @@ def precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L):
     return A_full, B_full, C_full, D_full, E_full, F_full
 
 
-def add_dynamic_rhs_gpu(F_full, d_phi, N_Z, N_phi, xprime, yprime, beta):
+def add_dynamic_rhs_gpu(F_full, d_phi, N_Z, N_phi, xprime, yprime, beta, phase_shift=0.0):
     """
     Add dynamic contribution to RHS F on GPU (in-place).
 
     F[i,j] += beta * (xprime * sin(phi_global) + yprime * cos(phi_global))
-    where phi_global = j * d_phi + pi/4
+    where phi_global = j * d_phi + phase_shift.
+
+    Parameters
+    ----------
+    F_full : cupy.ndarray, shape (N_Z, N_phi)
+    d_phi : float
+    N_Z, N_phi : int
+    xprime, yprime : float
+    beta : float
+    phase_shift : float
+        Phase offset added to phi (default 0.0).
+        Use np.pi/4 ONLY to reproduce legacy behavior for validation.
     """
     j_indices = cp.arange(N_phi, dtype=cp.float64)
     phi_local = j_indices * d_phi
-    phi_global = phi_local + cp.pi / 4.0
+    phi_global = phi_local + phase_shift
 
     dyn_term = beta * (xprime * cp.sin(phi_global) + yprime * cp.cos(phi_global))
     F_full += dyn_term[cp.newaxis, :]

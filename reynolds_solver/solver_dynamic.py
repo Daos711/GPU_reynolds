@@ -3,7 +3,7 @@ GPU solver for the Reynolds equation (dynamic version).
 
 Extends the static solver with a dynamic contribution to the RHS:
     F[i,j] += beta * (xprime * sin(phi_global) + yprime * cos(phi_global))
-where phi_global = j * d_phi + pi/4.
+where phi_global = j * d_phi + phase_shift (default 0.0).
 """
 
 import numpy as np
@@ -22,6 +22,7 @@ def solve_reynolds_gpu_dynamic(
     xprime: float = 0.0,
     yprime: float = 0.0,
     beta: float = 2.0,
+    phase_shift: float = 0.0,
     omega: float = 1.5,
     tol: float = 1e-5,
     max_iter: int = 50000,
@@ -40,6 +41,8 @@ def solve_reynolds_gpu_dynamic(
     R, L : float
     xprime, yprime : float
     beta : float
+    phase_shift : float
+        Phase offset for dynamic RHS (default 0.0, no shift).
     omega : float
     tol : float
     max_iter : int
@@ -59,7 +62,7 @@ def solve_reynolds_gpu_dynamic(
     A, B, C, D, E, F_full = precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L)
 
     # 2. Add dynamic contribution to RHS
-    add_dynamic_rhs_gpu(F_full, d_phi, N_Z, N_phi, xprime, yprime, beta)
+    add_dynamic_rhs_gpu(F_full, d_phi, N_Z, N_phi, xprime, yprime, beta, phase_shift)
 
     # 3. Solve with pre-computed coefficients
     P_gpu, delta, n_iter = solver.solve_with_rhs(

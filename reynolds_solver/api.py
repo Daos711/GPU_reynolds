@@ -33,6 +33,7 @@ def solve_reynolds(
     xprime: float = 0.0,
     yprime: float = 0.0,
     beta: float = 2.0,
+    phase_shift: float = 0.0,
 ) -> tuple:
     """
     Solve the Reynolds equation on GPU (Red-Black SOR).
@@ -57,6 +58,8 @@ def solve_reynolds(
         Dimensionless velocities (for dynamic equation, 0 = static).
     beta : float
         Dynamic term coefficient.
+    phase_shift : float
+        Phase offset for dynamic RHS (default 0.0, no shift).
 
     Returns
     -------
@@ -73,6 +76,7 @@ def solve_reynolds(
         return solve_reynolds_gpu_dynamic(
             H, d_phi, d_Z, R, L,
             xprime=xprime, yprime=yprime, beta=beta,
+            phase_shift=phase_shift,
             omega=omega, tol=tol, max_iter=max_iter, check_every=check_every,
         )
     else:
