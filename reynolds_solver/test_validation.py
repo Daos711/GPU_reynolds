@@ -35,16 +35,13 @@ def solve_reynolds_cpu(H, d_phi, d_Z, R, L, omega=1.5, tol=1e-5, max_iter=20000)
 
     H_i_plus_half = 0.5 * (H[:, :-1] + H[:, 1:])
     H_i_minus_half = np.hstack((H_i_plus_half[:, -1:], H_i_plus_half[:, :-1]))
-    H_j_plus_half = 0.5 * (H[:-1, :] + H[1:, :])
-    H_j_minus_half = np.vstack((H_j_plus_half[-1:, :], H_j_plus_half[:-1, :]))
+    H_j_plus_half = 0.5 * (H[:-1, :] + H[1:, :])  # (N_Z-1, N_phi)
 
     D_over_L = 2 * R / L
     alpha_sq = (D_over_L * d_phi / d_Z) ** 2
 
     A = H_i_plus_half ** 3
     B = H_i_minus_half ** 3
-    C = alpha_sq * H_j_plus_half ** 3
-    D_coef = alpha_sq * H_j_minus_half ** 3
 
     A_full = np.zeros((N_Z, N_phi))
     B_full = np.zeros((N_Z, N_phi))
@@ -55,10 +52,10 @@ def solve_reynolds_cpu(H, d_phi, d_Z, R, L, omega=1.5, tol=1e-5, max_iter=20000)
     A_full[:, -1] = A[:, 0]
     B_full[:, 1:] = B
     B_full[:, 0] = B[:, -1]
-    C_full[:-1, :] = C
-    C_full[-1, :] = C[0, :]
-    D_full[1:, :] = D_coef
-    D_full[0, :] = D_coef[-1, :]
+
+    # Z-direction: Dirichlet BC, no periodic wrap
+    C_full[1:-1, :] = alpha_sq * (H_j_plus_half[1:, :] ** 3)
+    D_full[1:-1, :] = alpha_sq * (H_j_plus_half[:-1, :] ** 3)
 
     E = A_full + B_full + C_full + D_full
 
@@ -101,22 +98,20 @@ def solve_reynolds_cpu(H, d_phi, d_Z, R, L, omega=1.5, tol=1e-5, max_iter=20000)
 @njit
 def solve_reynolds_cpu_dynamic(H, d_phi, d_Z, R, L,
                                 xprime=0.0, yprime=0.0, beta=2.0,
+                                phase_shift=0.0,
                                 omega=1.5, tol=1e-5, max_iter=20000):
     N_Z, N_phi = H.shape
     P = np.zeros((N_Z, N_phi))
 
     H_i_plus_half = 0.5 * (H[:, :-1] + H[:, 1:])
     H_i_minus_half = np.hstack((H_i_plus_half[:, -1:], H_i_plus_half[:, :-1]))
-    H_j_plus_half = 0.5 * (H[:-1, :] + H[1:, :])
-    H_j_minus_half = np.vstack((H_j_plus_half[-1:, :], H_j_plus_half[:-1, :]))
+    H_j_plus_half = 0.5 * (H[:-1, :] + H[1:, :])  # (N_Z-1, N_phi)
 
     D_over_L = 2 * R / L
     alpha_sq = (D_over_L * d_phi / d_Z) ** 2
 
     A = H_i_plus_half ** 3
     B = H_i_minus_half ** 3
-    C = alpha_sq * H_j_plus_half ** 3
-    D_coef = alpha_sq * H_j_minus_half ** 3
 
     A_full = np.zeros((N_Z, N_phi))
     B_full = np.zeros((N_Z, N_phi))
@@ -127,10 +122,10 @@ def solve_reynolds_cpu_dynamic(H, d_phi, d_Z, R, L,
     A_full[:, -1] = A[:, 0]
     B_full[:, 1:] = B
     B_full[:, 0] = B[:, -1]
-    C_full[:-1, :] = C
-    C_full[-1, :] = C[0, :]
-    D_full[1:, :] = D_coef
-    D_full[0, :] = D_coef[-1, :]
+
+    # Z-direction: Dirichlet BC, no periodic wrap
+    C_full[1:-1, :] = alpha_sq * (H_j_plus_half[1:, :] ** 3)
+    D_full[1:-1, :] = alpha_sq * (H_j_plus_half[:-1, :] ** 3)
 
     E = A_full + B_full + C_full + D_full
 
@@ -141,7 +136,7 @@ def solve_reynolds_cpu_dynamic(H, d_phi, d_Z, R, L,
 
     for j in range(N_phi):
         phi_local = j * d_phi
-        phi_global = phi_local + np.pi / 4.0
+        phi_global = phi_local + phase_shift
         sin_phi_global = np.sin(phi_global)
         cos_phi_global = np.cos(phi_global)
         dyn_term = beta * (xprime * sin_phi_global + yprime * cos_phi_global)
@@ -175,6 +170,54 @@ def solve_reynolds_cpu_dynamic(H, d_phi, d_Z, R, L,
         delta /= norm_P + 1e-12
         iteration += 1
     return P, delta, iteration
+
+
+# -----------------------------------------------------------------------
+# CPU coefficient precomputation (for unit tests without GPU)
+# -----------------------------------------------------------------------
+def precompute_coefficients_cpu(H, d_phi, d_Z, R, L):
+    """
+    CPU (numpy) version of precompute_coefficients_gpu.
+
+    Returns
+    -------
+    A_full, B_full, C_full, D_full, E_full, F_full : np.ndarray, each (N_Z, N_phi)
+    """
+    N_Z, N_phi = H.shape
+
+    H_i_plus_half = 0.5 * (H[:, :-1] + H[:, 1:])
+    H_i_minus_half = np.hstack((H_i_plus_half[:, -1:], H_i_plus_half[:, :-1]))
+    H_j_plus_half = 0.5 * (H[:-1, :] + H[1:, :])  # (N_Z-1, N_phi)
+
+    D_over_L = 2.0 * R / L
+    alpha_sq = (D_over_L * d_phi / d_Z) ** 2
+
+    A_half = H_i_plus_half ** 3
+    B_half = H_i_minus_half ** 3
+
+    A_full = np.zeros((N_Z, N_phi))
+    B_full = np.zeros((N_Z, N_phi))
+    C_full = np.zeros((N_Z, N_phi))
+    D_full = np.zeros((N_Z, N_phi))
+
+    A_full[:, :-1] = A_half
+    A_full[:, -1] = A_half[:, 0]
+
+    B_full[:, 1:] = B_half
+    B_full[:, 0] = B_half[:, -1]
+
+    # Z-direction: Dirichlet BC, no periodic wrap
+    C_full[1:-1, :] = alpha_sq * (H_j_plus_half[1:, :] ** 3)
+    D_full[1:-1, :] = alpha_sq * (H_j_plus_half[:-1, :] ** 3)
+
+    E_full = A_full + B_full + C_full + D_full
+
+    F_half = d_phi * (H_i_plus_half - H_i_minus_half)
+    F_full = np.zeros((N_Z, N_phi))
+    F_full[:, :-1] = F_half
+    F_full[:, -1] = F_half[:, 0]
+
+    return A_full, B_full, C_full, D_full, E_full, F_full
 
 
 # -----------------------------------------------------------------------
@@ -502,6 +545,133 @@ def test_dynamic_solver():
     return all_passed
 
 
+def test_z_coefficients_no_wrap():
+    """
+    Verify that D_full[1,:] does NOT depend on the last row of H.
+    Constructs H where last rows are 10x larger -- if wrap is present,
+    D_full[1,:] will be inflated.
+    """
+    print("\n=== Test 3: Z-coefficients no-wrap regression ===")
+
+    N_Z, N_phi = 50, 50
+    d_phi = 2 * np.pi / N_phi
+    d_Z = 2.0 / N_Z
+    R, L = 0.035, 0.056
+
+    all_passed = True
+
+    # H_normal: uniform gap = 1.0
+    H_normal = np.ones((N_Z, N_phi))
+
+    # H_modified: same, but last 2 rows are 10x
+    H_modified = np.ones((N_Z, N_phi))
+    H_modified[-2:, :] = 10.0
+
+    _, _, _, D1, _, _ = precompute_coefficients_cpu(H_normal, d_phi, d_Z, R, L)
+    _, _, _, D2, _, _ = precompute_coefficients_cpu(H_modified, d_phi, d_Z, R, L)
+
+    # D_full[1,:] uses interface (0,1) -- must not depend on last rows
+    d1_match = np.allclose(D1[1, :], D2[1, :], rtol=1e-12)
+    all_passed &= run_test(
+        "D_full[1,:] independent of last rows of H",
+        d1_match,
+        f"max diff = {np.max(np.abs(D1[1, :] - D2[1, :])):.2e}"
+    )
+
+    # C_full[N_Z-2,:] must not depend on first rows
+    _, _, C1, _, _, _ = precompute_coefficients_cpu(H_normal, d_phi, d_Z, R, L)
+    H_modified2 = np.ones((N_Z, N_phi))
+    H_modified2[:2, :] = 10.0
+    _, _, C2, _, _, _ = precompute_coefficients_cpu(H_modified2, d_phi, d_Z, R, L)
+
+    c_match = np.allclose(C1[-2, :], C2[-2, :], rtol=1e-12)
+    all_passed &= run_test(
+        "C_full[-2,:] independent of first rows of H",
+        c_match,
+        f"max diff = {np.max(np.abs(C1[-2, :] - C2[-2, :])):.2e}"
+    )
+
+    # Boundary rows must be zero
+    d0_zero = np.all(D1[0, :] == 0)
+    d_last_zero = np.all(D1[-1, :] == 0)
+    c0_zero = np.all(C1[0, :] == 0)
+    c_last_zero = np.all(C1[-1, :] == 0)
+
+    all_passed &= run_test("D_full[0,:] == 0", d0_zero)
+    all_passed &= run_test("D_full[-1,:] == 0", d_last_zero)
+    all_passed &= run_test("C_full[0,:] == 0", c0_zero)
+    all_passed &= run_test("C_full[-1,:] == 0", c_last_zero)
+
+    return all_passed
+
+
+def test_dynamic_solver_legacy_phase():
+    """Test dynamic solver with phase_shift=pi/4 (legacy behavior) on both GPU and CPU."""
+    print("\n=== Test 4: Dynamic solver with phase_shift=pi/4 (legacy) ===")
+
+    from reynolds_solver.solver_dynamic import solve_reynolds_gpu_dynamic
+    import cupy as cp
+
+    R = 0.035
+    L = 0.056
+    epsilon = 0.6
+    N = 250
+    omega_sor = 1.5
+    tol = 1e-5
+    max_iter = 50000
+    xprime = 0.001
+    yprime = 0.001
+    beta = 2.0
+    phase_shift = np.pi / 4.0
+
+    H, d_phi, d_Z, phi_1D, Z = generate_test_case(N, epsilon)
+
+    # --- CPU ---
+    print("  Solving on CPU (Numba, phase_shift=pi/4)...")
+    P_cpu, delta_cpu, iter_cpu = solve_reynolds_cpu_dynamic(
+        H, d_phi, d_Z, R, L,
+        xprime=xprime, yprime=yprime, beta=beta,
+        phase_shift=phase_shift,
+        omega=omega_sor, tol=tol, max_iter=max_iter
+    )
+    print(f"  CPU: {iter_cpu} iters, delta = {delta_cpu:.2e}")
+
+    # --- GPU ---
+    print("  Solving on GPU (CuPy, phase_shift=pi/4)...")
+    # warmup
+    solve_reynolds_gpu_dynamic(H, d_phi, d_Z, R, L,
+                                xprime=xprime, yprime=yprime, beta=beta,
+                                phase_shift=phase_shift,
+                                omega=omega_sor, tol=0.1, max_iter=10, check_every=5)
+    cp.cuda.Device(0).synchronize()
+
+    P_gpu, delta_gpu, iter_gpu = solve_reynolds_gpu_dynamic(
+        H, d_phi, d_Z, R, L,
+        xprime=xprime, yprime=yprime, beta=beta,
+        phase_shift=phase_shift,
+        omega=omega_sor, tol=tol, max_iter=max_iter
+    )
+    cp.cuda.Device(0).synchronize()
+    print(f"  GPU: {iter_gpu} iters, delta = {delta_gpu:.2e}")
+
+    all_passed = True
+
+    P_max = np.max(P_cpu)
+    if P_max > 0:
+        max_err = np.max(np.abs(P_cpu - P_gpu)) / P_max
+    else:
+        max_err = np.max(np.abs(P_cpu - P_gpu))
+
+    passed = max_err < 5e-3
+    all_passed &= run_test(
+        "Dynamic (legacy pi/4): max|P_cpu - P_gpu| / max(P_cpu) < 5e-3",
+        passed,
+        f"max_err = {max_err:.2e}"
+    )
+
+    return all_passed
+
+
 def run_benchmark():
     """Benchmark: CPU vs GPU on 250x250, 500x500, 1000x1000."""
     print("\n" + "=" * 60)
@@ -588,6 +758,8 @@ def main():
     results = []
     results.append(test_static_solver())
     results.append(test_dynamic_solver())
+    results.append(test_z_coefficients_no_wrap())
+    results.append(test_dynamic_solver_legacy_phase())
 
     # Multi-grid benchmark
     run_benchmark()
