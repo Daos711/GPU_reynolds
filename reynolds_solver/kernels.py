@@ -2,8 +2,10 @@
 CUDA C kernels for Red-Black SOR solution of the Reynolds equation.
 
 Contains:
-  - rb_sor_step:  one half-step of Red-Black SOR (no residual computation)
-  - apply_bc:     boundary conditions (periodic in phi, Dirichlet in Z)
+  - rb_sor_step:      one half-step of Red-Black SOR (Half-Sommerfeld)
+  - rb_sor_jfo_step:  one half-step of Red-Black SOR (JFO active-set)
+  - update_theta_step: upwind theta transport in cavitation zone (double buffer)
+  - apply_bc:          boundary conditions (periodic in phi, Dirichlet in Z)
 
 All kernels are compiled via CuPy RawKernel on first call and cached.
 """
@@ -59,6 +61,98 @@ extern "C" __global__ void rb_sor_step(
 """
 
 # ---------------------------------------------------------------------------
+# CUDA kernel: one Red-Black SOR half-step for JFO (active-set only)
+# ---------------------------------------------------------------------------
+_RB_SOR_JFO_KERNEL_CODE = r"""
+extern "C" __global__ void rb_sor_jfo_step(
+    double* __restrict__ P,
+    const double* __restrict__ A_arr,
+    const double* __restrict__ B_arr,
+    const double* __restrict__ C_arr,
+    const double* __restrict__ D_arr,
+    const double* __restrict__ E_arr,
+    const double* __restrict__ F_arr,
+    const int* __restrict__ zone_mask,
+    const int N_Z,
+    const int N_phi,
+    const double omega_sor,
+    const int color
+)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    int i = blockIdx.y * blockDim.y + threadIdx.y + 1;
+
+    if (i >= N_Z - 1 || j >= N_phi - 1) return;
+
+    // checkerboard coloring: skip points of the other color
+    if ((i + j) % 2 != color) return;
+
+    int idx = i * N_phi + j;
+
+    if (zone_mask[idx] == 1) {
+        // Active zone: standard SOR update with F_theta as RHS
+        int j_plus  = (j + 1 < N_phi - 1) ? j + 1 : 1;
+        int j_minus = (j - 1 >= 1)        ? j - 1 : N_phi - 2;
+
+        double P_old = P[idx];
+
+        double P_new = (A_arr[idx] * P[i * N_phi + j_plus]
+                      + B_arr[idx] * P[i * N_phi + j_minus]
+                      + C_arr[idx] * P[(i + 1) * N_phi + j]
+                      + D_arr[idx] * P[(i - 1) * N_phi + j]
+                      - F_arr[idx]) / E_arr[idx];
+
+        // SOR relaxation (no P<0 clamp here — mask handles cavitation)
+        P[idx] = P_old + omega_sor * (P_new - P_old);
+    } else {
+        // Cavitation zone: P = 0
+        P[idx] = 0.0;
+    }
+}
+"""
+
+# ---------------------------------------------------------------------------
+# CUDA kernel: upwind theta transport (double buffer: old -> new)
+# ---------------------------------------------------------------------------
+_UPDATE_THETA_KERNEL_CODE = r"""
+extern "C" __global__ void update_theta_step(
+    const double* __restrict__ theta_old,
+    double* __restrict__ theta_new,
+    const double* __restrict__ H,
+    const int* __restrict__ zone_mask,
+    const int N_Z,
+    const int N_phi
+)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i >= N_Z || j >= N_phi) return;
+
+    int idx = i * N_phi + j;
+
+    if (zone_mask[idx] == 0) {
+        // Cavitation zone: upwind along +phi direction
+        int j_prev = (j - 1 + N_phi) % N_phi;
+        double H_here = H[idx];
+        double H_prev = H[i * N_phi + j_prev];
+        double theta_prev = theta_old[i * N_phi + j_prev];
+
+        double theta_val = (H_prev / H_here) * theta_prev;
+
+        // Clamp to [0, 1]
+        if (theta_val < 0.0) theta_val = 0.0;
+        if (theta_val > 1.0) theta_val = 1.0;
+
+        theta_new[idx] = theta_val;
+    } else {
+        // Active zone: theta = 1
+        theta_new[idx] = 1.0;
+    }
+}
+"""
+
+# ---------------------------------------------------------------------------
 # CUDA kernel: boundary conditions
 # ---------------------------------------------------------------------------
 _APPLY_BC_KERNEL_CODE = r"""
@@ -90,6 +184,8 @@ extern "C" __global__ void apply_bc(
 # Compiled kernels (lazy init)
 # ---------------------------------------------------------------------------
 _rb_sor_kernel = None
+_rb_sor_jfo_kernel = None
+_update_theta_kernel = None
 _apply_bc_kernel = None
 
 
@@ -99,6 +195,22 @@ def get_rb_sor_kernel():
     if _rb_sor_kernel is None:
         _rb_sor_kernel = cp.RawKernel(_RB_SOR_KERNEL_CODE, "rb_sor_step")
     return _rb_sor_kernel
+
+
+def get_rb_sor_jfo_kernel():
+    """Returns compiled CUDA Red-Black SOR kernel for JFO (cached)."""
+    global _rb_sor_jfo_kernel
+    if _rb_sor_jfo_kernel is None:
+        _rb_sor_jfo_kernel = cp.RawKernel(_RB_SOR_JFO_KERNEL_CODE, "rb_sor_jfo_step")
+    return _rb_sor_jfo_kernel
+
+
+def get_update_theta_kernel():
+    """Returns compiled CUDA theta transport kernel (cached)."""
+    global _update_theta_kernel
+    if _update_theta_kernel is None:
+        _update_theta_kernel = cp.RawKernel(_UPDATE_THETA_KERNEL_CODE, "update_theta_step")
+    return _update_theta_kernel
 
 
 def get_apply_bc_kernel():
