@@ -53,7 +53,7 @@ def solve_reynolds(
     P_init: np.ndarray = None,
     # JFO-specific parameters
     jfo_max_outer: int = 500,
-    jfo_max_inner: int = 100,
+    jfo_max_inner: int = 500,
     jfo_p_off: float = 0.0,
     jfo_p_on: float = 1e-6,
     jfo_tol_theta: float = 1e-5,

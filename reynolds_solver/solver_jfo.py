@@ -181,7 +181,7 @@ class SolverJFO:
         tol_theta=1e-5,
         tol_inner=None,
         max_outer=500,
-        max_inner=100,
+        max_inner=500,
         p_off=0.0,
         p_on=1e-6,
         P_init=None,
@@ -202,7 +202,7 @@ class SolverJFO:
         n_inner_total : int
         """
         if tol_inner is None:
-            tol_inner = tol_P * 0.1
+            tol_inner = tol_P
 
         if p_on <= p_off:
             raise ValueError(
@@ -281,6 +281,8 @@ class SolverJFO:
             # (a) Inner SOR: solve P at fixed mask/theta
             #     F_theta was built at end of previous iteration (or initial)
             inner_iters = 0
+            dP_inner_last = 0.0
+            dP_inner_best = float('inf')
             for inner in range(max_inner):
                 P_before = self._P.copy()
                 self._run_jfo_sor_iteration(sor_kernel, bc_kernel, omega)
@@ -288,8 +290,12 @@ class SolverJFO:
                 inner_iters += 1
 
                 delta_P_inner = float(cp.max(cp.abs(self._P - P_before)))
+                dP_inner_last = delta_P_inner
+                if delta_P_inner < dP_inner_best:
+                    dP_inner_best = delta_P_inner
                 if delta_P_inner < tol_inner:
                     break
+            hit_max_inner = (inner_iters == max_inner)
 
             # (b) Update zone mask with hysteresis (uses current P and F_theta)
             self._update_zone_mask(H_gpu, p_off, p_on)
@@ -332,14 +338,16 @@ class SolverJFO:
                 )
                 seam_mask = int(cp.sum(self._mask[:, 0] != self._mask[:, N_phi - 2])) + \
                             int(cp.sum(self._mask[:, N_phi - 1] != self._mask[:, 1]))
+                hit_flag = "!" if hit_max_inner else " "
                 print(
                     f"    outer={outer:>4d}: dP={residual_P:.2e}, "
                     f"dtheta={residual_theta:.2e}, "
-                    f"mask_changed={mask_changed_count} "
+                    f"mask={mask_changed_count} "
                     f"(0\u21921={n_0to1}, 1\u21920={n_1to0}), "
-                    f"cav_frac={cav_frac:.3f}, "
-                    f"inner={inner_iters}, "
-                    f"seam_t={seam_theta:.2e}, seam_m={seam_mask}"
+                    f"cav={cav_frac:.3f}, "
+                    f"inner={inner_iters}{hit_flag} "
+                    f"dPi_last={dP_inner_last:.2e} best={dP_inner_best:.2e}, "
+                    f"seam={seam_theta:.1e}/{seam_mask}"
                 )
 
             if (mask_changed_count == 0) and residual_P < tol_P and residual_theta < tol_theta:
