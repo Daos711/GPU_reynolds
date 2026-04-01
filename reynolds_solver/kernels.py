@@ -4,7 +4,7 @@ CUDA C kernels for Red-Black SOR solution of the Reynolds equation.
 Contains:
   - rb_sor_step:      one half-step of Red-Black SOR (Half-Sommerfeld)
   - rb_sor_jfo_step:  one half-step of Red-Black SOR (JFO active-set)
-  - update_theta_step: upwind theta transport in cavitation zone (double buffer)
+  - update_theta_sweep: upwind theta line-sweep along phi (one thread per Z-row)
   - apply_bc:          boundary conditions (periodic in phi, Dirichlet in Z)
 
 All kernels are compiled via CuPy RawKernel on first call and cached.
@@ -112,42 +112,41 @@ extern "C" __global__ void rb_sor_jfo_step(
 """
 
 # ---------------------------------------------------------------------------
-# CUDA kernel: upwind theta transport (double buffer: old -> new)
+# CUDA kernel: upwind theta line-sweep along phi (one thread per Z-row)
+# Sequential within each row to propagate H*theta = const fully.
+# Two passes handle periodic wrap-around of cavitation zones.
 # ---------------------------------------------------------------------------
-_UPDATE_THETA_KERNEL_CODE = r"""
-extern "C" __global__ void update_theta_step(
-    const double* __restrict__ theta_old,
-    double* __restrict__ theta_new,
+_UPDATE_THETA_SWEEP_KERNEL_CODE = r"""
+extern "C" __global__ void update_theta_sweep(
+    double* __restrict__ theta,
     const double* __restrict__ H,
     const int* __restrict__ zone_mask,
     const int N_Z,
     const int N_phi
 )
 {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N_Z) return;
 
-    if (i >= N_Z || j >= N_phi) return;
-
-    int idx = i * N_phi + j;
-
-    if (zone_mask[idx] == 0) {
-        // Cavitation zone: upwind along +phi direction
-        int j_prev = (j - 1 + N_phi) % N_phi;
-        double H_here = H[idx];
-        double H_prev = H[i * N_phi + j_prev];
-        double theta_prev = theta_old[i * N_phi + j_prev];
-
-        double theta_val = (H_prev / H_here) * theta_prev;
-
-        // Clamp to [0, 1]
-        if (theta_val < 0.0) theta_val = 0.0;
-        if (theta_val > 1.0) theta_val = 1.0;
-
-        theta_new[idx] = theta_val;
-    } else {
-        // Active zone: theta = 1
-        theta_new[idx] = 1.0;
+    // Two passes to handle periodic wrap-around of cavitation zone
+    for (int pass = 0; pass < 2; pass++) {
+        for (int j = 0; j < N_phi; j++) {
+            int idx = i * N_phi + j;
+            if (zone_mask[idx] == 0) {
+                // Cavitation: upwind along +phi, H*theta = const
+                int j_prev = (j - 1 + N_phi) % N_phi;
+                double H_here = H[idx];
+                double H_prev = H[i * N_phi + j_prev];
+                double theta_prev = theta[i * N_phi + j_prev];
+                double val = (H_prev / H_here) * theta_prev;
+                if (val < 0.0) val = 0.0;
+                if (val > 1.0) val = 1.0;
+                theta[idx] = val;
+            } else {
+                // Active zone: theta = 1
+                theta[idx] = 1.0;
+            }
+        }
     }
 }
 """
@@ -185,7 +184,7 @@ extern "C" __global__ void apply_bc(
 # ---------------------------------------------------------------------------
 _rb_sor_kernel = None
 _rb_sor_jfo_kernel = None
-_update_theta_kernel = None
+_update_theta_sweep_kernel = None
 _apply_bc_kernel = None
 
 
@@ -205,12 +204,14 @@ def get_rb_sor_jfo_kernel():
     return _rb_sor_jfo_kernel
 
 
-def get_update_theta_kernel():
-    """Returns compiled CUDA theta transport kernel (cached)."""
-    global _update_theta_kernel
-    if _update_theta_kernel is None:
-        _update_theta_kernel = cp.RawKernel(_UPDATE_THETA_KERNEL_CODE, "update_theta_step")
-    return _update_theta_kernel
+def get_update_theta_sweep_kernel():
+    """Returns compiled CUDA theta line-sweep kernel (cached)."""
+    global _update_theta_sweep_kernel
+    if _update_theta_sweep_kernel is None:
+        _update_theta_sweep_kernel = cp.RawKernel(
+            _UPDATE_THETA_SWEEP_KERNEL_CODE, "update_theta_sweep"
+        )
+    return _update_theta_sweep_kernel
 
 
 def get_apply_bc_kernel():

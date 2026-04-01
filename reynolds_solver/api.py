@@ -60,6 +60,7 @@ def solve_reynolds(
     jfo_tol_inner: float = None,
     theta_init: np.ndarray = None,
     mask_init: np.ndarray = None,
+    verbose: bool = False,
 ) -> tuple:
     """
     Solve the Reynolds equation on GPU (Red-Black SOR).
@@ -192,6 +193,7 @@ def solve_reynolds(
             P_init=P_init,
             theta_init=theta_init,
             mask_init=mask_init,
+            verbose=verbose,
         )
 
     else:

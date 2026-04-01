@@ -57,7 +57,7 @@ def test_mass_conservativity():
     H, d_phi, d_Z, phi_1D, Z = generate_test_case(N, epsilon)
 
     P, theta, residual, n_outer, n_inner = solve_reynolds(
-        H, d_phi, d_Z, R, L, cavitation="jfo",
+        H, d_phi, d_Z, R, L, cavitation="jfo", verbose=True,
     )
     print(f"    Converged: {n_outer} outer, {n_inner} inner total, residual={residual:.2e}")
 
