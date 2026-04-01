@@ -260,16 +260,17 @@ class SolverJFO:
         residual_P = 1.0
         residual_theta = 1.0
 
+        # Build initial F_theta from consistent initial state
+        self._build_F_theta(H_gpu, d_phi)
+
         for outer in range(max_outer):
             # Save state for convergence check
             self._mask_old[:] = self._mask
             self._theta_prev[:] = self._theta
             self._P_old[:] = self._P
 
-            # (a) Rebuild RHS with current theta
-            self._build_F_theta(H_gpu, d_phi)
-
-            # (b) Inner SOR loop on active zone
+            # (a) Inner SOR: solve P at fixed mask/theta
+            #     F_theta was built at end of previous iteration (or initial)
             inner_iters = 0
             for inner in range(max_inner):
                 P_before = self._P.copy()
@@ -281,17 +282,21 @@ class SolverJFO:
                 if delta_P_inner < tol_inner:
                     break
 
-            # (c) Update theta via line-sweep (in-place, full propagation)
-            self._run_theta_sweep(sweep_kernel, H_gpu)
-
-            # (d) Update zone mask with hysteresis
+            # (b) Update zone mask with hysteresis (uses current P and F_theta)
             self._update_zone_mask(H_gpu, p_off, p_on)
 
-            # Enforce invariants
+            # (c) Strict projection: enforce invariants immediately
             cav = (self._mask == 0)
             self._P[cav] = 0.0
             act = (self._mask == 1)
             self._theta[act] = 1.0
+            cp.maximum(self._P, 0.0, out=self._P)
+
+            # (d) Theta sweep in cavitation zone (using NEW mask)
+            self._run_theta_sweep(sweep_kernel, H_gpu)
+
+            # (e) Rebuild F_theta on consistent theta/mask state
+            self._build_F_theta(H_gpu, d_phi)
 
             # Apply BCs
             bc_kernel(
@@ -299,8 +304,11 @@ class SolverJFO:
                 (self._P, np.int32(N_Z), np.int32(N_phi)),
             )
 
-            # (e) Check outer convergence
-            mask_changed_count = int(cp.sum(self._mask != self._mask_old))
+            # (f) Check outer convergence
+            diff_mask = self._mask != self._mask_old
+            mask_changed_count = int(cp.sum(diff_mask))
+            n_0to1 = int(cp.sum((self._mask_old == 0) & (self._mask == 1)))
+            n_1to0 = int(cp.sum((self._mask_old == 1) & (self._mask == 0)))
             residual_P = float(cp.max(cp.abs(self._P - self._P_old)))
             residual_theta = float(cp.max(cp.abs(self._theta - self._theta_prev)))
             cav_frac = float(cp.mean((self._mask == 0).astype(cp.float64)))
@@ -309,7 +317,8 @@ class SolverJFO:
                 print(
                     f"    outer={outer:>4d}: dP={residual_P:.2e}, "
                     f"dtheta={residual_theta:.2e}, "
-                    f"mask_changed={mask_changed_count}, "
+                    f"mask_changed={mask_changed_count} "
+                    f"(0\u21921={n_0to1}, 1\u21920={n_1to0}), "
                     f"cav_frac={cav_frac:.3f}, "
                     f"inner={inner_iters}"
                 )
