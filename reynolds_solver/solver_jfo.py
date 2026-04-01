@@ -124,7 +124,7 @@ class SolverJFO:
         self._mask[:, 0] = self._mask[:, N_phi - 2]
         self._mask[:, N_phi - 1] = self._mask[:, 1]
 
-    def _run_theta_sweep(self, sweep_kernel, H_gpu):
+    def _run_theta_sweep(self, sweep_kernel, H_gpu, direction=0):
         """Run theta line-sweep: one thread per Z-row, sequential along phi."""
         N_Z, N_phi = self.N_Z, self.N_phi
         sweep_kernel(
@@ -132,6 +132,7 @@ class SolverJFO:
             (
                 self._theta, H_gpu, self._mask,
                 np.int32(N_Z), np.int32(N_phi),
+                np.int32(direction),
             ),
         )
 
@@ -188,6 +189,8 @@ class SolverJFO:
         theta_init=None,
         mask_init=None,
         verbose=False,
+        sweep_direction=0,
+        flip_F_sign=False,
     ):
         """
         Solve Reynolds equation with JFO cavitation.
@@ -271,6 +274,8 @@ class SolverJFO:
         # Sync ghost columns and build initial F_theta
         self._sync_periodic()
         self._build_F_theta(H_gpu, d_phi)
+        if flip_F_sign:
+            self._F_theta *= -1.0
 
         for outer in range(max_outer):
             # Save state for convergence check
@@ -309,11 +314,13 @@ class SolverJFO:
             self._sync_periodic()
 
             # (d) Theta sweep in cavitation zone (using NEW mask)
-            self._run_theta_sweep(sweep_kernel, H_gpu)
+            self._run_theta_sweep(sweep_kernel, H_gpu, direction=sweep_direction)
 
             # (e) Periodic sync + rebuild F_theta on consistent state
             self._sync_periodic()
             self._build_F_theta(H_gpu, d_phi)
+            if flip_F_sign:
+                self._F_theta *= -1.0
 
             # Apply BCs
             bc_kernel(
@@ -396,6 +403,8 @@ def solve_reynolds_gpu_jfo(
     theta_init=None,
     mask_init=None,
     verbose: bool = False,
+    sweep_direction: int = 0,
+    flip_F_sign: bool = False,
 ) -> tuple:
     """
     Solve Reynolds equation with JFO cavitation on GPU.
@@ -428,4 +437,6 @@ def solve_reynolds_gpu_jfo(
         theta_init=theta_init,
         mask_init=mask_init,
         verbose=verbose,
+        sweep_direction=sweep_direction,
+        flip_F_sign=flip_F_sign,
     )

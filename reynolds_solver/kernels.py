@@ -122,7 +122,8 @@ extern "C" __global__ void update_theta_sweep(
     const double* __restrict__ H,
     const int* __restrict__ zone_mask,
     const int N_Z,
-    const int N_phi
+    const int N_phi,
+    const int direction
 )
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -131,22 +132,39 @@ extern "C" __global__ void update_theta_sweep(
     // Physical columns: j = 1 .. N_phi-2  (columns 0 and N_phi-1 are ghosts)
     // Two passes to handle periodic wrap-around of cavitation zone.
     for (int pass = 0; pass < 2; pass++) {
-        for (int j = 1; j <= N_phi - 2; j++) {
-            int idx = i * N_phi + j;
-            if (zone_mask[idx] == 0) {
-                // Cavitation: upwind along +phi, H*theta = const
-                // j_prev wraps periodically through physical domain
-                int j_prev = (j == 1) ? (N_phi - 2) : (j - 1);
-                double H_here = H[idx];
-                double H_prev = H[i * N_phi + j_prev];
-                double theta_prev = theta[i * N_phi + j_prev];
-                double val = (H_prev / H_here) * theta_prev;
-                if (val < 0.0) val = 0.0;
-                if (val > 1.0) val = 1.0;
-                theta[idx] = val;
-            } else {
-                // Active zone: theta = 1
-                theta[idx] = 1.0;
+        if (direction == 0) {
+            // Forward sweep (+phi): j from 1 to N_phi-2, upstream = j-1
+            for (int j = 1; j <= N_phi - 2; j++) {
+                int idx = i * N_phi + j;
+                if (zone_mask[idx] == 0) {
+                    int j_prev = (j == 1) ? (N_phi - 2) : (j - 1);
+                    double H_here = H[idx];
+                    double H_prev = H[i * N_phi + j_prev];
+                    double theta_prev = theta[i * N_phi + j_prev];
+                    double val = (H_prev / H_here) * theta_prev;
+                    if (val < 0.0) val = 0.0;
+                    if (val > 1.0) val = 1.0;
+                    theta[idx] = val;
+                } else {
+                    theta[idx] = 1.0;
+                }
+            }
+        } else {
+            // Backward sweep (-phi): j from N_phi-2 to 1, upstream = j+1
+            for (int j = N_phi - 2; j >= 1; j--) {
+                int idx = i * N_phi + j;
+                if (zone_mask[idx] == 0) {
+                    int j_next = (j == N_phi - 2) ? 1 : (j + 1);
+                    double H_here = H[idx];
+                    double H_next = H[i * N_phi + j_next];
+                    double theta_next = theta[i * N_phi + j_next];
+                    double val = (H_next / H_here) * theta_next;
+                    if (val < 0.0) val = 0.0;
+                    if (val > 1.0) val = 1.0;
+                    theta[idx] = val;
+                } else {
+                    theta[idx] = 1.0;
+                }
             }
         }
         // Sync ghost columns after each pass
