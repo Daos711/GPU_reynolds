@@ -16,4 +16,4 @@ from reynolds_solver.api import solve_reynolds
 from reynolds_solver.solver import ReynoldsSolverGPU
 
 __all__ = ["solve_reynolds", "ReynoldsSolverGPU"]
-__version__ = "1.1.0"
+__version__ = "1.2.0"

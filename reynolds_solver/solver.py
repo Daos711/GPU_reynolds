@@ -98,6 +98,8 @@ class ReynoldsSolverGPU:
         tol: float = 1e-5,
         max_iter: int = 50000,
         check_every: int = 500,
+        closure=None,
+        P_init=None,
     ) -> tuple:
         """
         Solve the static Reynolds equation on GPU.
@@ -114,6 +116,10 @@ class ReynoldsSolverGPU:
         max_iter : int
         check_every : int
             How often to check convergence (iterations).
+        closure : Closure or None
+            Conductance model. None defaults to LaminarClosure.
+        P_init : np.ndarray or None
+            Initial pressure field for warm start.
 
         Returns
         -------
@@ -122,12 +128,17 @@ class ReynoldsSolverGPU:
         n_iter : int
         """
         N_Z, N_phi = H.shape
-        assert N_Z == self.N_Z and N_phi == self.N_phi, \
-            f"Grid size mismatch: solver ({self.N_Z}x{self.N_phi}) vs input ({N_Z}x{N_phi})"
+        if N_Z != self.N_Z or N_phi != self.N_phi:
+            raise ValueError(
+                f"Grid size mismatch: solver ({self.N_Z}x{self.N_phi}) "
+                f"vs input ({N_Z}x{N_phi})"
+            )
 
         # 1. Transfer H to GPU and precompute coefficients
         H_gpu = cp.asarray(H, dtype=cp.float64)
-        A, B, C, D, E, F = precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L)
+        A, B, C, D, E, F = precompute_coefficients_gpu(
+            H_gpu, d_phi, d_Z, R, L, closure=closure
+        )
 
         # Copy into cached buffers
         self._A[:] = A
@@ -136,7 +147,16 @@ class ReynoldsSolverGPU:
         self._D[:] = D
         self._E[:] = E
         self._F[:] = F
-        self._P[:] = 0.0
+
+        if P_init is not None:
+            P_arr = cp.asarray(P_init, dtype=cp.float64)
+            if P_arr.shape != (N_Z, N_phi):
+                raise ValueError(
+                    f"P_init shape {P_arr.shape} != H shape {(N_Z, N_phi)}"
+                )
+            self._P[:] = P_arr
+        else:
+            self._P[:] = 0.0
 
         # 2. Get compiled kernels
         sor_kernel = get_rb_sor_kernel()
@@ -180,6 +200,7 @@ class ReynoldsSolverGPU:
         tol: float = 1e-5,
         max_iter: int = 50000,
         check_every: int = 500,
+        P_init=None,
     ) -> tuple:
         """
         Internal method: solve with pre-computed coefficients on GPU.
@@ -195,7 +216,16 @@ class ReynoldsSolverGPU:
         self._D[:] = D
         self._E[:] = E
         self._F[:] = F_full
-        self._P[:] = 0.0
+
+        if P_init is not None:
+            P_arr = cp.asarray(P_init, dtype=cp.float64)
+            if P_arr.shape != (N_Z, N_phi):
+                raise ValueError(
+                    f"P_init shape {P_arr.shape} != expected shape {(N_Z, N_phi)}"
+                )
+            self._P[:] = P_arr
+        else:
+            self._P[:] = 0.0
 
         sor_kernel = get_rb_sor_kernel()
         bc_kernel = get_apply_bc_kernel()
@@ -244,6 +274,8 @@ def solve_reynolds_gpu(
     tol: float = 1e-5,
     max_iter: int = 50000,
     check_every: int = 500,
+    closure=None,
+    P_init=None,
 ) -> tuple:
     """
     Drop-in replacement for solve_reynolds_gauss_seidel_numba().
@@ -259,6 +291,10 @@ def solve_reynolds_gpu(
     tol : float
     max_iter : int
     check_every : int
+    closure : Closure or None
+        Conductance model. None defaults to LaminarClosure.
+    P_init : np.ndarray or None
+        Initial pressure field for warm start.
 
     Returns
     -------
@@ -268,4 +304,7 @@ def solve_reynolds_gpu(
     """
     N_Z, N_phi = H.shape
     solver = _get_solver(N_Z, N_phi)
-    return solver.solve(H, d_phi, d_Z, R, L, omega, tol, max_iter, check_every)
+    return solver.solve(
+        H, d_phi, d_Z, R, L, omega, tol, max_iter, check_every,
+        closure=closure, P_init=P_init,
+    )
