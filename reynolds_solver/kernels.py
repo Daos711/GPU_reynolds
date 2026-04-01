@@ -128,13 +128,15 @@ extern "C" __global__ void update_theta_sweep(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N_Z) return;
 
-    // Two passes to handle periodic wrap-around of cavitation zone
+    // Physical columns: j = 1 .. N_phi-2  (columns 0 and N_phi-1 are ghosts)
+    // Two passes to handle periodic wrap-around of cavitation zone.
     for (int pass = 0; pass < 2; pass++) {
-        for (int j = 0; j < N_phi; j++) {
+        for (int j = 1; j <= N_phi - 2; j++) {
             int idx = i * N_phi + j;
             if (zone_mask[idx] == 0) {
                 // Cavitation: upwind along +phi, H*theta = const
-                int j_prev = (j - 1 + N_phi) % N_phi;
+                // j_prev wraps periodically through physical domain
+                int j_prev = (j == 1) ? (N_phi - 2) : (j - 1);
                 double H_here = H[idx];
                 double H_prev = H[i * N_phi + j_prev];
                 double theta_prev = theta[i * N_phi + j_prev];
@@ -147,6 +149,9 @@ extern "C" __global__ void update_theta_sweep(
                 theta[idx] = 1.0;
             }
         }
+        // Sync ghost columns after each pass
+        theta[i * N_phi + 0]           = theta[i * N_phi + (N_phi - 2)];
+        theta[i * N_phi + (N_phi - 1)] = theta[i * N_phi + 1];
     }
 }
 """

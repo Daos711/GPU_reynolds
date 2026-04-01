@@ -116,6 +116,14 @@ class SolverJFO:
             (self._P, np.int32(N_Z), np.int32(N_phi)),
         )
 
+    def _sync_periodic(self):
+        """Sync ghost columns for theta and mask (periodic in phi)."""
+        N_phi = self.N_phi
+        self._theta[:, 0] = self._theta[:, N_phi - 2]
+        self._theta[:, N_phi - 1] = self._theta[:, 1]
+        self._mask[:, 0] = self._mask[:, N_phi - 2]
+        self._mask[:, N_phi - 1] = self._mask[:, 1]
+
     def _run_theta_sweep(self, sweep_kernel, H_gpu):
         """Run theta line-sweep: one thread per Z-row, sequential along phi."""
         N_Z, N_phi = self.N_Z, self.N_phi
@@ -260,7 +268,8 @@ class SolverJFO:
         residual_P = 1.0
         residual_theta = 1.0
 
-        # Build initial F_theta from consistent initial state
+        # Sync ghost columns and build initial F_theta
+        self._sync_periodic()
         self._build_F_theta(H_gpu, d_phi)
 
         for outer in range(max_outer):
@@ -291,11 +300,13 @@ class SolverJFO:
             act = (self._mask == 1)
             self._theta[act] = 1.0
             cp.maximum(self._P, 0.0, out=self._P)
+            self._sync_periodic()
 
             # (d) Theta sweep in cavitation zone (using NEW mask)
             self._run_theta_sweep(sweep_kernel, H_gpu)
 
-            # (e) Rebuild F_theta on consistent theta/mask state
+            # (e) Periodic sync + rebuild F_theta on consistent state
+            self._sync_periodic()
             self._build_F_theta(H_gpu, d_phi)
 
             # Apply BCs
@@ -314,13 +325,21 @@ class SolverJFO:
             cav_frac = float(cp.mean((self._mask == 0).astype(cp.float64)))
 
             if verbose and (outer % 20 == 0 or outer < 5):
+                N_phi = self.N_phi
+                seam_theta = max(
+                    float(cp.max(cp.abs(self._theta[:, 0] - self._theta[:, N_phi - 2]))),
+                    float(cp.max(cp.abs(self._theta[:, N_phi - 1] - self._theta[:, 1]))),
+                )
+                seam_mask = int(cp.sum(self._mask[:, 0] != self._mask[:, N_phi - 2])) + \
+                            int(cp.sum(self._mask[:, N_phi - 1] != self._mask[:, 1]))
                 print(
                     f"    outer={outer:>4d}: dP={residual_P:.2e}, "
                     f"dtheta={residual_theta:.2e}, "
                     f"mask_changed={mask_changed_count} "
                     f"(0\u21921={n_0to1}, 1\u21920={n_1to0}), "
                     f"cav_frac={cav_frac:.3f}, "
-                    f"inner={inner_iters}"
+                    f"inner={inner_iters}, "
+                    f"seam_t={seam_theta:.2e}, seam_m={seam_mask}"
                 )
 
             if (mask_changed_count == 0) and residual_P < tol_P and residual_theta < tol_theta:
