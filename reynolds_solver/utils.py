@@ -81,6 +81,43 @@ def precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L, closure=None):
     return A_full, B_full, C_full, D_full, E_full, F_full
 
 
+def build_F_theta_gpu(H_gpu, theta_gpu, d_phi):
+    """
+    Build JFO RHS: F_theta = d(H*theta)/dphi using face-based fluxes.
+
+    Uses the same ghost/physical indexing and face scheme as F_orig
+    in precompute_coefficients_gpu.
+
+    When theta=1 everywhere, F_theta == F_orig to machine precision.
+
+    Parameters
+    ----------
+    H_gpu : cupy.ndarray, shape (N_Z, N_phi), float64
+    theta_gpu : cupy.ndarray, shape (N_Z, N_phi), float64
+    d_phi : float
+
+    Returns
+    -------
+    F_theta : cupy.ndarray, shape (N_Z, N_phi), float64
+    """
+    N_Z, N_phi = H_gpu.shape
+    Hth = H_gpu * theta_gpu
+
+    S_plus_half = 0.5 * (Hth[:, :-1] + Hth[:, 1:])
+
+    S_minus_half = cp.empty_like(S_plus_half)
+    S_minus_half[:, 1:] = S_plus_half[:, :-1]
+    S_minus_half[:, 0] = S_plus_half[:, -1]
+
+    F_half = d_phi * (S_plus_half - S_minus_half)
+
+    F_theta = cp.zeros((N_Z, N_phi), dtype=cp.float64)
+    F_theta[:, :-1] = F_half
+    F_theta[:, -1] = F_half[:, 0]
+
+    return F_theta
+
+
 def add_dynamic_rhs_gpu(F_full, d_phi, N_Z, N_phi, xprime, yprime, beta, phase_shift=0.0):
     """
     Add dynamic contribution to RHS F on GPU (in-place).

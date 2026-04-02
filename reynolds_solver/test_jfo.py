@@ -2,15 +2,17 @@
 Validation tests for JFO cavitation model.
 
 Tests:
-  1. Mass conservativity (discrete flux balance)
-  2. P >= 0 everywhere
-  3. theta in [0, 1] everywhere
-  4. In active zone theta == 1
-  5. Symmetric case (epsilon=0): P ~ 0
-  6. Cavitation zone non-empty at epsilon=0.6
-  7. Warm start no worse than cold start
-  8. Backward compatibility (old tests unaffected)
-  9. JFO ~ Half-Sommerfeld at small epsilon (loads within 5%)
+  0a. F_theta == F_orig when theta=1 (invariant check, no GPU solver needed)
+  0b. Frozen theta=1: JFO == HS (update_mask=False, run_theta_sweep=False)
+  1.  Mass conservativity (discrete flux balance)
+  2.  P >= 0 everywhere
+  3.  theta in [0, 1] everywhere
+  4.  In active zone theta == 1
+  5.  Symmetric case (epsilon=0): P ~ 0
+  6.  Cavitation zone non-empty at epsilon=0.6
+  7.  Warm start no worse than cold start
+  8.  Backward compatibility (old tests unaffected)
+  9.  JFO ~ Half-Sommerfeld at small epsilon (loads within 5%)
 
 Run:
     python -m reynolds_solver.test_jfo
@@ -40,6 +42,81 @@ def generate_test_case(N, epsilon=0.6):
     d_phi = phi_1D[1] - phi_1D[0]
     d_Z = Z[1] - Z[0]
     return H, d_phi, d_Z, phi_1D, Z
+
+
+# -----------------------------------------------------------------------
+# Test 0a: F_theta == F_orig when theta=1
+# -----------------------------------------------------------------------
+def test_f_theta_equals_f_orig():
+    print("\n=== Test 0a: F_theta == F_orig when theta=1 ===")
+    import cupy as cp
+    from reynolds_solver.utils import precompute_coefficients_gpu, build_F_theta_gpu
+
+    R, L = 0.035, 0.056
+    N = 250
+    epsilon = 0.6
+
+    H, d_phi, d_Z, _, _ = generate_test_case(N, epsilon)
+    H_gpu = cp.asarray(H, dtype=cp.float64)
+
+    _, _, _, _, _, F_orig = precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L)
+
+    theta_ones = cp.ones_like(H_gpu)
+    F_theta = build_F_theta_gpu(H_gpu, theta_ones, d_phi)
+
+    max_diff = float(cp.max(cp.abs(F_theta - F_orig)))
+    print(f"    max|F_theta - F_orig| = {max_diff:.4e}")
+
+    return run_test(
+        "F_theta == F_orig when theta=1 (< 1e-12)",
+        max_diff < 1e-12,
+        f"max_diff = {max_diff:.4e}"
+    )
+
+
+# -----------------------------------------------------------------------
+# Test 0b: Frozen theta=1 -> JFO == HS
+# -----------------------------------------------------------------------
+def test_frozen_theta_jfo_equals_hs():
+    print("\n=== Test 0b: Frozen theta=1 -> JFO == HS ===")
+    from reynolds_solver import solve_reynolds
+
+    R, L = 0.035, 0.056
+    N = 250
+    epsilon = 0.6
+
+    H, d_phi, d_Z, phi_1D, Z = generate_test_case(N, epsilon)
+
+    P_hs, _, _ = solve_reynolds(H, d_phi, d_Z, R, L, cavitation="half_sommerfeld")
+
+    P_jfo, theta, residual, n_outer, n_inner = solve_reynolds(
+        H, d_phi, d_Z, R, L, cavitation="jfo",
+        update_mask=False, run_theta_sweep=False,
+        verbose=True,
+    )
+
+    # theta should remain all-ones
+    theta_err = np.max(np.abs(theta - 1.0))
+
+    # P should match HS solution
+    max_P = max(np.max(np.abs(P_hs)), 1e-30)
+    p_diff = np.max(np.abs(P_jfo - P_hs)) / max_P
+
+    print(f"    max|theta - 1| = {theta_err:.4e}")
+    print(f"    max|P_jfo - P_hs| / max|P_hs| = {p_diff:.4e}")
+
+    all_passed = True
+    all_passed &= run_test(
+        "Frozen theta stays 1.0",
+        theta_err < 1e-12,
+        f"max|theta - 1| = {theta_err:.4e}"
+    )
+    all_passed &= run_test(
+        "Frozen JFO pressure matches HS (< 1%)",
+        p_diff < 0.01,
+        f"rel_diff = {p_diff:.4e}"
+    )
+    return all_passed
 
 
 # -----------------------------------------------------------------------
@@ -355,6 +432,8 @@ def main():
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     results = []
+    results.append(test_f_theta_equals_f_orig())
+    results.append(test_frozen_theta_jfo_equals_hs())
     results.append(test_mass_conservativity())
     results.append(test_pressure_nonneg())
     results.append(test_theta_bounds())

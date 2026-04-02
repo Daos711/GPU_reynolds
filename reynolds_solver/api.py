@@ -61,6 +61,10 @@ def solve_reynolds(
     theta_init: np.ndarray = None,
     mask_init: np.ndarray = None,
     verbose: bool = False,
+    # JFO debug flags
+    use_F_theta: bool = True,
+    update_mask: bool = True,
+    run_theta_sweep: bool = True,
 ) -> tuple:
     """
     Solve the Reynolds equation on GPU (Red-Black SOR).
@@ -117,6 +121,13 @@ def solve_reynolds(
         Initial fill fraction for JFO warm start. Values in [0, 1].
     mask_init : np.ndarray or None
         Initial zone mask for JFO warm start. Values in {0, 1}.
+    use_F_theta : bool
+        If True (default), use F_theta = d(H*theta)/dphi as SOR RHS.
+        If False, use F_orig = dH/dphi (diagnostic mode).
+    update_mask : bool
+        If True (default), update zone mask each outer iteration.
+    run_theta_sweep : bool
+        If True (default), run theta line-sweep each outer iteration.
 
     Returns
     -------
@@ -194,6 +205,9 @@ def solve_reynolds(
             theta_init=theta_init,
             mask_init=mask_init,
             verbose=verbose,
+            use_F_theta=use_F_theta,
+            update_mask=update_mask,
+            run_theta_sweep=run_theta_sweep,
         )
 
     else:

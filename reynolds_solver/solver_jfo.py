@@ -8,8 +8,8 @@ Method:
   - Outer loop: active-set iteration (zone mask updates, theta transport)
   - Inner loop: Red-Black SOR on active zone only (rb_sor_jfo_step kernel)
   - Theta transport: line-sweep along +phi (one thread per Z-row, in-place)
-  - RHS = original F = d(H)/dphi (same as Half-Sommerfeld)
-  - Theta tracked in cavitation zone for mass conservation only
+  - RHS = F_theta = d(H*theta)/dphi, rebuilt every outer iteration
+  - When use_F_theta=False (diagnostic): uses F_orig = d(H)/dphi instead
 """
 
 import numpy as np
@@ -20,7 +20,7 @@ from reynolds_solver.kernels import (
     get_update_theta_sweep_kernel,
     get_apply_bc_kernel,
 )
-from reynolds_solver.utils import precompute_coefficients_gpu
+from reynolds_solver.utils import precompute_coefficients_gpu, build_F_theta_gpu
 
 
 class SolverJFO:
@@ -48,7 +48,7 @@ class SolverJFO:
         self._mask = cp.ones(shape, dtype=cp.int32)
         self._mask_old = cp.empty(shape, dtype=cp.int32)
 
-        # Stencil coefficient buffers (including F_orig)
+        # Stencil coefficient buffers
         self._A = cp.empty(shape, dtype=cp.float64)
         self._B = cp.empty(shape, dtype=cp.float64)
         self._C = cp.empty(shape, dtype=cp.float64)
@@ -125,8 +125,9 @@ class SolverJFO:
         Update zone_mask based on hysteresis thresholds.
 
         Active -> cavitation: P <= p_off
-        Cavitation -> active: P_trial > p_on (computed via local stencil
-                              using ORIGINAL F, not F_theta)
+        Cavitation -> active: P_trial > p_on (computed via local stencil)
+
+        Uses self._F which contains F_theta (or F_orig in diagnostic mode).
         """
         N_Z, N_phi = self.N_Z, self.N_phi
 
@@ -175,9 +176,25 @@ class SolverJFO:
         mask_init=None,
         verbose=False,
         sweep_direction=0,
+        use_F_theta=True,
+        update_mask=True,
+        run_theta_sweep=True,
     ):
         """
         Solve Reynolds equation with JFO cavitation.
+
+        Parameters
+        ----------
+        use_F_theta : bool
+            If True (default), rebuild F_theta = d(H*theta)/dphi each outer
+            iteration and use as SOR RHS. If False, use F_orig = dH/dphi
+            (diagnostic mode, decouples theta from pressure).
+        update_mask : bool
+            If True (default), update zone mask each outer iteration.
+            Set False for frozen-state diagnostics.
+        run_theta_sweep : bool
+            If True (default), run theta sweep each outer iteration.
+            Set False for frozen-state diagnostics.
 
         Returns
         -------
@@ -198,7 +215,7 @@ class SolverJFO:
 
         N_Z, N_phi = self.N_Z, self.N_phi
 
-        # Load stencil coefficients (including original F = dH/dphi)
+        # Load stencil coefficients
         self._A[:] = A
         self._B[:] = B
         self._C[:] = C
@@ -259,13 +276,17 @@ class SolverJFO:
         # Sync ghost columns before iteration
         self._sync_periodic()
 
+        # Build initial F_theta if using theta-coupled RHS
+        if use_F_theta:
+            self._F[:] = build_F_theta_gpu(H_gpu, self._theta, d_phi)
+
         for outer in range(max_outer):
             # Save state for convergence check
             self._mask_old[:] = self._mask
             self._theta_prev[:] = self._theta
             self._P_old[:] = self._P
 
-            # (a) Inner SOR: solve P at fixed mask using original F as RHS
+            # (a) Inner SOR: solve P with current self._F as RHS
             inner_iters = 0
             dP_inner_last = 0.0
             dP_inner_best = float('inf')
@@ -283,8 +304,9 @@ class SolverJFO:
                     break
             hit_max_inner = (inner_iters == max_inner)
 
-            # (b) Update zone mask with hysteresis (P_trial uses original F)
-            self._update_zone_mask(p_off, p_on)
+            # (b) Update zone mask with hysteresis
+            if update_mask:
+                self._update_zone_mask(p_off, p_on)
 
             # (c) Strict projection: enforce invariants immediately
             cav = (self._mask == 0)
@@ -294,9 +316,14 @@ class SolverJFO:
             cp.maximum(self._P, 0.0, out=self._P)
             self._sync_periodic()
 
-            # (d) Theta sweep in cavitation zone (mass conservation tracking)
-            self._run_theta_sweep(sweep_kernel, H_gpu, direction=sweep_direction)
-            self._sync_periodic()
+            # (d) Theta sweep in cavitation zone
+            if run_theta_sweep:
+                self._run_theta_sweep(sweep_kernel, H_gpu, direction=sweep_direction)
+                self._sync_periodic()
+
+            # (e) Rebuild F_theta from current theta (for next SOR iteration)
+            if use_F_theta:
+                self._F[:] = build_F_theta_gpu(H_gpu, self._theta, d_phi)
 
             # Apply BCs
             bc_kernel(
@@ -304,7 +331,7 @@ class SolverJFO:
                 (self._P, np.int32(N_Z), np.int32(N_phi)),
             )
 
-            # (e) Check outer convergence
+            # (f) Check outer convergence
             diff_mask = self._mask != self._mask_old
             mask_changed_count = int(cp.sum(diff_mask))
             n_0to1 = int(cp.sum((self._mask_old == 0) & (self._mask == 1)))
@@ -372,6 +399,9 @@ def solve_reynolds_gpu_jfo(
     mask_init=None,
     verbose: bool = False,
     sweep_direction: int = 0,
+    use_F_theta: bool = True,
+    update_mask: bool = True,
+    run_theta_sweep: bool = True,
 ) -> tuple:
     """
     Solve Reynolds equation with JFO cavitation on GPU.
@@ -405,4 +435,7 @@ def solve_reynolds_gpu_jfo(
         mask_init=mask_init,
         verbose=verbose,
         sweep_direction=sweep_direction,
+        use_F_theta=use_F_theta,
+        update_mask=update_mask,
+        run_theta_sweep=run_theta_sweep,
     )
