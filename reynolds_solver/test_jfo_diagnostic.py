@@ -1,9 +1,7 @@
 """
-Diagnostic A/B test for JFO solver: sweep direction, F_theta sign,
-and theta under-relaxation.
+Diagnostic test for JFO solver with original F as RHS.
 
-Phase 1: sweep direction + F_theta sign (4 variants)
-Phase 2: omega_theta sweep (forward sweep + normal F, varying omega_theta)
+Runs JFO at epsilon=0.1 and 0.6 with verbose output.
 
 Run:
     python -m reynolds_solver.test_jfo_diagnostic
@@ -54,14 +52,9 @@ def main():
     L = 0.056
     N = 250
 
-    # =====================================================================
-    # Phase 2: omega_theta sweep (forward sweep + normal F)
-    # =====================================================================
-    omega_values = [1.0, 0.7, 0.5, 0.3, 0.1]
-
     for epsilon in [0.1, 0.6]:
         print(f"\n{'='*70}")
-        print(f"  omega_theta sweep, epsilon = {epsilon}")
+        print(f"  JFO with original F as RHS, epsilon = {epsilon}")
         print(f"{'='*70}")
 
         H, d_phi, d_Z, phi_1D, Z = generate_test_case(N, epsilon)
@@ -70,52 +63,22 @@ def main():
         W_hs = compute_load(P_hs, d_phi, d_Z, phi_1D, N)
         print(f"  HS reference: W_hs = {W_hs:.6e}")
 
-        print(f"\n  {'omega_theta':>11s} {'mass_err':>10s} {'cav_frac':>10s} "
-              f"{'W_jfo':>12s} {'rel_diff':>10s} {'n_outer':>8s} {'residual':>10s}")
-        print(f"  {'-'*80}")
-
-        for omega_t in omega_values:
-            try:
-                P, theta, residual, n_outer, n_inner = solve_reynolds_gpu_jfo(
-                    H, d_phi, d_Z, R, L,
-                    closure=LaminarClosure(),
-                    max_outer=500,
-                    sweep_direction=0,
-                    flip_F_sign=False,
-                    omega_theta=omega_t,
-                    verbose=False,
-                )
-
-                mass_err = compute_mass_err(H, P, theta, d_phi, d_Z)
-                mask = (P > 0).astype(int)
-                cav_frac = 1.0 - np.mean(mask)
-                W_jfo = compute_load(P, d_phi, d_Z, phi_1D, N)
-                rel_diff = abs(W_jfo - W_hs) / (abs(W_hs) + 1e-30)
-
-                print(f"  {omega_t:11.1f} {mass_err:10.4e} {cav_frac:10.3f} "
-                      f"{W_jfo:12.6e} {rel_diff:10.4f} {n_outer:8d} {residual:10.2e}")
-            except Exception as e:
-                print(f"  {omega_t:11.1f} ERROR: {e}")
-
-    # Best omega_theta with verbose log at epsilon=0.6
-    print(f"\n{'='*70}")
-    print(f"  Verbose log: omega_theta=0.3, epsilon=0.6")
-    print(f"{'='*70}")
-    H, d_phi, d_Z, phi_1D, Z = generate_test_case(N, 0.6)
-    try:
         P, theta, residual, n_outer, n_inner = solve_reynolds_gpu_jfo(
             H, d_phi, d_Z, R, L,
             closure=LaminarClosure(),
             max_outer=500,
-            sweep_direction=0,
-            flip_F_sign=False,
-            omega_theta=0.3,
             verbose=True,
         )
+
         mass_err = compute_mass_err(H, P, theta, d_phi, d_Z)
-        print(f"  mass_err={mass_err:.4e}, n_outer={n_outer}, residual={residual:.2e}")
-    except Exception as e:
-        print(f"  ERROR: {e}")
+        mask = (P > 0).astype(int)
+        cav_frac = 1.0 - np.mean(mask)
+        W_jfo = compute_load(P, d_phi, d_Z, phi_1D, N)
+        rel_diff = abs(W_jfo - W_hs) / (abs(W_hs) + 1e-30)
+
+        print(f"\n  Results: mass_err={mass_err:.4e}, cav_frac={cav_frac:.3f}, "
+              f"W_jfo={W_jfo:.6e}, rel_diff={rel_diff:.4f}, "
+              f"n_outer={n_outer}, residual={residual:.2e}")
 
 
 if __name__ == "__main__":
