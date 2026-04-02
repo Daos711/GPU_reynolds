@@ -1,21 +1,17 @@
 """
 JFO cavitation via unified variable ψ (Elrod 1981). CPU reference.
 
-Iterative scheme: honest Picard outer loop.
-  Outer: classify nodes (full-film vs cavitation), rebuild frozen coefficients.
-  Inner: linear SOR with frozen coefficients.
+Key principle (correct Elrod 1981):
+  - Diffusion coefficients = H³ ALWAYS (no face indicators)
+  - Diffusion operates on P = max(ψ, 0), not ψ directly
+  - Full-film/cavitation switch is dynamic: try full-film diagonal first,
+    if ψ_trial < 0 switch to cavitation (Couette-only) diagonal.
+  - Semi-implicit Couette: for cavitation, θ_c = 1+ψ_c, the ψ_c part
+    contributes d_phi·H_{j+1/2} to the diagonal.
 
-Key discretization principle (Elrod 1981):
-  Diffusion always uses H³ coefficients (NO face indicators).
-  Diffusion operates on P = max(ψ, 0), NOT on ψ directly.
-  This preserves pressure coupling at film/cavitation boundaries,
-  allowing reformation (return from cavitation to full film).
-
-Semi-implicit Couette: for cavitation nodes (ψ < 0), θ_c = 1 + ψ_c.
-  The ψ_c-dependent part contributes d_phi · H_{j+1/2} to the diagonal.
-
-Non-dimensionalization, ghost columns, face indexing — identical to the
-existing HS path via precompute_coefficients_gpu() in utils.py.
+This avoids:
+  1. Face-indicator product killing diffusion at boundaries (v3.1 bug)
+  2. Frozen gc classification + large diffusion numerator → NaN (v3.2 bug)
 """
 
 import numpy as np
@@ -23,85 +19,24 @@ from numba import njit
 
 
 # ---------------------------------------------------------------------------
-# Frozen-coefficient builder (called once per Picard outer iteration)
+# Nonlinear Gauss-Seidel inner loop
 # ---------------------------------------------------------------------------
 @njit
-def _build_frozen_coefficients(psi, H3_face_p, H3_face_m,
-                                H3_face_zp, H3_face_zm,
-                                H_face_p, H_face_m,
-                                d_phi, N_Z, N_phi):
+def _inner_sor_nonlinear(psi, H3_face_p, H3_face_m, H3_face_zp, H3_face_zm,
+                          H_face_p, H_face_m, E_full,
+                          d_phi, N_Z, N_phi, omega_sor, max_inner, tol_inner):
     """
-    Build frozen arrays from the current ψ field.
+    Nonlinear Gauss-Seidel / SOR for the unified variable ψ.
 
-    KEY DIFFERENCE from indicator-product approach:
-      - Diffusion coefficients A,B,C,D = H³ ALWAYS (no face indicators).
-      - gc classifies nodes: full-film (gc=1) or cavitation (gc=0).
-      - diff_diag = A+B+C+D for full-film nodes, 0 for cavitation.
-      - Inner loop uses P = max(ψ, 0) in the numerator, not ψ.
-
-    Returns
-    -------
-    conv_rhs  : (N_Z, N_phi) frozen Couette RHS (constant part, θ_c=1)
-    conv_diag : (N_Z, N_phi) Couette diagonal (>0 in cavitation only)
-    diff_diag : (N_Z, N_phi) diffusion diagonal (>0 in full-film only)
-    gc        : (N_Z, N_phi) node classification (1=full-film, 0=cavitation)
-    """
-    conv_rhs  = np.zeros((N_Z, N_phi), dtype=np.float64)
-    conv_diag = np.zeros((N_Z, N_phi), dtype=np.float64)
-    diff_diag = np.zeros((N_Z, N_phi), dtype=np.float64)
-    gc        = np.zeros((N_Z, N_phi), dtype=np.float64)
-
-    # Classify nodes
-    for i in range(N_Z):
-        for j in range(N_phi):
-            if psi[i, j] >= 0.0:
-                gc[i, j] = 1.0
-
-    for i in range(1, N_Z - 1):
-        for j in range(1, N_phi - 1):
-            j_minus = j - 1 if j - 1 >= 1 else N_phi - 2
-
-            # Upstream θ (frozen, from j-1 node)
-            psi_jm = psi[i, j_minus]
-            theta_jm = 1.0 if psi_jm >= 0.0 else max(1.0 + psi_jm, 0.0)
-
-            # Couette RHS: always uses θ_c = 1 (constant part)
-            conv_rhs[i, j] = d_phi * (H_face_p[i, j] * 1.0
-                                     - H_face_m[i, j] * theta_jm)
-
-            if gc[i, j] > 0.5:
-                # Full-film: ψ enters diffusion diagonal, no conv_diag
-                diff_diag[i, j] = (H3_face_p[i, j] + H3_face_m[i, j]
-                                 + H3_face_zp[i, j] + H3_face_zm[i, j])
-                conv_diag[i, j] = 0.0
-            else:
-                # Cavitation: P=0 so ψ not in diffusion, but θ_c=1+ψ_c
-                # gives conv_diag = d_phi·H_face_p
-                diff_diag[i, j] = 0.0
-                conv_diag[i, j] = d_phi * H_face_p[i, j]
-
-    return conv_rhs, conv_diag, diff_diag, gc
-
-
-# ---------------------------------------------------------------------------
-# Inner SOR loop (all coefficients FROZEN — no g/θ recomputation)
-# ---------------------------------------------------------------------------
-@njit
-def _inner_sor_loop(psi, H3_face_p, H3_face_m, H3_face_zp, H3_face_zm,
-                    conv_rhs, conv_diag, diff_diag,
-                    N_Z, N_phi, omega_sor, max_inner, tol_inner,
-                    clamp_min):
-    """
-    Sequential Gauss-Seidel / SOR for the unified variable ψ.
-
-    KEY: diffusion numerator uses P_neighbor = max(ψ_neighbor, 0),
-    NOT ψ_neighbor.  This preserves pressure coupling at the
-    film/cavitation boundary and enables reformation.
-
-    Parameters
-    ----------
-    clamp_min : float
-        Lower bound for ψ.  -1.0 for JFO mode, 0.0 for force_full_film.
+    Each node update:
+      1. Compute diff_num = sum(H³_face · max(ψ_neighbor, 0))
+      2. Compute conv_rhs = d_phi · (H_p - H_m · θ_upstream)
+         where θ_upstream is from the CURRENT ψ (not frozen).
+      3. numerator = diff_num - conv_rhs
+      4. Try full-film: ψ_trial = numerator / E_full
+      5. If ψ_trial ≥ 0: accept (full-film)
+         If ψ_trial < 0: cavitation ψ = numerator / (d_phi · H_p)
+      6. Clamp ψ ≥ -1, apply SOR relaxation.
     """
     for iteration in range(max_inner):
         max_delta = 0.0
@@ -113,7 +48,7 @@ def _inner_sor_loop(psi, H3_face_p, H3_face_m, H3_face_zp, H3_face_zm,
 
                 psi_old = psi[i, j]
 
-                # KEY: use P = max(ψ, 0) for neighbours in diffusion
+                # Diffusion numerator: P = max(ψ, 0) for all neighbours
                 P_jp = max(psi[i, j_plus],  0.0)
                 P_jm = max(psi[i, j_minus], 0.0)
                 P_ip = max(psi[i + 1, j],   0.0)
@@ -124,14 +59,27 @@ def _inner_sor_loop(psi, H3_face_p, H3_face_m, H3_face_zp, H3_face_zm,
                           + H3_face_zp[i, j] * P_ip
                           + H3_face_zm[i, j] * P_im)
 
-                # Total diagonal: diffusion (full-film) + Couette (cavitation)
-                diag = diff_diag[i, j] + conv_diag[i, j]
+                # Upstream θ from CURRENT ψ (Gauss-Seidel, not frozen)
+                psi_jm = psi[i, j_minus]
+                theta_jm = 1.0 if psi_jm >= 0.0 else max(1.0 + psi_jm, 0.0)
 
-                psi_new = (diff_num - conv_rhs[i, j]) / (diag + 1e-30)
+                # Couette RHS (constant part: θ_c = 1)
+                conv_rhs = d_phi * (H_face_p[i, j] - H_face_m[i, j] * theta_jm)
 
-                # Lower bound on ψ
-                if psi_new < clamp_min:
-                    psi_new = clamp_min
+                numerator = diff_num - conv_rhs
+
+                # Try full-film first (large diagonal = E)
+                E = E_full[i, j]
+                psi_trial = numerator / (E + 1e-30)
+
+                if psi_trial >= 0.0:
+                    psi_new = psi_trial
+                else:
+                    # Cavitation: only Couette diagonal
+                    conv_diag = d_phi * H_face_p[i, j]
+                    psi_new = numerator / (conv_diag + 1e-30)
+                    if psi_new < -1.0:
+                        psi_new = -1.0
 
                 # SOR relaxation
                 psi[i, j] = psi_old + omega_sor * (psi_new - psi_old)
@@ -229,37 +177,13 @@ def solve_jfo_unified_cpu(
     """
     JFO cavitation via unified variable ψ (Elrod 1981).  CPU reference.
 
-    Parameters
-    ----------
-    H : np.ndarray, shape (N_Z, N_phi), float64
-        Dimensionless gap (ghost columns already set).
-    d_phi, d_Z : float
-        Grid spacing.
-    R, L : float
-        Bearing radius and length (m).
-    omega_sor : float
-        SOR relaxation (1.0–1.4).
-    tol : float
-        Outer-loop convergence on ||Δψ||_inf.
-    max_outer : int
-        Max Picard iterations.
-    max_inner : int
-        Max SOR iterations per outer step.
-    tol_inner : float
-        Inner SOR convergence tolerance.
-    verbose : bool
-        Print convergence info.
-    force_full_film : bool
-        If True: standard HS path (no cavitation physics), clamp ψ≥0.
-        Used for test 0a (algebraic full-film ≡ HS).
-
     Returns
     -------
     P : np.ndarray (N_Z, N_phi) — dimensionless pressure
     theta : np.ndarray (N_Z, N_phi) — fill fraction
     residual : float — final ||Δψ||_inf
-    n_outer : int — Picard iterations used
-    n_inner_total : int — total SOR iterations
+    n_outer : int — outer iterations used
+    n_inner_total : int — total inner iterations
     """
     N_Z, N_phi = H.shape
     alpha_sq = (2.0 * R / L * d_phi / d_Z) ** 2
@@ -279,13 +203,16 @@ def solve_jfo_unified_cpu(
     H3_face_p = H_face_p ** 3
     H3_face_m = H_face_m ** 3
 
-    # Z-direction faces (node-indexed, include alpha_sq)
+    # Z-direction faces (include alpha_sq)
     H3_face_zp = np.zeros((N_Z, N_phi), dtype=np.float64)
     H3_face_zm = np.zeros((N_Z, N_phi), dtype=np.float64)
     H_jph = 0.5 * (H[:-1, :] + H[1:, :])
     H3_jph = H_jph ** 3
     H3_face_zp[1:-1, :] = alpha_sq * H3_jph[1:, :]
     H3_face_zm[1:-1, :] = alpha_sq * H3_jph[:-1, :]
+
+    # Full diffusion diagonal (constant, precomputed once)
+    E_full = H3_face_p + H3_face_m + H3_face_zp + H3_face_zm
 
     # ------------------------------------------------------------------
     # Initialise ψ
@@ -307,12 +234,10 @@ def solve_jfo_unified_cpu(
         B_half[:, 0]  = A_half[:, -1]
 
         A_ff = np.zeros((N_Z, N_phi), dtype=np.float64)
-        A_ff[:, :-1] = A_half
-        A_ff[:, -1]  = A_half[:, 0]
+        A_ff[:, :-1] = A_half;  A_ff[:, -1] = A_half[:, 0]
 
         B_ff = np.zeros((N_Z, N_phi), dtype=np.float64)
-        B_ff[:, 1:] = B_half
-        B_ff[:, 0]  = B_half[:, -1]
+        B_ff[:, 1:] = B_half;  B_ff[:, 0] = B_half[:, -1]
 
         C_ff = np.zeros((N_Z, N_phi), dtype=np.float64)
         D_ff = np.zeros((N_Z, N_phi), dtype=np.float64)
@@ -323,10 +248,8 @@ def solve_jfo_unified_cpu(
 
         F_half = d_phi * (H_iph_half - H_imh_half)
         F_ff = np.zeros((N_Z, N_phi), dtype=np.float64)
-        F_ff[:, :-1] = F_half
-        F_ff[:, -1]  = F_half[:, 0]
+        F_ff[:, :-1] = F_half;  F_ff[:, -1] = F_half[:, 0]
 
-        # Single inner loop (no outer needed for full-film)
         n_inner, inner_res = _inner_sor_loop_fullfilm(
             psi, A_ff, B_ff, C_ff, D_ff, E_ff, F_ff,
             N_Z, N_phi, omega_sor, max_inner * max_outer, tol_inner,
@@ -334,11 +257,10 @@ def solve_jfo_unified_cpu(
 
         P = np.maximum(psi, 0.0)
         theta = np.ones_like(psi)
-        residual = inner_res
-        return P, theta, residual, 1, n_inner
+        return P, theta, inner_res, 1, n_inner
 
     # ------------------------------------------------------------------
-    # JFO mode: Picard outer loop
+    # JFO mode: outer loop wrapping nonlinear GS inner loop
     # ------------------------------------------------------------------
     n_inner_total = 0
     residual = 1.0
@@ -347,25 +269,15 @@ def solve_jfo_unified_cpu(
     for outer in range(max_outer):
         psi_old = psi.copy()
 
-        # Step 1: build frozen coefficients from current ψ
-        conv_rhs, conv_diag, diff_diag, gc = \
-            _build_frozen_coefficients(
-                psi, H3_face_p, H3_face_m,
-                H3_face_zp, H3_face_zm,
-                H_face_p, H_face_m,
-                d_phi, N_Z, N_phi,
-            )
-
-        # Step 2: inner SOR with frozen coefficients
-        n_inner, inner_res = _inner_sor_loop(
+        # Inner: nonlinear GS (dynamic full-film/cavitation switching)
+        n_inner, inner_res = _inner_sor_nonlinear(
             psi, H3_face_p, H3_face_m, H3_face_zp, H3_face_zm,
-            conv_rhs, conv_diag, diff_diag,
-            N_Z, N_phi, omega_sor, max_inner, tol_inner,
-            -1.0,  # clamp_min
+            H_face_p, H_face_m, E_full,
+            d_phi, N_Z, N_phi, omega_sor, max_inner, tol_inner,
         )
         n_inner_total += n_inner
 
-        # Step 3: outer convergence check
+        # Outer convergence
         residual = np.max(np.abs(psi - psi_old))
         n_outer_done = outer + 1
 
