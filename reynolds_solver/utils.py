@@ -10,7 +10,7 @@ import numpy as np
 import cupy as cp
 
 
-def precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L):
+def precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L, closure=None):
     """
     Compute discretization coefficients A, B, C, D, E, F on GPU.
 
@@ -23,25 +23,35 @@ def precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L):
     d_Z : float
     R : float
     L : float
+    closure : Closure or None
+        Conductance model. None defaults to LaminarClosure.
 
     Returns
     -------
     A, B, C, D, E, F : cupy.ndarray, each shape (N_Z, N_phi), float64
     """
+    if closure is None:
+        from reynolds_solver.physics.closures import LaminarClosure
+        closure = LaminarClosure()
+
     N_Z, N_phi = H_gpu.shape
 
-    H_i_plus_half = 0.5 * (H_gpu[:, :-1] + H_gpu[:, 1:])
+    H_i_plus_half, H_j_plus_half, A_half, C_half_raw = \
+        closure.modify_conductances(H_gpu, d_phi, d_Z, R, L)
+
     H_i_minus_half = cp.empty_like(H_i_plus_half)
     H_i_minus_half[:, 1:] = H_i_plus_half[:, :-1]
     H_i_minus_half[:, 0] = H_i_plus_half[:, -1]
 
-    H_j_plus_half = 0.5 * (H_gpu[:-1, :] + H_gpu[1:, :])  # (N_Z-1, N_phi)
+    # B_half: conductance at i-1/2 faces
+    # For laminar: H_i_minus_half**3. For turbulent: need closure on minus-half faces.
+    # Since closure returns A_half at i+1/2, B_half is A_half shifted by one column.
+    B_half = cp.empty_like(A_half)
+    B_half[:, 1:] = A_half[:, :-1]
+    B_half[:, 0] = A_half[:, -1]
 
     D_over_L = 2.0 * R / L
     alpha_sq = (D_over_L * d_phi / d_Z) ** 2
-
-    A_half = H_i_plus_half ** 3
-    B_half = H_i_minus_half ** 3
 
     A_full = cp.zeros((N_Z, N_phi), dtype=cp.float64)
     B_full = cp.zeros((N_Z, N_phi), dtype=cp.float64)
@@ -56,10 +66,10 @@ def precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L):
 
     # Z-direction: Dirichlet BC (P=0 at boundaries), no periodic wrap.
     # For internal nodes i = 1..N_Z-2:
-    #   C[i] uses interface (i, i+1) -> H_j_plus_half[i]
-    #   D[i] uses interface (i-1, i) -> H_j_plus_half[i-1]
-    C_full[1:-1, :] = alpha_sq * (H_j_plus_half[1:, :] ** 3)
-    D_full[1:-1, :] = alpha_sq * (H_j_plus_half[:-1, :] ** 3)
+    #   C[i] uses interface (i, i+1) -> C_half_raw[i]
+    #   D[i] uses interface (i-1, i) -> C_half_raw[i-1]
+    C_full[1:-1, :] = alpha_sq * C_half_raw[1:, :]
+    D_full[1:-1, :] = alpha_sq * C_half_raw[:-1, :]
 
     E_full = A_full + B_full + C_full + D_full
 
@@ -69,6 +79,43 @@ def precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L):
     F_full[:, -1] = F_half[:, 0]
 
     return A_full, B_full, C_full, D_full, E_full, F_full
+
+
+def build_F_theta_gpu(H_gpu, theta_gpu, d_phi):
+    """
+    Build JFO RHS: F_theta = d(H*theta)/dphi using face-based fluxes.
+
+    Uses the same ghost/physical indexing and face scheme as F_orig
+    in precompute_coefficients_gpu.
+
+    When theta=1 everywhere, F_theta == F_orig to machine precision.
+
+    Parameters
+    ----------
+    H_gpu : cupy.ndarray, shape (N_Z, N_phi), float64
+    theta_gpu : cupy.ndarray, shape (N_Z, N_phi), float64
+    d_phi : float
+
+    Returns
+    -------
+    F_theta : cupy.ndarray, shape (N_Z, N_phi), float64
+    """
+    N_Z, N_phi = H_gpu.shape
+    Hth = H_gpu * theta_gpu
+
+    S_plus_half = 0.5 * (Hth[:, :-1] + Hth[:, 1:])
+
+    S_minus_half = cp.empty_like(S_plus_half)
+    S_minus_half[:, 1:] = S_plus_half[:, :-1]
+    S_minus_half[:, 0] = S_plus_half[:, -1]
+
+    F_half = d_phi * (S_plus_half - S_minus_half)
+
+    F_theta = cp.zeros((N_Z, N_phi), dtype=cp.float64)
+    F_theta[:, :-1] = F_half
+    F_theta[:, -1] = F_half[:, 0]
+
+    return F_theta
 
 
 def add_dynamic_rhs_gpu(F_full, d_phi, N_Z, N_phi, xprime, yprime, beta, phase_shift=0.0):

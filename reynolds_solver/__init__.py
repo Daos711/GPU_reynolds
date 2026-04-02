@@ -14,6 +14,7 @@ Advanced usage (cached buffers):
 
 from reynolds_solver.api import solve_reynolds
 from reynolds_solver.solver import ReynoldsSolverGPU
+from reynolds_solver.solver_jfo import SolverJFO
 
-__all__ = ["solve_reynolds", "ReynoldsSolverGPU"]
-__version__ = "1.1.0"
+__all__ = ["solve_reynolds", "ReynoldsSolverGPU", "SolverJFO"]
+__version__ = "1.3.0"

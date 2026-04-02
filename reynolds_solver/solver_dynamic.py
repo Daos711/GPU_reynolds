@@ -27,6 +27,8 @@ def solve_reynolds_gpu_dynamic(
     tol: float = 1e-5,
     max_iter: int = 50000,
     check_every: int = 500,
+    closure=None,
+    P_init=None,
 ) -> tuple:
     """
     Drop-in replacement for solve_reynolds_gauss_seidel_numba_dynamic().
@@ -47,6 +49,10 @@ def solve_reynolds_gpu_dynamic(
     tol : float
     max_iter : int
     check_every : int
+    closure : Closure or None
+        Conductance model. None defaults to LaminarClosure.
+    P_init : np.ndarray or None
+        Initial pressure field for warm start.
 
     Returns
     -------
@@ -59,7 +65,9 @@ def solve_reynolds_gpu_dynamic(
 
     # 1. Transfer H to GPU and precompute coefficients
     H_gpu = cp.asarray(H, dtype=cp.float64)
-    A, B, C, D, E, F_full = precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L)
+    A, B, C, D, E, F_full = precompute_coefficients_gpu(
+        H_gpu, d_phi, d_Z, R, L, closure=closure
+    )
 
     # 2. Add dynamic contribution to RHS
     add_dynamic_rhs_gpu(F_full, d_phi, N_Z, N_phi, xprime, yprime, beta, phase_shift)
@@ -68,6 +76,7 @@ def solve_reynolds_gpu_dynamic(
     P_gpu, delta, n_iter = solver.solve_with_rhs(
         H_gpu, F_full, A, B, C, D, E,
         omega=omega, tol=tol, max_iter=max_iter, check_every=check_every,
+        P_init=P_init,
     )
 
     # 4. Transfer result to CPU
