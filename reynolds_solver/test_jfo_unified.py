@@ -197,14 +197,6 @@ def test_mass_conservation_local():
     div_phi = np.diff(q_phi, axis=1) / d_phi    # (N_Z, N_phi-2)
     div_z   = np.diff(q_z,   axis=0) / d_Z      # (N_Z-2, N_phi)
 
-    # Interior: rows 1..N_Z-2, physical columns 1..N_phi-2
-    # div_phi[:, k] corresponds to column k+1 in the original grid (face k+1 - face k)
-    # For physical columns j=1..N_phi-2: div_phi column index = j-1 → j=1..N_phi-2 → k=0..N_phi-3
-    # div_z[k, :] corresponds to row k+1 → for rows 1..N_Z-2: k=0..N_Z-3
-    # Overlap: div_phi rows 1..N_Z-2 (all), div_z columns 1..N_phi-2
-    Nz_int = N_Z - 2
-    Np_int = N_phi - 2
-
     # div_phi interior: rows 1:-1, all columns (N_phi-2 of them)
     dp = div_phi[1:-1, :]  # shape (N_Z-2, N_phi-2)
     # div_z interior: all rows (N_Z-2 of them), columns 1:-1

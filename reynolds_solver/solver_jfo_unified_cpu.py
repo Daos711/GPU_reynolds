@@ -11,6 +11,10 @@ Discretization — face-flux divergence form:
   g_{face} = product of node indicators on both sides (ψ ≥ 0 → 1, else 0)
   θ(ψ) = 1 if ψ ≥ 0, else 1 + ψ  (clipped to [0, 1])
 
+Semi-implicit Couette treatment: for cavitation nodes (ψ < 0), θ_c = 1 + ψ_c.
+The ψ_c-dependent part contributes to the diagonal (d_phi · H_{j+1/2}),
+preventing zero-diagonal singularity in the SOR update.
+
 Non-dimensionalization, ghost columns, face indexing — identical to the
 existing HS path via precompute_coefficients_gpu() in utils.py.
 """
@@ -29,28 +33,24 @@ def _build_frozen_coefficients(psi, H_face_p, H_face_m,
                                 alpha_sq, d_phi,
                                 N_Z, N_phi):
     """
-    Build frozen arrays A, B, C, D (diffusion) and conv_rhs (Couette)
-    from the current ψ field.
+    Build frozen arrays from the current ψ field.
 
-    Face indicators: g_face = g(ψ_center) · g(ψ_neighbor).
-    Upwind θ for Couette: θ(ψ) at the upstream node (+φ direction).
-
-    Parameters
-    ----------
-    H_face_p, H_face_m : (N_Z, N_phi) — H at j+1/2 and j-1/2 faces
-    H3_face_p, H3_face_m : (N_Z, N_phi) — H³ at j+1/2 and j-1/2 faces
-    H3_face_zp, H3_face_zm : (N_Z, N_phi) — α²·H³ at i+1/2 and i-1/2 faces
+    Semi-implicit Couette: for cavitation nodes (gc=0), θ_c = 1 + ψ_c.
+    The constant part (1) goes to conv_rhs, the ψ_c part adds d_phi·H_p
+    to the diagonal via conv_diag.  This ensures diag > 0 everywhere.
 
     Returns
     -------
     A, B, C, D : (N_Z, N_phi) frozen diffusion coefficients
-    conv_rhs   : (N_Z, N_phi) frozen Couette RHS
+    conv_rhs   : (N_Z, N_phi) frozen Couette RHS (uses θ_c=1 constant part)
+    conv_diag  : (N_Z, N_phi) Couette diagonal contribution (>0 in cavitation)
     """
-    A_coeff = np.zeros((N_Z, N_phi), dtype=np.float64)
-    B_coeff = np.zeros((N_Z, N_phi), dtype=np.float64)
-    C_coeff = np.zeros((N_Z, N_phi), dtype=np.float64)
-    D_coeff = np.zeros((N_Z, N_phi), dtype=np.float64)
-    conv_rhs = np.zeros((N_Z, N_phi), dtype=np.float64)
+    A_coeff   = np.zeros((N_Z, N_phi), dtype=np.float64)
+    B_coeff   = np.zeros((N_Z, N_phi), dtype=np.float64)
+    C_coeff   = np.zeros((N_Z, N_phi), dtype=np.float64)
+    D_coeff   = np.zeros((N_Z, N_phi), dtype=np.float64)
+    conv_rhs  = np.zeros((N_Z, N_phi), dtype=np.float64)
+    conv_diag = np.zeros((N_Z, N_phi), dtype=np.float64)
 
     for i in range(1, N_Z - 1):
         for j in range(1, N_phi - 1):
@@ -83,21 +83,29 @@ def _build_frozen_coefficients(psi, H_face_p, H_face_m,
             C_coeff[i, j] = gf_ip * H3_face_zp[i, j]
             D_coeff[i, j] = gf_im * H3_face_zm[i, j]
 
-            # Frozen Couette (upwind by +φ direction)
-            theta_c  = 1.0 if psi_c  >= 0.0 else max(1.0 + psi_c,  0.0)
+            # --- Semi-implicit Couette treatment ---
+            # θ_c: for active nodes (gc=1), θ_c=1 → entirely in RHS.
+            #       for cavitation (gc=0), θ_c=1+ψ_c → constant "1" in RHS,
+            #       ψ_c-dependent part → diagonal (d_phi · H_face_p).
+            # θ_jm: always frozen (upstream node).
             theta_jm = 1.0 if psi_jm >= 0.0 else max(1.0 + psi_jm, 0.0)
 
-            conv_rhs[i, j] = d_phi * (H_face_p[i, j] * theta_c
+            # conv_rhs uses θ_c = 1 (constant part) for BOTH active & cavitation
+            conv_rhs[i, j] = d_phi * (H_face_p[i, j] * 1.0
                                      - H_face_m[i, j] * theta_jm)
 
-    return A_coeff, B_coeff, C_coeff, D_coeff, conv_rhs
+            # Convective diagonal: only for cavitation nodes (gc=0)
+            conv_diag[i, j] = (1.0 - gc) * d_phi * H_face_p[i, j]
+
+    return A_coeff, B_coeff, C_coeff, D_coeff, conv_rhs, conv_diag
 
 
 # ---------------------------------------------------------------------------
 # Inner SOR loop (all coefficients FROZEN — no g/θ recomputation)
 # ---------------------------------------------------------------------------
 @njit
-def _inner_sor_loop(psi, A_coeff, B_coeff, C_coeff, D_coeff, conv_rhs,
+def _inner_sor_loop(psi, A_coeff, B_coeff, C_coeff, D_coeff,
+                    conv_rhs, conv_diag,
                     N_Z, N_phi, omega_sor, max_inner, tol_inner,
                     clamp_min):
     """
@@ -105,6 +113,7 @@ def _inner_sor_loop(psi, A_coeff, B_coeff, C_coeff, D_coeff, conv_rhs,
 
     Parameters
     ----------
+    conv_diag : (N_Z, N_phi) — Couette contribution to diagonal
     clamp_min : float
         Lower bound for ψ.  -1.0 for JFO mode, 0.0 for force_full_film.
     """
@@ -124,8 +133,10 @@ def _inner_sor_loop(psi, A_coeff, B_coeff, C_coeff, D_coeff, conv_rhs,
                           + C_coeff[i, j] * psi[i + 1, j]
                           + D_coeff[i, j] * psi[i - 1, j])
 
+                # Total diagonal: diffusion + Couette semi-implicit
                 diag = (A_coeff[i, j] + B_coeff[i, j]
-                      + C_coeff[i, j] + D_coeff[i, j])
+                      + C_coeff[i, j] + D_coeff[i, j]
+                      + conv_diag[i, j])
 
                 psi_new = (diff_num - conv_rhs[i, j]) / (diag + 1e-30)
 
@@ -274,6 +285,9 @@ def solve_jfo_unified_cpu(
         F_ff[:, :-1] = F_half
         F_ff[:, -1]  = F_half[:, 0]
 
+        # No convective diagonal for full-film (all active, gc=1)
+        conv_diag_ff = np.zeros((N_Z, N_phi), dtype=np.float64)
+
     # ------------------------------------------------------------------
     # Initialise ψ
     # ------------------------------------------------------------------
@@ -298,8 +312,9 @@ def solve_jfo_unified_cpu(
             C_coeff = C_ff
             D_coeff = D_ff
             conv_rhs = F_ff
+            conv_diag_arr = conv_diag_ff
         else:
-            A_coeff, B_coeff, C_coeff, D_coeff, conv_rhs = \
+            A_coeff, B_coeff, C_coeff, D_coeff, conv_rhs, conv_diag_arr = \
                 _build_frozen_coefficients(
                     psi, H_face_p, H_face_m,
                     H3_face_p, H3_face_m,
@@ -310,7 +325,8 @@ def solve_jfo_unified_cpu(
 
         # Step 2: inner SOR with frozen coefficients
         n_inner, inner_res = _inner_sor_loop(
-            psi, A_coeff, B_coeff, C_coeff, D_coeff, conv_rhs,
+            psi, A_coeff, B_coeff, C_coeff, D_coeff,
+            conv_rhs, conv_diag_arr,
             N_Z, N_phi, omega_sor, max_inner, tol_inner,
             clamp_min,
         )
