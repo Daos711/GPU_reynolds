@@ -102,7 +102,10 @@ extern "C" __global__ void rb_sor_jfo_step(
                       + D_arr[idx] * P[(i - 1) * N_phi + j]
                       - F_arr[idx]) / E_arr[idx];
 
-        // SOR relaxation (no P<0 clamp here — mask handles cavitation)
+        // Clamp negative pressure in active zone (same as HS kernel)
+        if (P_new < 0.0) P_new = 0.0;
+
+        // SOR relaxation
         P[idx] = P_old + omega_sor * (P_new - P_old);
     } else {
         // Cavitation zone: P = 0
