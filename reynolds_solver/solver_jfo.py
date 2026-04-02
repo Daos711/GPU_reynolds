@@ -191,6 +191,7 @@ class SolverJFO:
         verbose=False,
         sweep_direction=0,
         flip_F_sign=False,
+        omega_theta=1.0,
     ):
         """
         Solve Reynolds equation with JFO cavitation.
@@ -314,7 +315,16 @@ class SolverJFO:
             self._sync_periodic()
 
             # (d) Theta sweep in cavitation zone (using NEW mask)
+            #     Save pre-sweep theta for under-relaxation
+            if omega_theta < 1.0:
+                self._theta_prev[:] = self._theta
             self._run_theta_sweep(sweep_kernel, H_gpu, direction=sweep_direction)
+            if omega_theta < 1.0:
+                # Under-relax: theta = omega*theta_sweep + (1-omega)*theta_prev
+                self._theta[:] = omega_theta * self._theta + (1.0 - omega_theta) * self._theta_prev
+                # Re-enforce active zone invariant after blending
+                act = (self._mask == 1)
+                self._theta[act] = 1.0
 
             # (e) Periodic sync + rebuild F_theta on consistent state
             self._sync_periodic()
@@ -405,6 +415,7 @@ def solve_reynolds_gpu_jfo(
     verbose: bool = False,
     sweep_direction: int = 0,
     flip_F_sign: bool = False,
+    omega_theta: float = 1.0,
 ) -> tuple:
     """
     Solve Reynolds equation with JFO cavitation on GPU.
@@ -439,4 +450,5 @@ def solve_reynolds_gpu_jfo(
         verbose=verbose,
         sweep_direction=sweep_direction,
         flip_F_sign=flip_F_sign,
+        omega_theta=omega_theta,
     )
