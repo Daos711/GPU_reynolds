@@ -91,11 +91,13 @@ extern "C" __global__ void rb_sor_jfo_step(
 
     if (zone_mask[idx] == 1) {
         // Active zone: standard SOR update with F_theta as RHS
-        // Read ghost columns (same as HS kernel) — not physical columns
+        int j_plus  = (j + 1 < N_phi - 1) ? j + 1 : 1;
+        int j_minus = (j - 1 >= 1)        ? j - 1 : N_phi - 2;
+
         double P_old = P[idx];
 
-        double P_new = (A_arr[idx] * P[i * N_phi + (j + 1)]
-                      + B_arr[idx] * P[i * N_phi + (j - 1)]
+        double P_new = (A_arr[idx] * P[i * N_phi + j_plus]
+                      + B_arr[idx] * P[i * N_phi + j_minus]
                       + C_arr[idx] * P[(i + 1) * N_phi + j]
                       + D_arr[idx] * P[(i - 1) * N_phi + j]
                       - F_arr[idx]) / E_arr[idx];

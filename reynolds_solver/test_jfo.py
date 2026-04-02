@@ -87,11 +87,19 @@ def test_frozen_theta_jfo_equals_hs():
 
     H, d_phi, d_Z, phi_1D, Z = generate_test_case(N, epsilon)
 
-    P_hs, _, _ = solve_reynolds(H, d_phi, d_Z, R, L, cavitation="half_sommerfeld")
+    P_hs, _, _ = solve_reynolds(
+        H, d_phi, d_Z, R, L, cavitation="half_sommerfeld",
+        max_iter=50000, tol=1e-6,
+    )
 
+    # Run JFO with enough inner iterations to fully converge the SOR
+    # (matching HS iteration budget), and only 1 outer iteration since
+    # mask/theta are frozen anyway.
     P_jfo, theta, residual, n_outer, n_inner = solve_reynolds(
         H, d_phi, d_Z, R, L, cavitation="jfo",
         update_mask=False, run_theta_sweep=False,
+        jfo_max_inner=50000, jfo_max_outer=1,
+        tol=1e-6,
         verbose=True,
     )
 
