@@ -108,25 +108,25 @@ def compute_FmuQ(P, H, Phi_mesh, phi_1D, Z, d_phi):
     return F, mu_coeff, Q
 
 
-def solve_static(H, d_phi, d_Z, P_init=None):
+def solve_static(H, d_phi, d_Z, P_init=None, tol=1e-5):
     """Solve static Reynolds on GPU."""
     from reynolds_solver import solve_reynolds
     P, _, _ = solve_reynolds(
         H, d_phi, d_Z, R, L,
         closure="laminar", cavitation="half_sommerfeld",
-        omega=1.5, tol=1e-5, max_iter=50000,
+        omega=1.5, tol=tol, max_iter=50000,
         P_init=P_init)
     return P
 
 
-def solve_dynamic(H, d_phi, d_Z, xprime, yprime, P_init=None):
+def solve_dynamic(H, d_phi, d_Z, xprime, yprime, P_init=None, tol=1e-5):
     """Solve dynamic Reynolds on GPU."""
     from reynolds_solver import solve_reynolds
     P, _, _ = solve_reynolds(
         H, d_phi, d_Z, R, L,
         closure="laminar", cavitation="half_sommerfeld",
         xprime=xprime, yprime=yprime, beta=2.0,
-        omega=1.5, tol=1e-5, max_iter=50000,
+        omega=1.5, tol=tol, max_iter=50000,
         P_init=P_init)
     return P
 
@@ -178,46 +178,53 @@ def block2_KC(N, eps_range, Phi_mesh, Z_mesh, phi_1D, Z, d_phi, d_Z,
     K_to_dim = F_dim_scale / c                  # N/m (stiffness)
     C_to_dim = F_dim_scale / (c * omega_shaft)  # N·s/m (damping)
 
+    # Use tight tolerance for perturbation solves (dx ~ 1e-5, need tol << dx)
+    tol_kc = 1e-8
+
     for i, eps0 in enumerate(eps_range):
         H_base = make_H(eps0, Phi_mesh, Z_mesh, textured=textured)
-        P_base = solve_static(H_base, d_phi, d_Z)
+        P_base = solve_static(H_base, d_phi, d_Z, tol=tol_kc)
 
         # --- Stiffness (static perturbations) ---
         # +x: eps -> eps+dx
         H_px = make_H(eps0 + dx, Phi_mesh, Z_mesh, textured=textured)
-        P_px = solve_static(H_px, d_phi, d_Z, P_init=P_base)
+        P_px = solve_static(H_px, d_phi, d_Z, P_init=P_base, tol=tol_kc)
         Fx_px, Fy_px = compute_forces(P_px, Phi_mesh, phi_1D, Z)
 
         # -x: eps -> eps-dx
         H_mx = make_H(eps0 - dx, Phi_mesh, Z_mesh, textured=textured)
-        P_mx = solve_static(H_mx, d_phi, d_Z, P_init=P_base)
+        P_mx = solve_static(H_mx, d_phi, d_Z, P_init=P_base, tol=tol_kc)
         Fx_mx, Fy_mx = compute_forces(P_mx, Phi_mesh, phi_1D, Z)
 
         # +y: H_base + dx*sin(phi)
         H_py = H_base + dx * sin_phi
-        P_py = solve_static(H_py, d_phi, d_Z, P_init=P_base)
+        P_py = solve_static(H_py, d_phi, d_Z, P_init=P_base, tol=tol_kc)
         Fx_py, Fy_py = compute_forces(P_py, Phi_mesh, phi_1D, Z)
 
         # -y: H_base - dx*sin(phi)
         H_my = H_base - dx * sin_phi
-        P_my = solve_static(H_my, d_phi, d_Z, P_init=P_base)
+        P_my = solve_static(H_my, d_phi, d_Z, P_init=P_base, tol=tol_kc)
         Fx_my, Fy_my = compute_forces(P_my, Phi_mesh, phi_1D, Z)
 
         # --- Damping (dynamic perturbations) ---
         # +x': xprime = +dxp
-        P_pxp = solve_dynamic(H_base, d_phi, d_Z, xprime=dxp, yprime=0, P_init=P_base)
+        P_pxp = solve_dynamic(H_base, d_phi, d_Z, xprime=dxp, yprime=0,
+                              P_init=P_base, tol=tol_kc)
         Fx_pxp, Fy_pxp = compute_forces(P_pxp, Phi_mesh, phi_1D, Z)
 
         # -x': xprime = -dxp
-        P_mxp = solve_dynamic(H_base, d_phi, d_Z, xprime=-dxp, yprime=0, P_init=P_base)
+        P_mxp = solve_dynamic(H_base, d_phi, d_Z, xprime=-dxp, yprime=0,
+                              P_init=P_base, tol=tol_kc)
         Fx_mxp, Fy_mxp = compute_forces(P_mxp, Phi_mesh, phi_1D, Z)
 
         # +y': yprime = +dxp
-        P_pyp = solve_dynamic(H_base, d_phi, d_Z, xprime=0, yprime=dxp, P_init=P_base)
+        P_pyp = solve_dynamic(H_base, d_phi, d_Z, xprime=0, yprime=dxp,
+                              P_init=P_base, tol=tol_kc)
         Fx_pyp, Fy_pyp = compute_forces(P_pyp, Phi_mesh, phi_1D, Z)
 
         # -y': yprime = -dxp
-        P_myp = solve_dynamic(H_base, d_phi, d_Z, xprime=0, yprime=-dxp, P_init=P_base)
+        P_myp = solve_dynamic(H_base, d_phi, d_Z, xprime=0, yprime=-dxp,
+                              P_init=P_base, tol=tol_kc)
         Fx_myp, Fy_myp = compute_forces(P_myp, Phi_mesh, phi_1D, Z)
 
         # K = -dF/dq (N/m), C = -dF/dqdot (N·s/m)
@@ -438,11 +445,15 @@ def main():
         ("Smooth", Kxx_s, Kxy_s, Kyx_s, Kyy_s, Cxx_s, Cxy_s, Cyx_s, Cyy_s, "smooth"),
         ("Textured", Kxx_t, Kxy_t, Kyx_t, Kyy_t, Cxx_t, Cxy_t, Cyx_t, Cyy_t, "textured"),
     ]:
-        t_orb, x_orb, y_orb = block4_orbit(
-            Kxx[idx06], Kxy[idx06], Kyx[idx06], Kyy[idx06],
-            Cxx[idx06], Cxy[idx06], Cyx[idx06], Cyy[idx06])
-        plot_orbit(t_orb, x_orb, y_orb, f"orbit_{tag}.png", f"Orbit ({label})")
-        print(f"  {label}: max|x|={np.max(np.abs(x_orb)):.4e}, max|y|={np.max(np.abs(y_orb)):.4e}")
+        try:
+            t_orb, x_orb, y_orb = block4_orbit(
+                Kxx[idx06], Kxy[idx06], Kyx[idx06], Kyy[idx06],
+                Cxx[idx06], Cxy[idx06], Cyx[idx06], Cyy[idx06])
+            plot_orbit(t_orb, x_orb, y_orb, f"orbit_{tag}.png", f"Orbit ({label})")
+            print(f"  {label}: max|x|={np.max(np.abs(x_orb)):.4e}, "
+                  f"max|y|={np.max(np.abs(y_orb)):.4e}")
+        except Exception as e:
+            print(f"  {label}: orbit integration failed: {e}")
 
     # --- Block 5: Benchmark ---
     t_gpu = block5_benchmark(N)
