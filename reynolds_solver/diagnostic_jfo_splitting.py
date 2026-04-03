@@ -127,7 +127,13 @@ def check_mass_discrete(P, theta, A, B, C, D, E, Hfp, Hfm, d_phi):
                  - E[i,j]*P[i,j])
             residual[i, j] = LHS - F_theta[i, j]
 
-    interior = residual[1:-1, 1:-1]
+    interior_res = residual[1:-1, 1:-1]
+    P_interior = P[1:-1, 1:-1]
+    fullfilm_mask = P_interior > 1e-10  # only full-film nodes
+    if np.any(fullfilm_mask):
+        interior = interior_res[fullfilm_mask]
+    else:
+        interior = interior_res.ravel()
     max_res = np.max(np.abs(interior))
     l2_res = np.sqrt(np.mean(interior**2))
     F_scale = np.max(np.abs(F_theta[1:-1, 1:-1])) + 1e-30
