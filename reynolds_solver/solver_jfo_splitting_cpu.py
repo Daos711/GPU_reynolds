@@ -99,7 +99,9 @@ def _build_F_theta(H_face_p, H_face_m, theta, d_phi, N_Z, N_phi):
 def solve_jfo_splitting_cpu(
     H, d_phi, d_Z, R, L,
     omega=1.5, tol=1e-5, max_outer=100, max_inner=20000,
-    tol_inner=1e-6, theta_relax=0.3, verbose=False,
+    tol_inner=1e-6, theta_relax=0.3,
+    max_theta_sweeps=30, tol_theta=1e-4,
+    verbose=False,
 ):
     """
     JFO cavitation via operator splitting (P, theta). CPU reference.
@@ -118,6 +120,8 @@ def solve_jfo_splitting_cpu(
     max_inner : int — max SOR iterations per pressure solve
     tol_inner : float — inner SOR convergence
     theta_relax : float — under-relaxation for theta (0.1–0.5)
+    max_theta_sweeps : int — max upwind sweeps per outer step for theta
+    tol_theta : float — convergence tolerance for inner theta loop
     verbose : bool
 
     Returns
@@ -161,9 +165,14 @@ def solve_jfo_splitting_cpu(
                                       N_Z, N_phi, omega, max_inner, tol_inner)
         total_inner += ni
 
+        # Step B: Inner theta-loop at fixed P (transport H*theta = const)
         theta_old = theta.copy()
-        _update_theta(theta, P, Hfp, Hfm, N_Z, N_phi, theta_relax)
-        _update_theta(theta, P, Hfp, Hfm, N_Z, N_phi, theta_relax)
+        th_sweeps = 0
+        for k in range(max_theta_sweeps):
+            dth_inner = _update_theta(theta, P, Hfp, Hfm, N_Z, N_phi, theta_relax)
+            th_sweeps = k + 1
+            if dth_inner < tol_theta:
+                break
 
         dP = np.max(np.abs(P - P_old))
         dth_outer = np.max(np.abs(theta - theta_old))
@@ -172,7 +181,7 @@ def solve_jfo_splitting_cpu(
         if verbose and (outer % 5 == 0 or outer < 3):
             cav = np.mean(theta[1:-1, 1:-1] < 1.0)
             print(f"  outer={outer:>3d}: dP={dP:.2e} dth={dth_outer:.2e} "
-                  f"cav={cav:.3f} maxP={np.max(P):.4f} inner={ni}")
+                  f"cav={cav:.3f} maxP={np.max(P):.4f} inner={ni} th_sweeps={th_sweeps}")
 
         if residual < tol:
             if verbose:
