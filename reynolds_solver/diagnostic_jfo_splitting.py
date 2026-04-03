@@ -18,7 +18,7 @@ L = 0.056
 
 # Solver defaults for tests & maps
 SOLVER_KW = dict(omega=1.5, tol=1e-5, max_outer=200, max_inner=20000,
-                 tol_inner=1e-6, theta_relax=0.3,
+                 tol_inner=1e-6, theta_relax=0.5,
                  max_theta_sweeps=5, tol_theta=1e-4)
 
 
@@ -244,7 +244,7 @@ def sweep_cav_frac():
         _, theta, res, n_out, _ = solve_jfo_splitting_cpu(
             H, d_phi, d_Z, R, L,
             omega=1.5, tol=1e-5, max_outer=200, max_inner=20000,
-            tol_inner=1e-6, theta_relax=0.3,
+            tol_inner=1e-6, theta_relax=0.5,
             max_theta_sweeps=5, tol_theta=1e-4)
         cav = np.mean(theta[1:-1, 1:-1] < 1.0)
         cav_fracs.append(cav)

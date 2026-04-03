@@ -99,7 +99,7 @@ def _build_F_theta(H_face_p, H_face_m, theta, d_phi, N_Z, N_phi):
 def solve_jfo_splitting_cpu(
     H, d_phi, d_Z, R, L,
     omega=1.5, tol=1e-5, max_outer=100, max_inner=20000,
-    tol_inner=1e-6, theta_relax=0.3,
+    tol_inner=1e-6, theta_relax=0.5,
     max_theta_sweeps=5, tol_theta=1e-4,
     verbose=False,
 ):
@@ -166,17 +166,20 @@ def solve_jfo_splitting_cpu(
         total_inner += ni
 
         # Step B: Inner theta-loop at fixed P (transport H*theta = const)
-        # relax=1.0: one sweep propagates through entire cavitation zone.
-        theta_old = theta.copy()
+        # relax=1.0 inside: one sweep propagates through entire cavitation zone.
+        # Outer damping with theta_relax to prevent inter-step oscillation.
+        theta_before_B = theta.copy()
         th_sweeps = 0
         for k in range(max_theta_sweeps):
             dth_inner = _update_theta(theta, P, Hfp, Hfm, N_Z, N_phi, 1.0)
             th_sweeps = k + 1
             if dth_inner < tol_theta:
                 break
+        # Outer damping
+        theta[:] = theta_before_B + theta_relax * (theta - theta_before_B)
 
         dP = np.max(np.abs(P - P_old))
-        dth_outer = np.max(np.abs(theta - theta_old))
+        dth_outer = np.max(np.abs(theta - theta_before_B))
         residual = max(dP, dth_outer)
 
         if verbose and (outer % 5 == 0 or outer < 3):
