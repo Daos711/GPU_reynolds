@@ -227,6 +227,10 @@ def solve_jfo_splitting_cpu(
 
     total_inner = 0
     residual = 1.0
+    W_prev = 0.0
+    theta_acc = np.zeros_like(theta)
+    n_acc = 0
+    acc_start = max(max_outer - 20, 0)
 
     for outer in range(max_outer):
         # Step A: build F_theta (blended RHS for stability), solve P
@@ -246,35 +250,34 @@ def solve_jfo_splitting_cpu(
         p_on = 1e-5 * maxP if maxP > 0.0 else 1e-10
         p_off = 1e-6 * maxP if maxP > 0.0 else 1e-11
 
-        theta_old = theta.copy()
-
         _update_zone_state(zone_state, P, N_Z, N_phi, p_on, p_off)
         _update_theta_march(theta, zone_state, Hfp, Hfm, N_Z, N_phi)
 
-        # Convergence: exclude interface nodes (in hysteresis band)
+        # Convergence: |ΔW|/W
+        W = np.sum(P)
         dP = np.max(np.abs(P - P_old))
+        dW_rel = abs(W - W_prev) / (abs(W) + 1e-30) if outer > 0 else 1.0
+        W_prev = W
+        residual = dW_rel
 
-        # Mask: nodes clearly in one zone (not ambiguous)
-        clear_mask = (P > p_on) | (P < p_off)
-        interior = clear_mask[1:-1, 1:-1]
-        dth_arr = np.abs(theta[1:-1, 1:-1] - theta_old[1:-1, 1:-1])
-        if np.any(interior):
-            dth_outer = np.max(dth_arr * interior)
-        else:
-            dth_outer = np.max(dth_arr)
-
-        residual = max(dP, dth_outer)
+        # Accumulate theta over last 20 steps
+        if outer >= acc_start:
+            theta_acc += theta.copy()
+            n_acc += 1
 
         if verbose and (outer % 5 == 0 or outer < 3):
             cav = np.mean(zone_state[1:-1, 1:-1] == 0)
-            W = np.sum(P)
-            print(f"  outer={outer:>3d}: dP={dP:.2e} dth={dth_outer:.2e} "
+            print(f"  outer={outer:>3d}: dP={dP:.2e} dW={dW_rel:.2e} "
                   f"cav={cav:.3f} maxP={maxP:.4f} inner={ni} W={W:.2f}")
 
-        if residual < tol:
+        if dW_rel < tol and outer > 5:
             if verbose:
                 cav = np.mean(zone_state[1:-1, 1:-1] == 0)
                 print(f"  CONVERGED outer={outer}: cav={cav:.3f} maxP={np.max(P):.4f}")
             break
+
+    # Average theta over accumulated steps
+    if n_acc > 0:
+        theta = theta_acc / n_acc
 
     return P, theta, residual, outer + 1, total_inner
