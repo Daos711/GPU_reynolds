@@ -166,16 +166,20 @@ def solve_jfo_splitting_cpu(
         total_inner += ni
 
         # Step B: Inner theta-loop at fixed P (transport H*theta = const)
-        theta_old = theta.copy()
+        # relax=1.0 inside: one sweep propagates through entire cavitation zone.
+        # Outer damping: blend result with previous theta via theta_relax.
+        theta_before_B = theta.copy()
         th_sweeps = 0
         for k in range(max_theta_sweeps):
-            dth_inner = _update_theta(theta, P, Hfp, Hfm, N_Z, N_phi, theta_relax)
+            dth_inner = _update_theta(theta, P, Hfp, Hfm, N_Z, N_phi, 1.0)
             th_sweeps = k + 1
             if dth_inner < tol_theta:
                 break
+        # Outer damping
+        theta[:] = theta_before_B + theta_relax * (theta - theta_before_B)
 
         dP = np.max(np.abs(P - P_old))
-        dth_outer = np.max(np.abs(theta - theta_old))
+        dth_outer = np.max(np.abs(theta - theta_before_B))
         residual = max(dP, dth_outer)
 
         if verbose and (outer % 5 == 0 or outer < 3):
