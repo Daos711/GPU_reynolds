@@ -97,7 +97,7 @@ def compute_FmuQ(P, H, Phi_mesh, phi_1D, Z, d_phi):
     dP_dphi[:, 1:-1] = (P[:, 2:] - P[:, :-2]) / (2 * d_phi)
     dP_dphi[:, 0] = (P[:, 1] - P[:, -2]) / (2 * d_phi)
     dP_dphi[:, -1] = dP_dphi[:, 0]
-    tau = 1.0 / H + 0.5 * H * dP_dphi
+    tau = (1.0 / H) + 3.0 * H * dP_dphi
     F_friction = np.trapezoid(np.trapezoid(tau, phi_1D, axis=1), Z) * friction_scale
     mu_coeff = F_friction / (F + 1e-30)
 
@@ -173,8 +173,10 @@ def block2_KC(N, eps_range, Phi_mesh, Z_mesh, phi_1D, Z, d_phi, d_Z,
     Cxx = np.zeros(n_eps); Cxy = np.zeros(n_eps)
     Cyx = np.zeros(n_eps); Cyy = np.zeros(n_eps)
 
-    K_scale = pressure_scale * R * L / 2
-    C_scale = K_scale
+    # Dimensionalization scales
+    F_dim_scale = pressure_scale * R * L / 2   # = load_scale (nd force -> N)
+    K_to_dim = F_dim_scale / c                  # N/m (stiffness)
+    C_to_dim = F_dim_scale / (c * omega_shaft)  # N·s/m (damping)
 
     for i, eps0 in enumerate(eps_range):
         H_base = make_H(eps0, Phi_mesh, Z_mesh, textured=textured)
@@ -218,18 +220,18 @@ def block2_KC(N, eps_range, Phi_mesh, Z_mesh, phi_1D, Z, d_phi, d_Z,
         P_myp = solve_dynamic(H_base, d_phi, d_Z, xprime=0, yprime=-dxp, P_init=P_base)
         Fx_myp, Fy_myp = compute_forces(P_myp, Phi_mesh, phi_1D, Z)
 
-        # K = -dF/dq, C = -dF/dqdot
-        Kxx[i] = -(Fx_px - Fx_mx) / (2 * dx) * K_scale
-        Kyx[i] = -(Fy_px - Fy_mx) / (2 * dx) * K_scale
-        Kxy[i] = -(Fx_py - Fx_my) / (2 * dx) * K_scale
-        Kyy[i] = -(Fy_py - Fy_my) / (2 * dx) * K_scale
-        Cxx[i] = -(Fx_pxp - Fx_mxp) / (2 * dxp) * C_scale
-        Cyx[i] = -(Fy_pxp - Fy_mxp) / (2 * dxp) * C_scale
-        Cxy[i] = -(Fx_pyp - Fx_myp) / (2 * dxp) * C_scale
-        Cyy[i] = -(Fy_pyp - Fy_myp) / (2 * dxp) * C_scale
+        # K = -dF/dq (N/m), C = -dF/dqdot (N·s/m)
+        Kxx[i] = -(Fx_px - Fx_mx) / (2 * dx) * K_to_dim
+        Kyx[i] = -(Fy_px - Fy_mx) / (2 * dx) * K_to_dim
+        Kxy[i] = -(Fx_py - Fx_my) / (2 * dx) * K_to_dim
+        Kyy[i] = -(Fy_py - Fy_my) / (2 * dx) * K_to_dim
+        Cxx[i] = -(Fx_pxp - Fx_mxp) / (2 * dxp) * C_to_dim
+        Cyx[i] = -(Fy_pxp - Fy_mxp) / (2 * dxp) * C_to_dim
+        Cxy[i] = -(Fx_pyp - Fx_myp) / (2 * dxp) * C_to_dim
+        Cyy[i] = -(Fy_pyp - Fy_myp) / (2 * dxp) * C_to_dim
 
-        print(f"  eps={eps0:.2f}: Kxx={Kxx[i]:.1f} Kyy={Kyy[i]:.1f} "
-              f"Cxx={Cxx[i]:.1f} Cyy={Cyy[i]:.1f}")
+        print(f"  eps={eps0:.2f}: Kxx={Kxx[i]:.2e} Kyy={Kyy[i]:.2e} "
+              f"Cxx={Cxx[i]:.2e} Cyy={Cyy[i]:.2e}")
 
     return Kxx, Kxy, Kyx, Kyy, Cxx, Cxy, Cyx, Cyy
 
@@ -238,23 +240,34 @@ def block2_KC(N, eps_range, Phi_mesh, Z_mesh, phi_1D, Z, d_phi, d_Z,
 # Block 3: Stability parameters
 # ===================================================================
 def block3_stability(Kxx, Kxy, Kyx, Kyy, Cxx, Cxy, Cyx, Cyy):
+    """Stability params from old model formulas (4.19)-(4.21)."""
     n_eps = len(Kxx)
     Keq = np.zeros(n_eps)
     gamma_sq = np.zeros(n_eps)
     omega_st = np.zeros(n_eps)
 
     for i in range(n_eps):
-        K_mat = np.array([[Kxx[i], Kxy[i]], [Kyx[i], Kyy[i]]])
-        C_mat = np.array([[Cxx[i], Cxy[i]], [Cyx[i], Cyy[i]]])
+        # (4.19) Equivalent stiffness
+        denom = Cxx[i] + Cyy[i]
+        if abs(denom) < 1e-12:
+            Keq[i] = 0.0
+        else:
+            Keq[i] = (Kxx[i]*Cyy[i] + Kyy[i]*Cxx[i]
+                     - Kxy[i]*Cyx[i] - Kyx[i]*Cxy[i]) / denom
 
-        det_K = np.linalg.det(K_mat)
-        det_C = np.linalg.det(C_mat)
-        tr_C = np.trace(C_mat)
+        # (4.20) Logarithmic decrement
+        num = (Keq[i] - Kxx[i]) * (Keq[i] - Kyy[i]) - Kxy[i]*Kyx[i]
+        den = Cxx[i]*Cyy[i] - Cxy[i]*Cyx[i]
+        if abs(den) < 1e-12:
+            gamma_sq[i] = 0.0
+        else:
+            gamma_sq[i] = num / den
 
-        Keq[i] = det_K / (tr_C + 1e-30) if tr_C != 0 else 0
-        cross = Kxx[i] * Cyy[i] + Kyy[i] * Cxx[i] - Kxy[i] * Cyx[i] - Kyx[i] * Cxy[i]
-        gamma_sq[i] = (tr_C * cross - det_K) / (det_C + 1e-30) if det_C != 0 else 0
-        omega_st[i] = np.sqrt(abs(cross / (tr_C + 1e-30))) if tr_C != 0 else 0
+        # (4.21) Critical speed
+        if abs(gamma_sq[i]) < 1e-12:
+            omega_st[i] = 0.0
+        else:
+            omega_st[i] = Keq[i] / gamma_sq[i]
 
     return Keq, gamma_sq, omega_st
 
@@ -263,21 +276,45 @@ def block3_stability(Kxx, Kxy, Kyx, Kyy, Cxx, Cxy, Cyx, Cyy):
 # Block 4: Orbit integration
 # ===================================================================
 def block4_orbit(Kxx_val, Kxy_val, Kyx_val, Kyy_val,
-                 Cxx_val, Cxy_val, Cyx_val, Cyy_val,
-                 m=1.0, F_ext=0.0):
+                 Cxx_val, Cxy_val, Cyx_val, Cyy_val):
     from scipy.integrate import solve_ivp
 
-    def ode(t, y):
-        x, xd, yy, yd = y
-        # m*x'' + C*x' + K*x = F_ext
-        xdd = (F_ext - Cxx_val*xd - Cxy_val*yd - Kxx_val*x - Kxy_val*yy) / m
-        ydd = (-Cyx_val*xd - Cyy_val*yd - Kyx_val*x - Kyy_val*yy) / m
-        return [xd, xdd, yd, ydd]
+    # Dimensionless parameters
+    psi = c / R
+    K_scale_nd = eta * omega_shaft * L / psi**3
+    C_scale_nd = eta * L / psi**3
 
-    y0 = [1e-3, 0, 1e-3, 0]
-    t_span = (0, 0.5)
-    sol = solve_ivp(ode, t_span, y0, max_step=1e-4, rtol=1e-8)
-    return sol.t, sol.y[0], sol.y[2]
+    # Dimensionless coefficients
+    Kxx_nd = Kxx_val / K_scale_nd
+    Kxy_nd = Kxy_val / K_scale_nd
+    Kyx_nd = Kyx_val / K_scale_nd
+    Kyy_nd = Kyy_val / K_scale_nd
+    Cxx_nd = Cxx_val / C_scale_nd
+    Cxy_nd = Cxy_val / C_scale_nd
+    Cyx_nd = Cyx_val / C_scale_nd
+    Cyy_nd = Cyy_val / C_scale_nd
+
+    m_rotor = 1.0      # rotor mass, kg
+    F0 = 1.0e4          # external force amplitude, N
+    m_nd = m_rotor * omega_shaft**2 / K_scale_nd
+    F_nd = F0 / (K_scale_nd * c)
+
+    def ode(t_star, state):
+        x, y, vx, vy = state
+        Fx_nd = F_nd * np.cos(t_star)
+        Fy_nd = F_nd * np.sin(t_star)
+        ax = (Fx_nd - Cxx_nd*vx - Cxy_nd*vy - Kxx_nd*x - Kxy_nd*y) / m_nd
+        ay = (Fy_nd - Cyx_nd*vx - Cyy_nd*vy - Kyx_nd*x - Kyy_nd*y) / m_nd
+        return [vx, vy, ax, ay]
+
+    t_star_max = 1000
+    n_pts = 200000
+    t_eval = np.linspace(0, t_star_max, n_pts)
+    sol = solve_ivp(ode, (0, t_star_max), [0, 0, 0, 0],
+                    t_eval=t_eval, method='BDF', rtol=1e-8, atol=1e-10)
+
+    # Convert to meters
+    return sol.t, sol.y[0] * c, sol.y[1] * c
 
 
 # ===================================================================
