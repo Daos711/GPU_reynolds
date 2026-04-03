@@ -229,8 +229,12 @@ def solve_jfo_splitting_cpu(
     residual = 1.0
 
     for outer in range(max_outer):
-        # Step A: build F_theta, solve P with fixed theta
-        F_theta = _build_F_theta(Hfp, Hfm, theta, d_phi, N_Z, N_phi)
+        # Step A: build F_theta (blended RHS for stability), solve P
+        F_theta_new = _build_F_theta(Hfp, Hfm, theta, d_phi, N_Z, N_phi)
+        if outer == 0:
+            F_theta = F_theta_new
+        else:
+            F_theta = 0.5 * F_theta_new + 0.5 * F_theta  # blend RHS
 
         P_old = P.copy()
         ni, res_inner = _sor_solve_P(P, A, B, C, D, E, F_theta,
