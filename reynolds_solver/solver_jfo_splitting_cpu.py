@@ -3,9 +3,8 @@ JFO cavitation — operator splitting approach.
 
 Alternates between:
   Step A: Solve P from Reynolds eq with FIXED θ (HS-like SOR, many iterations)
-  Step B: Update θ from converged P (upwind mass transport, single pass)
+  Step B: Update zone_state with hysteresis, then march θ from rupture point
 
-This avoids the GS instability from mixing P and θ updates in one sweep.
 Coefficients A,B,C,D,E — identical to precompute_coefficients_gpu() in utils.py.
 """
 import numpy as np
@@ -48,40 +47,114 @@ def _sor_solve_P(P, A, B, C, D, E, F_theta,
 
 
 @njit
-def _update_theta(theta, P, H_face_p, H_face_m, N_Z, N_phi, relax):
-    """Update theta from converged P. Single upwind pass with under-relaxation."""
-    max_dth = 0.0
+def _update_zone_state(zone_state, P, N_Z, N_phi, p_on, p_off):
+    """Update zone classification with hysteresis. Only interior nodes."""
     for i in range(1, N_Z - 1):
         for j in range(1, N_phi - 1):
-            jm = j - 1 if j - 1 >= 1 else N_phi - 2
-            th_old = theta[i, j]
+            if P[i, j] > p_on:
+                zone_state[i, j] = 1  # full-film
+            elif P[i, j] < p_off:
+                zone_state[i, j] = 0  # cavitation
+            # else: keep previous (hysteresis band)
 
-            if P[i, j] > 0.0:
-                th_target = 1.0
+
+@njit
+def _update_theta_march(theta, zone_state, H_face_p, H_face_m, N_Z, N_phi):
+    """Rupture-anchored theta march for each Z-row.
+
+    For each row:
+      1. Full-film nodes (zone_state=1): theta = 1
+      2. Find rupture point (full-film -> cavitation transition)
+      3. March through cavitation zone from rupture with upwind transport
+    """
+    for i in range(1, N_Z - 1):
+        # Physical columns: 1..N_phi-2
+        n_phys = N_phi - 2  # number of physical columns
+
+        # Set full-film nodes to theta=1
+        any_cav = False
+        for j in range(1, N_phi - 1):
+            if zone_state[i, j] == 1:
+                theta[i, j] = 1.0
             else:
-                H_fp = H_face_p[i, j]
-                H_fm = H_face_m[i, j]
-                if H_fp > 1e-30:
-                    th_target = H_fm * theta[i, jm] / H_fp
-                    if th_target < 0.0: th_target = 0.0
-                    if th_target > 1.0: th_target = 1.0
+                any_cav = True
+
+        if not any_cav:
+            continue  # entire row is full-film
+
+        # Find rupture: last full-film node before a cavitation node (in +phi)
+        # Scan physical columns in order, looking for transition 1 -> 0
+        rupture_j = -1
+        for jj in range(n_phys):
+            j = 1 + jj  # physical column
+            j_next = j + 1 if j + 1 < N_phi - 1 else 1
+            if zone_state[i, j] == 1 and zone_state[i, j_next] == 0:
+                rupture_j = j
+                break  # take the first rupture
+
+        if rupture_j < 0:
+            # All cavitation, no full-film anchor — march from column 1
+            # Use current theta[i, N_phi-2] as upstream (periodic)
+            rupture_j = N_phi - 2  # "previous" full-film is the last phys column
+            # But if it's also cavitation, just start with theta=1
+            theta_prev = 1.0
+            j = 1
+            for _ in range(n_phys):
+                if zone_state[i, j] == 1:
+                    theta_prev = 1.0
                 else:
-                    th_target = theta[i, jm]
+                    H_fp = H_face_p[i, j]
+                    H_fm = H_face_m[i, j]
+                    if H_fp > 1e-30:
+                        th_new = H_fm * theta_prev / H_fp
+                        if th_new < 0.0:
+                            th_new = 0.0
+                        if th_new > 1.0:
+                            th_new = 1.0
+                        theta[i, j] = th_new
+                        theta_prev = th_new
+                    else:
+                        theta[i, j] = theta_prev
+                j = j + 1
+                if j >= N_phi - 1:
+                    j = 1
+            continue
 
-            theta[i, j] = th_old + relax * (th_target - th_old)
+        # March from rupture point through cavitation zone
+        theta_prev = 1.0  # at rupture, entering cavitation from full-film
+        j = rupture_j + 1
+        if j >= N_phi - 1:
+            j = 1  # periodic wrap
 
-            d = abs(theta[i, j] - th_old)
-            if d > max_dth:
-                max_dth = d
+        for _ in range(n_phys):
+            if zone_state[i, j] == 1:
+                break  # reached reformation point
 
+            H_fp = H_face_p[i, j]
+            H_fm = H_face_m[i, j]
+            if H_fp > 1e-30:
+                th_new = H_fm * theta_prev / H_fp
+                if th_new < 0.0:
+                    th_new = 0.0
+                if th_new > 1.0:
+                    th_new = 1.0
+                theta[i, j] = th_new
+                theta_prev = th_new
+            else:
+                theta[i, j] = theta_prev
+
+            j = j + 1
+            if j >= N_phi - 1:
+                j = 1  # periodic wrap
+
+    # Ghost columns (periodic)
     for i in range(N_Z):
         theta[i, 0] = theta[i, N_phi - 2]
         theta[i, N_phi - 1] = theta[i, 1]
+    # Z boundaries
     for j in range(N_phi):
         theta[0, j] = 1.0
         theta[N_Z - 1, j] = 1.0
-
-    return max_dth
 
 
 @njit
@@ -99,15 +172,14 @@ def _build_F_theta(H_face_p, H_face_m, theta, d_phi, N_Z, N_phi):
 def solve_jfo_splitting_cpu(
     H, d_phi, d_Z, R, L,
     omega=1.5, tol=1e-5, max_outer=100, max_inner=20000,
-    tol_inner=1e-6, theta_relax=0.5,
-    max_theta_sweeps=5, tol_theta=1e-4,
+    tol_inner=1e-6,
     verbose=False,
 ):
     """
     JFO cavitation via operator splitting (P, theta). CPU reference.
 
     Step A: Solve P from Reynolds with fixed theta (HS-like SOR).
-    Step B: Update theta from converged P (upwind transport + under-relaxation).
+    Step B: Update zone_state (hysteresis), then march theta from rupture.
 
     Parameters
     ----------
@@ -119,9 +191,6 @@ def solve_jfo_splitting_cpu(
     max_outer : int — max outer iterations
     max_inner : int — max SOR iterations per pressure solve
     tol_inner : float — inner SOR convergence
-    theta_relax : float — under-relaxation for theta (0.1–0.5)
-    max_theta_sweeps : int — max upwind sweeps per outer step for theta
-    tol_theta : float — convergence tolerance for inner theta loop
     verbose : bool
 
     Returns
@@ -154,10 +223,13 @@ def solve_jfo_splitting_cpu(
 
     P = np.zeros((N_Z, N_phi))
     theta = np.ones((N_Z, N_phi))
+    zone_state = np.ones((N_Z, N_phi), dtype=np.int32)  # 1=full-film
 
     total_inner = 0
+    residual = 1.0
 
     for outer in range(max_outer):
+        # Step A: build F_theta, solve P with fixed theta
         F_theta = _build_F_theta(Hfp, Hfm, theta, d_phi, N_Z, N_phi)
 
         P_old = P.copy()
@@ -165,31 +237,39 @@ def solve_jfo_splitting_cpu(
                                       N_Z, N_phi, omega, max_inner, tol_inner)
         total_inner += ni
 
-        # Step B: Inner theta-loop at fixed P (transport H*theta = const)
-        # relax=1.0 inside: one sweep propagates through entire cavitation zone.
-        # Outer damping with theta_relax to prevent inter-step oscillation.
-        theta_before_B = theta.copy()
-        th_sweeps = 0
-        for k in range(max_theta_sweeps):
-            dth_inner = _update_theta(theta, P, Hfp, Hfm, N_Z, N_phi, 1.0)
-            th_sweeps = k + 1
-            if dth_inner < tol_theta:
-                break
-        # Outer damping
-        theta[:] = theta_before_B + theta_relax * (theta - theta_before_B)
+        # Step B: update zone_state with hysteresis, then march theta
+        maxP = np.max(P)
+        p_on = 1e-5 * maxP if maxP > 0.0 else 1e-10
+        p_off = 1e-6 * maxP if maxP > 0.0 else 1e-11
 
+        theta_old = theta.copy()
+
+        _update_zone_state(zone_state, P, N_Z, N_phi, p_on, p_off)
+        _update_theta_march(theta, zone_state, Hfp, Hfm, N_Z, N_phi)
+
+        # Convergence: exclude interface nodes (in hysteresis band)
         dP = np.max(np.abs(P - P_old))
-        dth_outer = np.max(np.abs(theta - theta_before_B))
+
+        # Mask: nodes clearly in one zone (not ambiguous)
+        clear_mask = (P > p_on) | (P < p_off)
+        interior = clear_mask[1:-1, 1:-1]
+        dth_arr = np.abs(theta[1:-1, 1:-1] - theta_old[1:-1, 1:-1])
+        if np.any(interior):
+            dth_outer = np.max(dth_arr * interior)
+        else:
+            dth_outer = np.max(dth_arr)
+
         residual = max(dP, dth_outer)
 
         if verbose and (outer % 5 == 0 or outer < 3):
-            cav = np.mean(theta[1:-1, 1:-1] < 1.0)
+            cav = np.mean(zone_state[1:-1, 1:-1] == 0)
+            W = np.sum(P)
             print(f"  outer={outer:>3d}: dP={dP:.2e} dth={dth_outer:.2e} "
-                  f"cav={cav:.3f} maxP={np.max(P):.4f} inner={ni} th_sweeps={th_sweeps}")
+                  f"cav={cav:.3f} maxP={maxP:.4f} inner={ni} W={W:.2f}")
 
         if residual < tol:
             if verbose:
-                cav = np.mean(theta[1:-1, 1:-1] < 1.0)
+                cav = np.mean(zone_state[1:-1, 1:-1] == 0)
                 print(f"  CONVERGED outer={outer}: cav={cav:.3f} maxP={np.max(P):.4f}")
             break
 

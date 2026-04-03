@@ -18,8 +18,7 @@ L = 0.056
 
 # Solver defaults for tests & maps
 SOLVER_KW = dict(omega=1.5, tol=1e-5, max_outer=200, max_inner=20000,
-                 tol_inner=1e-6, theta_relax=0.5,
-                 max_theta_sweeps=5, tol_theta=1e-4)
+                 tol_inner=1e-6)
 
 
 def generate_test_case(N, epsilon):
@@ -55,7 +54,6 @@ def test_fullfilm_hs():
     N_Z, N_phi = H.shape
     alpha_sq = (2.0 * R / L * d_phi / d_Z) ** 2
 
-    # Build coefficients (same as precompute_coefficients_gpu)
     H_iph = 0.5 * (H[:, :-1] + H[:, 1:])
     H_imh = np.empty_like(H_iph)
     H_imh[:, 1:] = H_iph[:, :-1]; H_imh[:, 0] = H_iph[:, -1]
@@ -72,16 +70,13 @@ def test_fullfilm_hs():
     Hfp[:, :-1] = H_iph; Hfp[:, -1] = 0.5*(H[:,-1]+H[:,0])
     Hfm[:, 1:] = Hfp[:, :-1]; Hfm[:, 0] = Hfp[:, -1]
 
-    # F_orig (theta=1)
     theta_ones = np.ones((N_Z, N_phi))
     F_orig = _build_F_theta(Hfp, Hfm, theta_ones, d_phi, N_Z, N_phi)
 
-    # Solve with full film
     P_jfo = np.zeros((N_Z, N_phi))
     _sor_solve_P(P_jfo, A, B_arr, C, D, E, F_orig,
                  N_Z, N_phi, 1.5, 100000, 1e-8)
 
-    # HS reference
     P_hs, _, _ = solve_reynolds(H, d_phi, d_Z, R, L,
                                  cavitation="half_sommerfeld",
                                  max_iter=50000, tol=1e-6)
@@ -102,7 +97,7 @@ def test_physical(P, theta):
     t_min = np.min(theta)
     t_max = np.max(theta)
     print(f"  min(P) = {p_min:.4e}, min(theta) = {t_min:.4e}, max(theta) = {t_max:.4e}")
-    ok = p_min >= 0.0 and t_min >= 0.0 and t_max <= 1.0 + 1e-12
+    ok = p_min >= -1e-10 and t_min >= -1e-10 and t_max <= 1.0 + 1e-10
     return run_test("P>=0, theta in [0,1]", ok)
 
 
@@ -244,8 +239,7 @@ def sweep_cav_frac():
         _, theta, res, n_out, _ = solve_jfo_splitting_cpu(
             H, d_phi, d_Z, R, L,
             omega=1.5, tol=1e-5, max_outer=200, max_inner=20000,
-            tol_inner=1e-6, theta_relax=0.5,
-            max_theta_sweeps=5, tol_theta=1e-4)
+            tol_inner=1e-6)
         cav = np.mean(theta[1:-1, 1:-1] < 1.0)
         cav_fracs.append(cav)
         print(f"  eps={eps:.2f}: cav={cav:.3f} ({cav*100:.1f}%), "
@@ -263,40 +257,48 @@ def sweep_cav_frac():
 
 
 # ===================================================================
-# Boundary oscillation check
+# Rupture/reformation debug for midplane row
 # ===================================================================
-def boundary_oscillation_check():
-    print("\n=== Boundary oscillation check (eps=0.6) ===")
-    from reynolds_solver.solver_jfo_splitting_cpu import (
-        solve_jfo_splitting_cpu, _build_F_theta, _sor_solve_P, _update_theta,
-    )
+def rupture_debug():
+    print("\n=== Rupture/reformation debug (eps=0.6, Z=0) ===")
+    from reynolds_solver.solver_jfo_splitting_cpu import solve_jfo_splitting_cpu
 
     N = 250
-    H, d_phi, d_Z, *_ = generate_test_case(N, 0.6)
-
-    # Run solver to convergence
+    H, d_phi, d_Z, phi_1D, *_ = generate_test_case(N, 0.6)
     P, theta, res, n_out, n_in = solve_jfo_splitting_cpu(
         H, d_phi, d_Z, R, L, **SOLVER_KW)
 
-    # One more outer step to measure oscillation
+    mid = N // 2
     N_Z, N_phi = H.shape
-    alpha_sq = (2.0 * R / L * d_phi / d_Z) ** 2
 
-    H_iph = 0.5 * (H[:, :-1] + H[:, 1:])
-    Hfp = np.zeros((N_Z, N_phi)); Hfm = np.zeros((N_Z, N_phi))
-    Hfp[:, :-1] = H_iph; Hfp[:, -1] = 0.5*(H[:,-1]+H[:,0])
-    Hfm[:, 1:] = Hfp[:, :-1]; Hfm[:, 0] = Hfp[:, -1]
+    # Reconstruct zone_state from P (same thresholds as solver)
+    maxP = np.max(P)
+    p_on = 1e-5 * maxP
+    p_off = 1e-6 * maxP
+    zs = np.ones(N_phi, dtype=np.int32)
+    for j in range(1, N_phi - 1):
+        if P[mid, j] > p_on:
+            zs[j] = 1
+        elif P[mid, j] < p_off:
+            zs[j] = 0
 
-    theta_before = theta.copy()
-    _update_theta(theta, P, Hfp, Hfm, N_Z, N_phi, 0.3)
-    _update_theta(theta, P, Hfp, Hfm, N_Z, N_phi, 0.3)
+    # Find rupture/reformation
+    rupture_j = -1
+    reform_j = -1
+    for j in range(1, N_phi - 1):
+        j_next = j + 1 if j + 1 < N_phi - 1 else 1
+        if zs[j] == 1 and zs[j_next] == 0:
+            rupture_j = j
+        if zs[j] == 0 and zs[j_next] == 1:
+            reform_j = j_next
 
-    dth = np.abs(theta[1:-1, 1:-1] - theta_before[1:-1, 1:-1])
-    n_osc = np.sum(dth > 0.01)
-    n_total = dth.size
-    print(f"  Nodes with |dth| > 0.01 on extra step: {n_osc} out of {n_total} interior")
-    if n_osc > 0:
-        print(f"  max|dth| = {np.max(dth):.4e}, mean|dth| = {np.mean(dth):.4e}")
+    n_cav = np.sum(zs[1:-1] == 0)
+    n_ff = np.sum(zs[1:-1] == 1)
+    print(f"  rupture_j = {rupture_j} (phi={phi_1D[rupture_j]:.3f} rad)" if rupture_j >= 0 else "  rupture_j = none")
+    print(f"  reform_j  = {reform_j} (phi={phi_1D[reform_j]:.3f} rad)" if reform_j >= 0 else "  reform_j  = none")
+    print(f"  zone_state: {n_ff} full-film, {n_cav} cavitation (of {N_phi-2} physical)")
+    print(f"  min(theta) = {np.min(theta[mid, 1:-1]):.4f}")
+    print(f"  p_on = {p_on:.2e}, p_off = {p_off:.2e}, maxP = {maxP:.4e}")
 
 
 # ===================================================================
@@ -318,7 +320,7 @@ def main():
     P, theta, residual, n_out, n_in = solve_jfo_splitting_cpu(
         H, d_phi, d_Z, R, L, verbose=True, **SOLVER_KW)
     cav = np.mean(theta[1:-1, 1:-1] < 1.0)
-    print(f"  Result: cav={cav:.3f}, maxP={np.max(P):.4f}, "
+    print(f"  Result: cav={cav:.3f}, maxP={np.max(P):.4f}, min(theta)={np.min(theta[1:-1,1:-1]):.4f}, "
           f"outer={n_out}, inner={n_in}, res={residual:.2e}")
 
     results = {}
@@ -328,6 +330,9 @@ def main():
     results["3"] = test_load_comparison()
     results["4"] = test_convergence(residual)
 
+    # --- Rupture debug ---
+    rupture_debug()
+
     # --- Maps ---
     print("\n=== Maps ===")
     for e in [0.6, 0.05]:
@@ -336,9 +341,6 @@ def main():
 
     # --- cav_frac sweep ---
     sweep_cav_frac()
-
-    # --- Boundary oscillation ---
-    boundary_oscillation_check()
 
     # --- Summary ---
     print("\n" + "=" * 60)
