@@ -179,7 +179,7 @@ def block2_KC(N, eps_range, Phi_mesh, Z_mesh, phi_1D, Z, d_phi, d_Z,
     C_to_dim = F_dim_scale / (c * omega_shaft)  # N·s/m (damping)
 
     # Use tight tolerance for perturbation solves (dx ~ 1e-5, need tol << dx)
-    tol_kc = 1e-8
+    tol_kc = 1e-6
 
     for i, eps0 in enumerate(eps_range):
         H_base = make_H(eps0, Phi_mesh, Z_mesh, textured=textured)
@@ -239,6 +239,15 @@ def block2_KC(N, eps_range, Phi_mesh, Z_mesh, phi_1D, Z, d_phi, d_Z,
 
         print(f"  eps={eps0:.2f}: Kxx={Kxx[i]:.2e} Kyy={Kyy[i]:.2e} "
               f"Cxx={Cxx[i]:.2e} Cyy={Cyy[i]:.2e}")
+
+    # Debug: dimensionless check
+    psi_db = c / R
+    K_sc = eta * omega_shaft * L / psi_db**3
+    C_sc = eta * L / psi_db**3
+    print(f"\n  Dimensionless check (K/K_scale, C/C_scale):")
+    for i, eps0 in enumerate(eps_range):
+        print(f"    eps={eps0:.2f}: Kxx_nd={Kxx[i]/K_sc:.2f} Kyy_nd={Kyy[i]/K_sc:.2f} "
+              f"Cxx_nd={Cxx[i]/C_sc:.1f} Cyy_nd={Cyy[i]/C_sc:.1f}")
 
     return Kxx, Kxy, Kyx, Kyy, Cxx, Cxy, Cyx, Cyy
 
@@ -427,15 +436,22 @@ def main():
         block2_KC(N, eps_KC, Phi_mesh, Z_mesh, phi_1D, Z, d_phi, d_Z,
                   textured=True)
 
-    # --- Block 3: Stability ---
+    # --- Block 3: Stability (needs dimensionless K/C) ---
     print("\n=== Block 3: Stability parameters ===")
+    psi_nd = c / R
+    K_scale_nd = eta * omega_shaft * L / psi_nd**3
+    C_scale_nd = eta * L / psi_nd**3
+    print(f"  K_scale = {K_scale_nd:.2e}, C_scale = {C_scale_nd:.2e}")
+
     Keq_s, gamma_s, omega_st_s = block3_stability(
-        Kxx_s, Kxy_s, Kyx_s, Kyy_s, Cxx_s, Cxy_s, Cyx_s, Cyy_s)
+        Kxx_s/K_scale_nd, Kxy_s/K_scale_nd, Kyx_s/K_scale_nd, Kyy_s/K_scale_nd,
+        Cxx_s/C_scale_nd, Cxy_s/C_scale_nd, Cyx_s/C_scale_nd, Cyy_s/C_scale_nd)
     Keq_t, gamma_t, omega_st_t = block3_stability(
-        Kxx_t, Kxy_t, Kyx_t, Kyy_t, Cxx_t, Cxy_t, Cyx_t, Cyy_t)
+        Kxx_t/K_scale_nd, Kxy_t/K_scale_nd, Kyx_t/K_scale_nd, Kyy_t/K_scale_nd,
+        Cxx_t/C_scale_nd, Cxy_t/C_scale_nd, Cyx_t/C_scale_nd, Cyy_t/C_scale_nd)
     for i, eps in enumerate(eps_KC):
-        print(f"  eps={eps:.2f}: Keq_s={Keq_s[i]:.1f} gamma_s={gamma_s[i]:.2f} "
-              f"Keq_t={Keq_t[i]:.1f} gamma_t={gamma_t[i]:.2f}")
+        print(f"  eps={eps:.2f}: Keq_s={Keq_s[i]:.4f} gamma_s={gamma_s[i]:.4f} "
+              f"Keq_t={Keq_t[i]:.4f} gamma_t={gamma_t[i]:.4f}")
 
     # --- Block 4: Orbit ---
     print("\n=== Block 4: Orbit (eps=0.6) ===")
