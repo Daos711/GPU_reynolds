@@ -207,23 +207,23 @@ def block2_KC(N, eps_range, Phi_mesh, Z_mesh, phi_1D, Z, d_phi, d_Z,
         Fx_my, Fy_my = compute_forces(P_my, Phi_mesh, phi_1D, Z)
 
         # --- Damping (dynamic perturbations) ---
-        # +x': xprime = +dxp
-        P_pxp = solve_dynamic(H_base, d_phi, d_Z, xprime=dxp, yprime=0,
+        # +x' velocity → physical cos(φ) → solver yprime
+        P_pxp = solve_dynamic(H_base, d_phi, d_Z, xprime=0, yprime=dxp,
                               P_init=P_base, tol=tol_kc)
         Fx_pxp, Fy_pxp = compute_forces(P_pxp, Phi_mesh, phi_1D, Z)
 
-        # -x': xprime = -dxp
-        P_mxp = solve_dynamic(H_base, d_phi, d_Z, xprime=-dxp, yprime=0,
+        # -x' velocity → physical cos(φ) → solver yprime
+        P_mxp = solve_dynamic(H_base, d_phi, d_Z, xprime=0, yprime=-dxp,
                               P_init=P_base, tol=tol_kc)
         Fx_mxp, Fy_mxp = compute_forces(P_mxp, Phi_mesh, phi_1D, Z)
 
-        # +y': yprime = +dxp
-        P_pyp = solve_dynamic(H_base, d_phi, d_Z, xprime=0, yprime=dxp,
+        # +y' velocity → physical sin(φ) → solver xprime
+        P_pyp = solve_dynamic(H_base, d_phi, d_Z, xprime=dxp, yprime=0,
                               P_init=P_base, tol=tol_kc)
         Fx_pyp, Fy_pyp = compute_forces(P_pyp, Phi_mesh, phi_1D, Z)
 
-        # -y': yprime = -dxp
-        P_myp = solve_dynamic(H_base, d_phi, d_Z, xprime=0, yprime=-dxp,
+        # -y' velocity → physical sin(φ) → solver xprime
+        P_myp = solve_dynamic(H_base, d_phi, d_Z, xprime=-dxp, yprime=0,
                               P_init=P_base, tol=tol_kc)
         Fx_myp, Fy_myp = compute_forces(P_myp, Phi_mesh, phi_1D, Z)
 
@@ -392,7 +392,7 @@ def block5_benchmark(N):
 def main():
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    N = 500
+    N = 300
     epsilon_FmuQ = np.linspace(0.05, 0.8, 16)
     eps_KC = np.linspace(0.2, 0.8, 10)
 
