@@ -176,55 +176,48 @@ def block2_KC(N, eps_range, Phi_mesh, Z_mesh, phi_1D, Z, d_phi, d_Z,
     # Dimensionalization scales
     F_dim_scale = pressure_scale * R * L / 2   # = load_scale (nd force -> N)
     K_to_dim = F_dim_scale / c                  # N/m (stiffness)
-    C_to_dim = F_dim_scale / (c * omega_shaft)  # N·s/m (damping)
+    C_to_dim = F_dim_scale * d_phi**2 / (c * omega_shaft)  # N·s/m (compensate d_phi²)
 
-    # Use tight tolerance for perturbation solves (dx ~ 1e-5, need tol << dx)
-    tol_kc = 1e-6
+    tol_kc = 1e-5  # same as old model
 
     for i, eps0 in enumerate(eps_range):
         H_base = make_H(eps0, Phi_mesh, Z_mesh, textured=textured)
-        P_base = solve_static(H_base, d_phi, d_Z, tol=tol_kc)
+        P_base = solve_static(H_base, d_phi, d_Z, P_init=None, tol=tol_kc)
 
-        # --- Stiffness (static perturbations) ---
-        # +x: eps -> eps+dx
+        # --- Stiffness (static perturbations) — all from scratch ---
         H_px = make_H(eps0 + dx, Phi_mesh, Z_mesh, textured=textured)
-        P_px = solve_static(H_px, d_phi, d_Z, P_init=P_base, tol=tol_kc)
+        P_px = solve_static(H_px, d_phi, d_Z, P_init=None, tol=tol_kc)
         Fx_px, Fy_px = compute_forces(P_px, Phi_mesh, phi_1D, Z)
 
-        # -x: eps -> eps-dx
         H_mx = make_H(eps0 - dx, Phi_mesh, Z_mesh, textured=textured)
-        P_mx = solve_static(H_mx, d_phi, d_Z, P_init=P_base, tol=tol_kc)
+        P_mx = solve_static(H_mx, d_phi, d_Z, P_init=None, tol=tol_kc)
         Fx_mx, Fy_mx = compute_forces(P_mx, Phi_mesh, phi_1D, Z)
 
-        # +y: H_base + dx*sin(phi)
         H_py = H_base + dx * sin_phi
-        P_py = solve_static(H_py, d_phi, d_Z, P_init=P_base, tol=tol_kc)
+        P_py = solve_static(H_py, d_phi, d_Z, P_init=None, tol=tol_kc)
         Fx_py, Fy_py = compute_forces(P_py, Phi_mesh, phi_1D, Z)
 
-        # -y: H_base - dx*sin(phi)
         H_my = H_base - dx * sin_phi
-        P_my = solve_static(H_my, d_phi, d_Z, P_init=P_base, tol=tol_kc)
+        P_my = solve_static(H_my, d_phi, d_Z, P_init=None, tol=tol_kc)
         Fx_my, Fy_my = compute_forces(P_my, Phi_mesh, phi_1D, Z)
 
-        # --- Damping (dynamic perturbations) ---
+        # --- Damping (dynamic perturbations) — all from scratch ---
         # +x' velocity → physical cos(φ) → solver yprime
         P_pxp = solve_dynamic(H_base, d_phi, d_Z, xprime=0, yprime=dxp,
-                              P_init=P_base, tol=tol_kc)
+                              P_init=None, tol=tol_kc)
         Fx_pxp, Fy_pxp = compute_forces(P_pxp, Phi_mesh, phi_1D, Z)
 
-        # -x' velocity → physical cos(φ) → solver yprime
         P_mxp = solve_dynamic(H_base, d_phi, d_Z, xprime=0, yprime=-dxp,
-                              P_init=P_base, tol=tol_kc)
+                              P_init=None, tol=tol_kc)
         Fx_mxp, Fy_mxp = compute_forces(P_mxp, Phi_mesh, phi_1D, Z)
 
         # +y' velocity → physical sin(φ) → solver xprime
         P_pyp = solve_dynamic(H_base, d_phi, d_Z, xprime=dxp, yprime=0,
-                              P_init=P_base, tol=tol_kc)
+                              P_init=None, tol=tol_kc)
         Fx_pyp, Fy_pyp = compute_forces(P_pyp, Phi_mesh, phi_1D, Z)
 
-        # -y' velocity → physical sin(φ) → solver xprime
         P_myp = solve_dynamic(H_base, d_phi, d_Z, xprime=-dxp, yprime=0,
-                              P_init=P_base, tol=tol_kc)
+                              P_init=None, tol=tol_kc)
         Fx_myp, Fy_myp = compute_forces(P_myp, Phi_mesh, phi_1D, Z)
 
         # K = -dF/dq (N/m), C = -dF/dqdot (N·s/m)
