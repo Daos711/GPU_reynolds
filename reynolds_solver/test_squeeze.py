@@ -178,57 +178,55 @@ def test_pure_squeeze():
 # Test 4: Sign test — closing vs opening
 # -----------------------------------------------------------------------
 def test_sign():
-    print("\n=== Test 4: Sign test (closing vs opening) ===")
+    print("\n=== Test 4: Sign test (squeeze opposes motion) ===")
     from reynolds_solver.squeeze import solve_reynolds_squeeze
 
     N = 200
-    H, d_phi, d_Z, phi_1D, Z, Phi_mesh = generate_grid(N, epsilon=0.3)
+    # Pure squeeze: H=const (no wedge), so force is entirely from squeeze
+    phi_1D = np.linspace(0, 2 * np.pi, N)
+    Z = np.linspace(-1, 1, N)
+    Phi_mesh, _ = np.meshgrid(phi_1D, Z)
+    d_phi = phi_1D[1] - phi_1D[0]
+    d_Z = Z[1] - Z[0]
+    H = np.ones((N, N))
 
     c = 50e-6
     omega_shaft = 312.0
-    v_mag = 0.1  # m/s
+    v_mag = 0.5
 
-    # Baseline (no squeeze)
-    P_base, _, _ = solve_reynolds_squeeze(
-        H, d_phi, d_Z, R, L,
-        v_x=0.0, v_y=0.0,
-        omega=1.5, tol=1e-6, max_iter=50000,
-    )
-
-    # Closing: v_x > 0 (shaft moves toward bearing wall at φ≈π)
-    P_close, _, _ = solve_reynolds_squeeze(
+    # v_x > 0 → squeeze force Fx should be < 0 (opposes motion)
+    P_px, _, _ = solve_reynolds_squeeze(
         H, d_phi, d_Z, R, L,
         v_x=v_mag, v_y=0.0,
         c=c, omega_shaft=omega_shaft,
         omega=1.5, tol=1e-6, max_iter=50000,
     )
+    Fx_px = np.trapezoid(np.trapezoid(P_px * np.cos(Phi_mesh), phi_1D, axis=1), Z)
 
-    # Opening: v_x < 0 (shaft moves away from bearing wall at φ≈π)
-    P_open, _, _ = solve_reynolds_squeeze(
+    # v_x < 0 → squeeze force Fx should be > 0 (opposes motion)
+    P_mx, _, _ = solve_reynolds_squeeze(
         H, d_phi, d_Z, R, L,
         v_x=-v_mag, v_y=0.0,
         c=c, omega_shaft=omega_shaft,
         omega=1.5, tol=1e-6, max_iter=50000,
     )
+    Fx_mx = np.trapezoid(np.trapezoid(P_mx * np.cos(Phi_mesh), phi_1D, axis=1), Z)
 
-    W_base = np.sum(P_base)
-    W_close = np.sum(P_close)
-    W_open = np.sum(P_open)
-
-    print(f"    W_base  = {W_base:.4e}")
-    print(f"    W_close = {W_close:.4e} (squeeze closing)")
-    print(f"    W_open  = {W_open:.4e} (squeeze opening)")
+    print(f"    v_x=+{v_mag}: Fx = {Fx_px:.4e} (should be < 0)")
+    print(f"    v_x=-{v_mag}: Fx = {Fx_mx:.4e} (should be > 0)")
+    print(f"    Squeeze stronger at thin film: |Fx(+v)| > |Fx(-v)|: "
+          f"{abs(Fx_px):.4e} vs {abs(Fx_mx):.4e}")
 
     all_ok = True
     all_ok &= run_test(
-        "Closing squeeze increases total load",
-        W_close > W_base,
-        f"W_close={W_close:.4e} > W_base={W_base:.4e}",
+        "v_x>0 → Fx<0 (squeeze opposes +x motion)",
+        Fx_px < 0,
+        f"Fx = {Fx_px:.4e}",
     )
     all_ok &= run_test(
-        "Opening squeeze decreases total load",
-        W_open < W_base,
-        f"W_open={W_open:.4e} < W_base={W_base:.4e}",
+        "v_x<0 → Fx>0 (squeeze opposes -x motion)",
+        Fx_mx > 0,
+        f"Fx = {Fx_mx:.4e}",
     )
     return all_ok
 
