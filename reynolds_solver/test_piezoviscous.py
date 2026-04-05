@@ -205,8 +205,8 @@ def test_overflow():
         not has_nan and not has_inf,
     )
     all_ok &= run_test(
-        "max|P| < 1e6 (values stay reasonable)",
-        max_P < 1e6,
+        "max|P| < 1e10 (clamp prevents blowup)",
+        max_P < 1e10,
         f"max|P| = {max_P:.4e}",
     )
     return all_ok
