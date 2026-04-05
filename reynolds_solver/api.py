@@ -24,6 +24,7 @@ import numpy as np
 from reynolds_solver.solver import solve_reynolds_gpu
 from reynolds_solver.solver_dynamic import solve_reynolds_gpu_dynamic
 from reynolds_solver.solver_jfo import solve_reynolds_gpu_jfo
+from reynolds_solver.solver_piezoviscous import solve_reynolds_piezoviscous
 from reynolds_solver.physics.closures import LaminarClosure, ConstantinescuClosure
 
 
@@ -65,6 +66,12 @@ def solve_reynolds(
     use_F_theta: bool = True,
     update_mask: bool = True,
     run_theta_sweep: bool = True,
+    # Piezoviscous parameters
+    alpha_pv: float = None,
+    p_scale: float = None,
+    tol_outer: float = 1e-3,
+    max_outer_pv: int = 20,
+    relax_pv: float = 0.7,
 ) -> tuple:
     """
     Solve the Reynolds equation on GPU (Red-Black SOR).
@@ -160,6 +167,33 @@ def solve_reynolds(
         raise ValueError(
             f"Unknown closure: '{closure}'. "
             "Valid options: 'laminar', 'constantinescu'."
+        )
+
+    # --- Piezoviscous path (overrides normal dispatch) ---
+    if alpha_pv is not None:
+        if cavitation != "half_sommerfeld":
+            raise NotImplementedError(
+                "Piezoviscosity only supported with cavitation='half_sommerfeld'."
+            )
+        if closure != "laminar":
+            raise NotImplementedError(
+                "Piezoviscosity only supported with closure='laminar'."
+            )
+        if p_scale is None:
+            raise ValueError(
+                "p_scale is required when alpha_pv is set."
+            )
+        return solve_reynolds_piezoviscous(
+            H, d_phi, d_Z, R, L,
+            alpha_pv=alpha_pv,
+            p_scale=p_scale,
+            xprime=xprime, yprime=yprime, beta=beta,
+            omega=omega, tol=tol, max_iter=max_iter, check_every=check_every,
+            tol_outer=tol_outer,
+            max_outer=max_outer_pv,
+            relax=relax_pv,
+            P_init=P_init,
+            verbose=verbose,
         )
 
     # --- Dispatch by cavitation model ---
