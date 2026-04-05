@@ -69,6 +69,8 @@ def solve_reynolds(
     # Piezoviscous parameters
     alpha_pv: float = None,
     p_scale: float = None,
+    p0_roelands: float = 1.98e8,
+    z_roelands: float = 0.6,
     tol_outer: float = 1e-3,
     max_outer_pv: int = 20,
     relax_pv: float = 0.7,
@@ -187,6 +189,8 @@ def solve_reynolds(
             H, d_phi, d_Z, R, L,
             alpha_pv=alpha_pv,
             p_scale=p_scale,
+            p0_roelands=p0_roelands,
+            z_roelands=z_roelands,
             xprime=xprime, yprime=yprime, beta=beta,
             omega=omega, tol=tol, max_iter=max_iter, check_every=check_every,
             tol_outer=tol_outer,

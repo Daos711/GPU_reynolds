@@ -213,6 +213,52 @@ def test_overflow():
 
 
 # -----------------------------------------------------------------------
+# Test 5b: Roelands formula correctness
+# -----------------------------------------------------------------------
+def test_roelands_formula():
+    print("\n=== Test 5b: Roelands formula correctness ===")
+    import cupy as cp
+    from reynolds_solver.solver_piezoviscous import _compute_mu_ratio_gpu
+
+    alpha = 18e-9
+    p0 = 1.98e8
+    z = 0.6
+
+    # At p=0: mu_ratio should be exactly 1.0
+    P_zero = cp.zeros((3, 3), dtype=cp.float64)
+    mu_zero, _ = _compute_mu_ratio_gpu(P_zero, alpha, 1.0, p0, z)
+    err_zero = float(cp.max(cp.abs(mu_zero - 1.0)))
+
+    # At p=p0: log_mu = (alpha*p0/z) * (2^z - 1)
+    P_p0 = cp.ones((3, 3), dtype=cp.float64) * p0  # p_dim = P * p_scale, use p_scale=1
+    mu_p0, _ = _compute_mu_ratio_gpu(P_p0, alpha, 1.0, p0, z)
+    log_expected = (alpha * p0 / z) * (2.0**z - 1.0)
+    mu_expected = np.exp(log_expected)
+    err_p0 = abs(float(cp.mean(mu_p0)) - mu_expected) / mu_expected
+
+    # At low pressure (p << p0): should approximate Barus
+    p_low = 1e6  # 1 MPa
+    P_low = cp.ones((3, 3), dtype=cp.float64) * p_low
+    mu_roel, _ = _compute_mu_ratio_gpu(P_low, alpha, 1.0, p0, z)
+    mu_barus = np.exp(alpha * p_low)
+    err_barus = abs(float(cp.mean(mu_roel)) - mu_barus) / mu_barus
+
+    print(f"    p=0: mu_ratio={float(cp.mean(mu_zero)):.6f}, err={err_zero:.2e}")
+    print(f"    p=p0: mu_ratio={float(cp.mean(mu_p0)):.6f}, expected={mu_expected:.6f}, "
+          f"err={err_p0:.2e}")
+    print(f"    p=1MPa: Roelands={float(cp.mean(mu_roel)):.6f}, Barus={mu_barus:.6f}, "
+          f"err={err_barus:.2e}")
+
+    all_ok = True
+    all_ok &= run_test("p=0 → mu_ratio=1.0 exactly", err_zero < 1e-14)
+    all_ok &= run_test("p=p0 matches analytic", err_p0 < 1e-10,
+                       f"err={err_p0:.2e}")
+    all_ok &= run_test("p<<p0 ≈ Barus (<1%)", err_barus < 0.01,
+                       f"err={err_barus:.2e}")
+    return all_ok
+
+
+# -----------------------------------------------------------------------
 # Test 6: Backward compatibility
 # -----------------------------------------------------------------------
 def test_backward_compat():
@@ -277,7 +323,7 @@ def test_squeeze_compat():
 # -----------------------------------------------------------------------
 def main():
     print("=" * 60)
-    print("  Piezoviscous (Barus) tests")
+    print("  Piezoviscous (Roelands) tests")
     print("=" * 60)
 
     results = []
@@ -286,13 +332,14 @@ def main():
     results.append(test_oil_discrimination())
     results.append(test_convergence())
     results.append(test_overflow())
+    results.append(test_roelands_formula())
     results.append(test_backward_compat())
     results.append(test_squeeze_compat())
 
     print("\n" + "=" * 60)
     all_ok = all(results)
     if all_ok:
-        print("  ALL PIEZOVISCOUS TESTS PASSED")
+        print("  ALL PIEZOVISCOUS (ROELANDS) TESTS PASSED")
     else:
         print("  SOME TESTS FAILED")
         for i, r in enumerate(results, 1):
