@@ -196,12 +196,20 @@ def test_overflow():
 
     has_nan = np.any(np.isnan(P))
     has_inf = np.any(np.isinf(P))
-    print(f"    has_nan = {has_nan}, has_inf = {has_inf}")
+    max_P = np.max(np.abs(P))
+    print(f"    has_nan = {has_nan}, has_inf = {has_inf}, max|P| = {max_P:.4e}")
 
-    return run_test(
+    all_ok = True
+    all_ok &= run_test(
         "No inf/nan with extreme alpha",
         not has_nan and not has_inf,
     )
+    all_ok &= run_test(
+        "max|P| < 1e6 (values stay reasonable)",
+        max_P < 1e6,
+        f"max|P| = {max_P:.4e}",
+    )
+    return all_ok
 
 
 # -----------------------------------------------------------------------

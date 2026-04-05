@@ -22,7 +22,7 @@ from reynolds_solver.solver import _get_solver
 from reynolds_solver.utils import precompute_coefficients_gpu, add_dynamic_rhs_gpu
 from reynolds_solver.physics.closures import LaminarClosure
 
-LOG_MU_MAX = 500.0  # clamp to prevent overflow in exp()
+LOG_MU_MAX = 20.0  # clamp: exp(20) ≈ 5e8, already extreme for lubrication
 
 
 def _compute_mu_ratio_gpu(P_gpu, alpha_pv, p_scale):
