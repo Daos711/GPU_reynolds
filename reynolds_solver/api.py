@@ -56,6 +56,10 @@ def solve_reynolds(
     # Subcell quadrature for conductance
     subcell_quad: bool = False,
     n_sub: int = 4,
+    H_smooth: np.ndarray = None,
+    texture_params: dict = None,
+    phi_1D: np.ndarray = None,
+    Z_1D: np.ndarray = None,
     # JFO-specific parameters
     jfo_max_outer: int = 500,
     jfo_max_inner: int = 500,
@@ -159,7 +163,13 @@ def solve_reynolds(
     """
     # --- Build closure object ---
     if closure == "laminar":
-        closure_obj = LaminarClosure(subcell_quad=subcell_quad, n_sub=n_sub)
+        import cupy as cp
+        H_smooth_gpu = cp.asarray(H_smooth, dtype=cp.float64) if H_smooth is not None else None
+        closure_obj = LaminarClosure(
+            subcell_quad=subcell_quad, n_sub=n_sub,
+            H_smooth_gpu=H_smooth_gpu, texture_params=texture_params,
+            phi_1D=phi_1D, Z_1D=Z_1D,
+        )
     elif closure == "constantinescu":
         missing = [name for name, val in [
             ("rho", rho), ("U_velocity", U_velocity),
@@ -203,6 +213,10 @@ def solve_reynolds(
                 verbose=verbose,
                 subcell_quad=subcell_quad,
                 n_sub=n_sub,
+                H_smooth_gpu=H_smooth_gpu,
+                texture_params=texture_params,
+                phi_1D=phi_1D,
+                Z_1D=Z_1D,
             )
         elif pv_method == "iterative":
             return solve_reynolds_piezoviscous(
@@ -221,6 +235,10 @@ def solve_reynolds(
                 verbose=verbose,
                 subcell_quad=subcell_quad,
                 n_sub=n_sub,
+                H_smooth_gpu=H_smooth_gpu,
+                texture_params=texture_params,
+                phi_1D=phi_1D,
+                Z_1D=Z_1D,
             )
         else:
             raise ValueError(
