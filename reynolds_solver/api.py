@@ -53,6 +53,9 @@ def solve_reynolds(
     max_iter: int = 50000,
     check_every: int = 500,
     P_init: np.ndarray = None,
+    # Subcell quadrature for conductance
+    subcell_quad: bool = False,
+    n_sub: int = 4,
     # JFO-specific parameters
     jfo_max_outer: int = 500,
     jfo_max_inner: int = 500,
@@ -156,7 +159,7 @@ def solve_reynolds(
     """
     # --- Build closure object ---
     if closure == "laminar":
-        closure_obj = LaminarClosure()
+        closure_obj = LaminarClosure(subcell_quad=subcell_quad, n_sub=n_sub)
     elif closure == "constantinescu":
         missing = [name for name, val in [
             ("rho", rho), ("U_velocity", U_velocity),
@@ -198,6 +201,8 @@ def solve_reynolds(
                 check_every=check_every,
                 P_init=P_init,
                 verbose=verbose,
+                subcell_quad=subcell_quad,
+                n_sub=n_sub,
             )
         elif pv_method == "iterative":
             return solve_reynolds_piezoviscous(
@@ -214,6 +219,8 @@ def solve_reynolds(
                 relax=relax_pv,
                 P_init=P_init,
                 verbose=verbose,
+                subcell_quad=subcell_quad,
+                n_sub=n_sub,
             )
         else:
             raise ValueError(

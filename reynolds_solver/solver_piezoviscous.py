@@ -129,9 +129,12 @@ def solve_reynolds_piezoviscous(
     relax: float = 0.7,
     P_init: np.ndarray = None,
     verbose: bool = False,
+    # Subcell quadrature
+    subcell_quad: bool = False,
+    n_sub: int = 4,
 ) -> tuple:
     """
-    Solve Reynolds equation with piezoviscosity (Barus law) on GPU.
+    Solve Reynolds equation with piezoviscosity (Roelands) on GPU.
 
     Outer loop: solve linear Reynolds → update μ_ratio → re-solve.
     Inner: standard GPU Red-Black SOR.
@@ -182,7 +185,7 @@ def solve_reynolds_piezoviscous(
     solver = _get_solver(N_Z, N_phi)
 
     H_gpu = cp.asarray(H, dtype=cp.float64)
-    closure = LaminarClosure()
+    closure = LaminarClosure(subcell_quad=subcell_quad, n_sub=n_sub)
 
     # Base coefficients (without piezoviscosity)
     A_base, B_base, C_base, D_base, E_base, F_full = \

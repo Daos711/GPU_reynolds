@@ -41,6 +41,8 @@ def solve_reynolds_transformed(
     check_every: int = 500,
     P_init: np.ndarray = None,
     verbose: bool = False,
+    subcell_quad: bool = False,
+    n_sub: int = 4,
 ) -> tuple:
     """
     Solve piezoviscous Reynolds via transformed pressure (Barus, single pass).
@@ -83,7 +85,7 @@ def solve_reynolds_transformed(
     N_Z, N_phi = H.shape
     solver = _get_solver(N_Z, N_phi)
     H_gpu = cp.asarray(H, dtype=cp.float64)
-    closure = LaminarClosure()
+    closure = LaminarClosure(subcell_quad=subcell_quad, n_sub=n_sub)
 
     # Step 1: precompute standard laminar coefficients
     A, B, C, D, E, F_full = precompute_coefficients_gpu(
