@@ -107,94 +107,97 @@ class LaminarClosure(Closure):
         return self._cells_to_faces(K_cell, N_Z, N_phi)
 
     def _subcell_analytical(self, H_gpu, d_phi, d_Z):
-        """Subcell quadrature with analytical texture evaluation."""
-        import numpy as np
+        """Subcell quadrature with analytical texture — GPU-vectorized.
 
+        Loop only over pits (72 iterations). All sub-points computed via
+        CuPy broadcasting on 4D arrays (N_Z-1, N_phi, n_sub, n_sub).
+        """
         N_Z, N_phi = H_gpu.shape
         n = self.n_sub
         tp = self.texture_params
-        phi_1D = self.phi_1D
-        Z_1D = self.Z_1D
-        H_sm = self.H_smooth_gpu  # CuPy array
+        H_sm = self.H_smooth_gpu
 
-        phi_c = tp["phi_c"]
-        Z_c = tp["Z_c"]
-        A_tex = tp["A"]
-        B_tex = tp["B"]
-        H_p = tp["H_p"]
+        A_tex = float(tp["A"])
+        B_tex = float(tp["B"])
+        H_p = float(tp["H_p"])
         profile = tp["profile"]
-        n_pits = len(phi_c)
+        # Pit centers as CPU lists (avoid repeated GPU→CPU transfers)
+        phi_c_cpu = [float(x) for x in tp["phi_c"]]
+        Z_c_cpu = [float(x) for x in tp["Z_c"]]
+        n_pits = len(phi_c_cpu)
 
-        # Precompute bounding box indices for each pit (CPU, once)
-        pit_cells = []
+        # Sub-point weights within [0, 1]
+        t = cp.linspace(0.5 / n, 1.0 - 0.5 / n, n, dtype=cp.float64)
+
+        # --- H_smooth at sub-points via bilinear interpolation ---
+        # Wrap last→first column for periodicity: N_phi cells around the ring
+        H_sm_wrap = cp.concatenate([H_sm, H_sm[:, :1]], axis=1)  # (N_Z, N_phi+1)
+        H00 = H_sm_wrap[:-1, :N_phi]       # (N_Z-1, N_phi)
+        H01 = H_sm_wrap[:-1, 1:N_phi + 1]
+        H10 = H_sm_wrap[1:, :N_phi]
+        H11 = H_sm_wrap[1:, 1:N_phi + 1]
+
+        # Broadcast weights: (1, 1, n, 1) for phi, (1, 1, 1, n) for Z
+        tp_w = t[None, None, :, None]
+        tq_w = t[None, None, None, :]
+
+        # H_sub shape: (N_Z-1, N_phi, n, n)
+        H_sub = (H00[:, :, None, None] * (1 - tp_w) * (1 - tq_w)
+               + H01[:, :, None, None] * tp_w * (1 - tq_w)
+               + H10[:, :, None, None] * (1 - tp_w) * tq_w
+               + H11[:, :, None, None] * tp_w * tq_w)
+
+        # --- Sub-point physical coordinates ---
+        phi_nodes = cp.asarray(self.phi_1D, dtype=cp.float64)
+        Z_nodes = cp.asarray(self.Z_1D, dtype=cp.float64)
+
+        # phi_sub: (N_phi, n) → broadcast to (1, N_phi, n, 1)
+        phi_sub = phi_nodes[:, None] + t[None, :] * d_phi  # (N_phi, n)
+        phi_sub_4d = phi_sub[None, :, :, None]
+
+        # Z_sub: (N_Z-1, n) → broadcast to (N_Z-1, 1, 1, n)
+        Z_sub = Z_nodes[:-1, None] + t[None, :] * d_Z  # (N_Z-1, n)
+        Z_sub_4d = Z_sub[:, None, None, :]
+
+        # --- Texture: loop over pits, vectorized per pit ---
         for k in range(n_pits):
-            j_lo = max(0, int((phi_c[k] - B_tex) / d_phi) - 1)
-            j_hi = min(N_phi - 1, int((phi_c[k] + B_tex) / d_phi) + 2)
-            i_lo = max(0, int((Z_c[k] - (-1.0) - A_tex) / d_Z) - 1)
-            # Z_1D starts at Z_1D[0], find index
-            i_lo = max(0, int((Z_c[k] - A_tex - Z_1D[0]) / d_Z) - 1)
-            i_hi = min(N_Z - 1, int((Z_c[k] + A_tex - Z_1D[0]) / d_Z) + 2)
-            pit_cells.append((j_lo, j_hi, i_lo, i_hi))
+            dphi = cp.arctan2(
+                cp.sin(phi_sub_4d - phi_c_cpu[k]),
+                cp.cos(phi_sub_4d - phi_c_cpu[k]))
+            expr = (dphi / B_tex) ** 2 + ((Z_sub_4d - Z_c_cpu[k]) / A_tex) ** 2
 
-        # Sub-point offsets within [0, 1]
-        t_arr = np.linspace(0.5 / n, 1.0 - 0.5 / n, n)
+            contrib = cp.maximum(1.0 - expr, 0.0)
+            if profile == "smoothcap":
+                H_sub += H_p * contrib ** 2
+            elif profile == "sqrt":
+                H_sub += H_p * cp.sqrt(contrib)
 
-        # Smooth field corners (CuPy)
-        # Cell (i,j) → corners at nodes (i,j), (i,j+1), (i+1,j), (i+1,j+1)
-        # With periodic wrap for last phi column
-        H_sm_np = cp.asnumpy(H_sm)
+        # --- K_cell = mean(H³) over sub-points ---
+        K_cell = cp.mean(H_sub ** 3, axis=(2, 3))  # (N_Z-1, N_phi)
 
-        # Compute K_cell on CPU (texture is CPU-side analytical)
-        K_cell_np = np.zeros((N_Z - 1, N_phi - 1), dtype=np.float64)
+        # --- Convert to faces (N_phi cells → N_phi-1 face array) ---
+        # K_cell has N_phi columns (periodic). Need A_half with N_phi-1 columns.
+        # A_half[i, j] = face between columns j and j+1:
+        #   average of K_cell for cell-j (covers [j, j+1]) from above and below rows
+        # For the standard A_half shape (N_Z, N_phi-1):
+        #   use K_cell[:, :N_phi-1] (cells 0..N_phi-2)
+        K_cell_trim = K_cell[:, :N_phi - 1]
+        A_half = cp.zeros((N_Z, N_phi - 1), dtype=cp.float64)
+        A_half[1:-1, :] = 0.5 * (K_cell_trim[:-1, :] + K_cell_trim[1:, :])
+        A_half[0, :] = K_cell_trim[0, :]
+        A_half[-1, :] = K_cell_trim[-1, :]
 
-        for i in range(N_Z - 1):
-            for j in range(N_phi - 1):
-                j_next = (j + 1) % N_phi
-                # Corners of smooth field
-                h00 = H_sm_np[i, j]
-                h01 = H_sm_np[i, j_next]
-                h10 = H_sm_np[i + 1, j]
-                h11 = H_sm_np[i + 1, j_next]
+        # C_half_raw (N_Z-1, N_phi): face between rows, all columns
+        # Use all N_phi columns of K_cell, average phi-neighbors
+        C_half_raw = cp.zeros((N_Z - 1, N_phi), dtype=cp.float64)
+        C_half_raw[:, 1:-1] = 0.5 * (K_cell[:, :-1][:, :N_phi - 2]
+                                     + K_cell[:, 1:][:, :N_phi - 2])
+        # But we have N_phi columns; handle boundary with periodic wrap
+        C_half_raw[:, 1:N_phi - 1] = 0.5 * (K_cell[:, :N_phi - 2] + K_cell[:, 1:N_phi - 1])
+        C_half_raw[:, 0] = K_cell[:, N_phi - 1]   # periodic wrap
+        C_half_raw[:, N_phi - 1] = K_cell[:, 0]    # periodic wrap
 
-                K_sum = 0.0
-                for p in range(n):
-                    for q in range(n):
-                        tp_val = t_arr[p]
-                        tq_val = t_arr[q]
-
-                        # Bilinear smooth H
-                        H_smooth_q = (h00 * (1 - tp_val) * (1 - tq_val)
-                                    + h01 * tp_val * (1 - tq_val)
-                                    + h10 * (1 - tp_val) * tq_val
-                                    + h11 * tp_val * tq_val)
-
-                        # Physical coordinates of sub-point
-                        phi_q = phi_1D[j] + (p + 0.5) / n * d_phi
-                        Z_q = Z_1D[i] + (q + 0.5) / n * d_Z
-
-                        # Analytical texture contribution
-                        H_text_q = 0.0
-                        for k in range(n_pits):
-                            jl, jh, il, ih = pit_cells[k]
-                            if j < jl or j > jh or i < il or i > ih:
-                                continue
-                            dphi = np.arctan2(
-                                np.sin(phi_q - phi_c[k]),
-                                np.cos(phi_q - phi_c[k]))
-                            expr = (dphi / B_tex)**2 + ((Z_q - Z_c[k]) / A_tex)**2
-                            if expr <= 1.0:
-                                if profile == "sqrt":
-                                    H_text_q += H_p * np.sqrt(1.0 - expr)
-                                elif profile == "smoothcap":
-                                    H_text_q += H_p * (1.0 - expr)**2
-
-                        H_q = H_smooth_q + H_text_q
-                        K_sum += H_q ** 3
-
-                K_cell_np[i, j] = K_sum / (n * n)
-
-        K_cell = cp.asarray(K_cell_np, dtype=cp.float64)
-        return self._cells_to_faces(K_cell, N_Z, N_phi)
+        return A_half, C_half_raw
 
     @staticmethod
     def _cells_to_faces(K_cell, N_Z, N_phi):
