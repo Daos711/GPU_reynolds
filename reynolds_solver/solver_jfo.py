@@ -312,30 +312,18 @@ class SolverJFO:
             # (a) Inner SOR: solve P on entire domain with P>=0 clamp
             inner_iters = 0
             dP_inner_last = 0.0
-            if update_mask:
-                # Full-domain SOR (like CPU reference)
-                for inner in range(max_inner):
-                    P_before = self._P.copy()
-                    self._run_sor_iteration(sor_kernel, bc_kernel, omega)
-                    n_inner_total += 1
-                    inner_iters += 1
+            active_kernel = sor_kernel if update_mask else jfo_sor_kernel
+            run_inner = self._run_sor_iteration if update_mask else self._run_jfo_sor_iteration
+            for inner in range(max_inner):
+                P_before = self._P.copy()
+                run_inner(active_kernel, bc_kernel, omega)
+                n_inner_total += 1
+                inner_iters += 1
 
-                    delta_P_inner = float(cp.max(cp.abs(self._P - P_before)))
-                    dP_inner_last = delta_P_inner
-                    if delta_P_inner < tol_inner:
-                        break
-            else:
-                # Frozen diagnostics: active-set SOR
-                for inner in range(max_inner):
-                    P_before = self._P.copy()
-                    self._run_jfo_sor_iteration(jfo_sor_kernel, bc_kernel, omega)
-                    n_inner_total += 1
-                    inner_iters += 1
-
-                    delta_P_inner = float(cp.max(cp.abs(self._P - P_before)))
-                    dP_inner_last = delta_P_inner
-                    if delta_P_inner < tol_inner:
-                        break
+                delta_P_inner = float(cp.max(cp.abs(self._P - P_before)))
+                dP_inner_last = delta_P_inner
+                if delta_P_inner < tol_inner:
+                    break
             hit_max_inner = (inner_iters == max_inner)
 
             # (b) Update zone mask with adaptive hysteresis thresholds

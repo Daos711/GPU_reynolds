@@ -141,10 +141,23 @@ def test_mass_conservativity():
 
     H, d_phi, d_Z, phi_1D, Z = generate_test_case(N, epsilon)
 
+    max_outer = 2000
     P, theta, residual, n_outer, n_inner = solve_reynolds(
-        H, d_phi, d_Z, R, L, cavitation="jfo", verbose=True,
+        H, d_phi, d_Z, R, L, cavitation="jfo",
+        jfo_max_outer=max_outer, jfo_max_inner=2000,
+        tol=1e-6, jfo_tol_theta=1e-6, jfo_tol_inner=1e-6,
+        verbose=True,
     )
-    print(f"    Converged: {n_outer} outer, {n_inner} inner total, residual={residual:.2e}")
+    hit_limit = (n_outer >= max_outer)
+    status = "HIT LIMIT" if hit_limit else "CONVERGED"
+    print(f"    {status}: {n_outer} outer, {n_inner} inner total, residual={residual:.2e}")
+
+    if hit_limit or residual > 1e-3:
+        return run_test(
+            "Mass conservativity: flux variation < 1%",
+            False,
+            f"solver not converged enough for flux check: n_outer={n_outer}, residual={residual:.2e}"
+        )
 
     # Discrete flux with upwind theta (matching solver discretization):
     #   Q_{j+1/2} = H_{j+1/2} * theta_j - 0.5 * H_{j+1/2}^3 * dP/dphi
@@ -436,28 +449,33 @@ def main():
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
+    tests = [
+        ("0a", test_f_theta_equals_f_orig),
+        ("0b", test_frozen_theta_jfo_equals_hs),
+        ("1",  test_mass_conservativity),
+        ("2",  test_pressure_nonneg),
+        ("3",  test_theta_bounds),
+        ("4",  test_theta_active_zone),
+        ("5",  test_symmetric_case),
+        ("6",  test_cavitation_zone_nonempty),
+        ("7",  test_warm_start),
+        ("8",  test_backward_compatibility),
+        ("9",  test_jfo_vs_hs_small_epsilon),
+    ]
+
     results = []
-    results.append(test_f_theta_equals_f_orig())
-    results.append(test_frozen_theta_jfo_equals_hs())
-    results.append(test_mass_conservativity())
-    results.append(test_pressure_nonneg())
-    results.append(test_theta_bounds())
-    results.append(test_theta_active_zone())
-    results.append(test_symmetric_case())
-    results.append(test_cavitation_zone_nonempty())
-    results.append(test_warm_start())
-    results.append(test_backward_compatibility())
-    results.append(test_jfo_vs_hs_small_epsilon())
+    for name, func in tests:
+        results.append((name, func()))
 
     print("\n" + "=" * 60)
-    all_ok = all(results)
+    all_ok = all(r for _, r in results)
     if all_ok:
         print("  ALL JFO TESTS PASSED")
     else:
         print("  SOME JFO TESTS FAILED")
-        for i, r in enumerate(results, 1):
+        for name, r in results:
             if not r:
-                print(f"    Test {i} FAILED")
+                print(f"    Test {name} FAILED")
     print("=" * 60)
 
     sys.exit(0 if all_ok else 1)
