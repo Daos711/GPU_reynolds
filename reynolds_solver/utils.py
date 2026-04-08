@@ -145,7 +145,8 @@ def add_dynamic_rhs_gpu(F_full, d_phi, N_Z, N_phi, xprime, yprime, beta, phase_s
 
 
 def create_H_with_ellipsoidal_depressions(H0, H_p, Phi_mesh, Z_mesh,
-                                           phi_c_flat, Z_c_flat, A, B):
+                                           phi_c_flat, Z_c_flat, A, B,
+                                           profile="sqrt"):
     """
     Create gap field H with ellipsoidal surface depressions (CPU, numpy).
 
@@ -156,6 +157,7 @@ def create_H_with_ellipsoidal_depressions(H0, H_p, Phi_mesh, Z_mesh,
     Phi_mesh, Z_mesh : np.ndarray -- coordinate meshes
     phi_c_flat, Z_c_flat : np.ndarray -- depression center coordinates
     A, B : float -- dimensionless semi-axes
+    profile : str -- depression shape: "sqrt" (default) or "smoothcap"
 
     Returns
     -------
@@ -168,5 +170,10 @@ def create_H_with_ellipsoidal_depressions(H0, H_p, Phi_mesh, Z_mesh,
         delta_phi = np.arctan2(np.sin(Phi_mesh - phi_c), np.cos(Phi_mesh - phi_c))
         expr = (delta_phi / B) ** 2 + ((Z_mesh - Z_c) / A) ** 2
         inside = expr <= 1
-        H[inside] += H_p * np.sqrt(1 - expr[inside])
+        if profile == "sqrt":
+            H[inside] += H_p * np.sqrt(1 - expr[inside])
+        elif profile == "smoothcap":
+            H[inside] += H_p * (1 - expr[inside])**2
+        else:
+            raise ValueError(f"Unknown profile: {profile}")
     return H

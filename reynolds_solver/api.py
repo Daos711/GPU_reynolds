@@ -25,6 +25,7 @@ from reynolds_solver.solver import solve_reynolds_gpu
 from reynolds_solver.solver_dynamic import solve_reynolds_gpu_dynamic
 from reynolds_solver.solver_jfo import solve_reynolds_gpu_jfo
 from reynolds_solver.solver_piezoviscous import solve_reynolds_piezoviscous
+from reynolds_solver.solver_transformed import solve_reynolds_transformed
 from reynolds_solver.physics.closures import LaminarClosure, ConstantinescuClosure
 
 
@@ -52,6 +53,13 @@ def solve_reynolds(
     max_iter: int = 50000,
     check_every: int = 500,
     P_init: np.ndarray = None,
+    # Subcell quadrature for conductance
+    subcell_quad: bool = False,
+    n_sub: int = 4,
+    H_smooth: np.ndarray = None,
+    texture_params: dict = None,
+    phi_1D: np.ndarray = None,
+    Z_1D: np.ndarray = None,
     # JFO-specific parameters
     jfo_max_outer: int = 500,
     jfo_max_inner: int = 500,
@@ -69,6 +77,9 @@ def solve_reynolds(
     # Piezoviscous parameters
     alpha_pv: float = None,
     p_scale: float = None,
+    p0_roelands: float = 1.98e8,
+    z_roelands: float = 0.6,
+    pv_method: str = "iterative",
     tol_outer: float = 1e-3,
     max_outer_pv: int = 20,
     relax_pv: float = 0.7,
@@ -152,7 +163,13 @@ def solve_reynolds(
     """
     # --- Build closure object ---
     if closure == "laminar":
-        closure_obj = LaminarClosure()
+        import cupy as cp
+        H_smooth_gpu = cp.asarray(H_smooth, dtype=cp.float64) if H_smooth is not None else None
+        closure_obj = LaminarClosure(
+            subcell_quad=subcell_quad, n_sub=n_sub,
+            H_smooth_gpu=H_smooth_gpu, texture_params=texture_params,
+            phi_1D=phi_1D, Z_1D=Z_1D,
+        )
     elif closure == "constantinescu":
         missing = [name for name, val in [
             ("rho", rho), ("U_velocity", U_velocity),
@@ -183,18 +200,51 @@ def solve_reynolds(
             raise ValueError(
                 "p_scale is required when alpha_pv is set."
             )
-        return solve_reynolds_piezoviscous(
-            H, d_phi, d_Z, R, L,
-            alpha_pv=alpha_pv,
-            p_scale=p_scale,
-            xprime=xprime, yprime=yprime, beta=beta,
-            omega=omega, tol=tol, max_iter=max_iter, check_every=check_every,
-            tol_outer=tol_outer,
-            max_outer=max_outer_pv,
-            relax=relax_pv,
-            P_init=P_init,
-            verbose=verbose,
-        )
+
+        if pv_method == "transformed":
+            return solve_reynolds_transformed(
+                H, d_phi, d_Z, R, L,
+                alpha_pv=alpha_pv,
+                p_scale=p_scale,
+                xprime=xprime, yprime=yprime, beta=beta,
+                omega=omega, tol=tol, max_iter=max_iter,
+                check_every=check_every,
+                P_init=P_init,
+                verbose=verbose,
+                subcell_quad=subcell_quad,
+                n_sub=n_sub,
+                H_smooth_gpu=H_smooth_gpu,
+                texture_params=texture_params,
+                phi_1D=phi_1D,
+                Z_1D=Z_1D,
+            )
+        elif pv_method == "iterative":
+            return solve_reynolds_piezoviscous(
+                H, d_phi, d_Z, R, L,
+                alpha_pv=alpha_pv,
+                p_scale=p_scale,
+                p0_roelands=p0_roelands,
+                z_roelands=z_roelands,
+                xprime=xprime, yprime=yprime, beta=beta,
+                omega=omega, tol=tol, max_iter=max_iter,
+                check_every=check_every,
+                tol_outer=tol_outer,
+                max_outer=max_outer_pv,
+                relax=relax_pv,
+                P_init=P_init,
+                verbose=verbose,
+                subcell_quad=subcell_quad,
+                n_sub=n_sub,
+                H_smooth_gpu=H_smooth_gpu,
+                texture_params=texture_params,
+                phi_1D=phi_1D,
+                Z_1D=Z_1D,
+            )
+        else:
+            raise ValueError(
+                f"Unknown pv_method: '{pv_method}'. "
+                "Valid: 'iterative', 'transformed'."
+            )
 
     # --- Dispatch by cavitation model ---
     if cavitation == "half_sommerfeld":

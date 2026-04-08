@@ -25,22 +25,31 @@ from reynolds_solver.physics.closures import LaminarClosure
 LOG_MU_MAX = 20.0  # clamp: exp(20) ≈ 5e8, already extreme for lubrication
 
 
-def _compute_mu_ratio_gpu(P_gpu, alpha_pv, p_scale):
+def _compute_mu_ratio_gpu(P_gpu, alpha_pv, p_scale, p0_roelands, z_roelands):
     """
-    Compute μ_ratio = exp(α · P · p_scale) on GPU with overflow protection.
+    Compute μ_ratio via Roelands model on GPU with overflow protection.
+
+    Roelands: μ(p) = μ₀ · exp[ (α·p₀/z) · ((1 + p/p₀)^z - 1) ]
+    At p << p₀: reduces to Barus (exp(α·p)).
+    At p >> p₀: growth is sub-exponential (more realistic).
 
     Parameters
     ----------
     P_gpu : cp.ndarray — dimensionless pressure field
-    alpha_pv : float — Barus coefficient (Pa⁻¹)
+    alpha_pv : float — pressure-viscosity coefficient (Pa⁻¹)
     p_scale : float — pressure scale (Pa), converts P_nd to p_dim
+    p0_roelands : float — Roelands constant (Pa), default 1.98e8
+    z_roelands : float — Roelands exponent, default 0.6
 
     Returns
     -------
     mu_ratio : cp.ndarray — viscosity ratio μ(p)/μ₀
     n_clamped : int — number of nodes where clamp was applied
     """
-    log_mu = alpha_pv * P_gpu * p_scale
+    p_dim = P_gpu * p_scale
+    log_mu = (alpha_pv * p0_roelands / z_roelands) * (
+        (1.0 + p_dim / p0_roelands) ** z_roelands - 1.0
+    )
     n_clamped = int(cp.sum(log_mu > LOG_MU_MAX))
     log_mu = cp.clip(log_mu, 0.0, LOG_MU_MAX)
     mu_ratio = cp.exp(log_mu)
@@ -102,6 +111,9 @@ def solve_reynolds_piezoviscous(
     L: float,
     alpha_pv: float,
     p_scale: float,
+    # Roelands parameters
+    p0_roelands: float = 1.98e8,
+    z_roelands: float = 0.6,
     # Squeeze / dynamic
     xprime: float = 0.0,
     yprime: float = 0.0,
@@ -117,9 +129,16 @@ def solve_reynolds_piezoviscous(
     relax: float = 0.7,
     P_init: np.ndarray = None,
     verbose: bool = False,
+    # Subcell quadrature
+    subcell_quad: bool = False,
+    n_sub: int = 4,
+    H_smooth_gpu=None,
+    texture_params=None,
+    phi_1D=None,
+    Z_1D=None,
 ) -> tuple:
     """
-    Solve Reynolds equation with piezoviscosity (Barus law) on GPU.
+    Solve Reynolds equation with piezoviscosity (Roelands) on GPU.
 
     Outer loop: solve linear Reynolds → update μ_ratio → re-solve.
     Inner: standard GPU Red-Black SOR.
@@ -170,7 +189,11 @@ def solve_reynolds_piezoviscous(
     solver = _get_solver(N_Z, N_phi)
 
     H_gpu = cp.asarray(H, dtype=cp.float64)
-    closure = LaminarClosure()
+    closure = LaminarClosure(
+        subcell_quad=subcell_quad, n_sub=n_sub,
+        H_smooth_gpu=H_smooth_gpu, texture_params=texture_params,
+        phi_1D=phi_1D, Z_1D=Z_1D,
+    )
 
     # Base coefficients (without piezoviscosity)
     A_base, B_base, C_base, D_base, E_base, F_full = \
@@ -213,7 +236,8 @@ def solve_reynolds_piezoviscous(
         P_old = P_gpu.copy()
 
         # Step 2: compute μ_ratio from current P
-        mu_ratio, n_clamped = _compute_mu_ratio_gpu(P_gpu, alpha_pv, p_scale)
+        mu_ratio, n_clamped = _compute_mu_ratio_gpu(
+            P_gpu, alpha_pv, p_scale, p0_roelands, z_roelands)
 
         # Step 3: modify conductances
         A_pv = A_base.copy()
