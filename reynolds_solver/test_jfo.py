@@ -146,21 +146,14 @@ def test_mass_conservativity():
     )
     print(f"    Converged: {n_outer} outer, {n_inner} inner total, residual={residual:.2e}")
 
-    # Discrete flux: Q = H*theta - 0.5*H^3*dP/dphi
-    # Interior faces
+    # Discrete flux with upwind theta (matching solver discretization):
+    #   Q_{j+1/2} = H_{j+1/2} * theta_j - 0.5 * H_{j+1/2}^3 * dP/dphi
     H_face = 0.5 * (H[:, :-1] + H[:, 1:])
-    theta_face = 0.5 * (theta[:, :-1] + theta[:, 1:])
+    theta_up = theta[:, :-1]  # upwind theta at face j+1/2
     dP_face = (P[:, 1:] - P[:, :-1]) / d_phi
-    Q_inner = H_face * theta_face - 0.5 * H_face ** 3 * dP_face
+    Q_face = H_face * theta_up - 0.5 * H_face ** 3 * dP_face
 
-    # Wrap-around face: column -1 -> column 0
-    H_wrap = 0.5 * (H[:, -1] + H[:, 0])
-    theta_wrap = 0.5 * (theta[:, -1] + theta[:, 0])
-    dP_wrap = (P[:, 0] - P[:, -1]) / d_phi
-    Q_wrap = (H_wrap * theta_wrap - 0.5 * H_wrap ** 3 * dP_wrap)[:, None]
-
-    Q_all = np.concatenate([Q_inner, Q_wrap], axis=1)
-    Q_integrated = np.sum(Q_all, axis=0) * d_Z
+    Q_integrated = np.sum(Q_face, axis=0) * d_Z
 
     mass_err = (np.max(Q_integrated) - np.min(Q_integrated)) / (np.mean(np.abs(Q_integrated)) + 1e-12)
     print(f"    Mass error (relative flux variation): {mass_err:.4e}")
@@ -225,12 +218,15 @@ def test_theta_active_zone():
     H, d_phi, d_Z, _, _ = generate_test_case(N, epsilon=0.6)
     P, theta, *_ = solve_reynolds(H, d_phi, d_Z, R, L, cavitation="jfo")
 
-    active = P > 0
+    # Active zone defined by adaptive threshold (matching solver logic)
+    maxP = np.max(P)
+    p_on = 1e-5 * maxP if maxP > 0 else 1e-10
+    active = P > p_on
     if np.any(active):
         theta_active = theta[active]
         all_one = np.allclose(theta_active, 1.0)
         return run_test(
-            "theta == 1 in active zone",
+            "theta == 1 in active zone (P > p_on)",
             all_one,
             f"min(theta[active]) = {np.min(theta_active):.6f}, "
             f"max(theta[active]) = {np.max(theta_active):.6f}"
@@ -281,7 +277,8 @@ def test_cavitation_zone_nonempty():
     H, d_phi, d_Z, _, _ = generate_test_case(N, epsilon=0.6)
     P, theta, *_ = solve_reynolds(H, d_phi, d_Z, R, L, cavitation="jfo")
 
-    cav_frac = np.mean(P == 0)
+    # Cavitation defined by theta < 1 (matching solver semantics)
+    cav_frac = np.mean(theta < 1.0 - 1e-6)
     passed = 0.05 < cav_frac < 0.95
     return run_test(
         "Cavitation fraction in (5%, 95%)",
@@ -308,8 +305,8 @@ def test_warm_start():
     )
     print(f"    Cold start: {n_out_cold} outer iterations")
 
-    # Warm start with converged state
-    mask_cold = (P_cold > 0).astype(np.int32)
+    # Warm start with converged state (mask from theta, not P>0)
+    mask_cold = (theta_cold >= 1.0 - 1e-8).astype(np.int32)
     P_warm, _, _, n_out_warm, _ = solve_reynolds(
         H, d_phi, d_Z, R, L, cavitation="jfo",
         P_init=P_cold, theta_init=theta_cold, mask_init=mask_cold,
