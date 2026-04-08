@@ -2,13 +2,13 @@
 GPU solver for the Reynolds equation with JFO cavitation model.
 
 Implements the Jakobsson-Floberg-Olsson mass-conserving cavitation model
-via an active-set iteration with Red-Black SOR inner solver.
+via operator splitting with Red-Black SOR inner solver.
 
 Method:
-  - Outer loop: active-set iteration (zone mask updates, theta transport)
-  - Inner loop: Red-Black SOR on active zone only (rb_sor_jfo_step kernel)
-  - Theta transport: line-sweep along +phi (one thread per Z-row, in-place)
-  - RHS = F_theta = d(H*theta)/dphi, rebuilt every outer iteration
+  - Outer loop: operator splitting (P solve, zone update, theta transport)
+  - Inner loop: Red-Black SOR on ENTIRE domain with P>=0 clamp (rb_sor_step)
+  - Theta transport: rupture-anchored march (one thread per Z-row, in-place)
+  - RHS = F_theta = d(H*theta)/dphi, rebuilt every outer iteration with blending
   - When use_F_theta=False (diagnostic): uses F_orig = d(H)/dphi instead
 """
 
@@ -16,6 +16,7 @@ import numpy as np
 import cupy as cp
 
 from reynolds_solver.kernels import (
+    get_rb_sor_kernel,
     get_rb_sor_jfo_kernel,
     get_update_theta_sweep_kernel,
     get_apply_bc_kernel,
@@ -71,8 +72,37 @@ class SolverJFO:
         self._bc_block = (256, 1, 1)
         self._bc_grid = ((max_dim + 255) // 256, 1, 1)
 
+    def _run_sor_iteration(self, sor_kernel, bc_kernel, omega):
+        """Run one Red-Black SOR iteration on entire domain with P>=0 clamp."""
+        N_Z, N_phi = self.N_Z, self.N_phi
+        # Red pass
+        sor_kernel(
+            self._grid, self._block,
+            (
+                self._P, self._A, self._B, self._C, self._D,
+                self._E, self._F,
+                np.int32(N_Z), np.int32(N_phi),
+                np.float64(omega), np.int32(0),
+            ),
+        )
+        # Black pass
+        sor_kernel(
+            self._grid, self._block,
+            (
+                self._P, self._A, self._B, self._C, self._D,
+                self._E, self._F,
+                np.int32(N_Z), np.int32(N_phi),
+                np.float64(omega), np.int32(1),
+            ),
+        )
+        # Boundary conditions
+        bc_kernel(
+            self._bc_grid, self._bc_block,
+            (self._P, np.int32(N_Z), np.int32(N_phi)),
+        )
+
     def _run_jfo_sor_iteration(self, sor_kernel, bc_kernel, omega):
-        """Run one Red-Black SOR iteration on active zone only."""
+        """Run one Red-Black SOR iteration on active zone only (diagnostic)."""
         N_Z, N_phi = self.N_Z, self.N_phi
         # Red pass
         sor_kernel(
@@ -121,57 +151,28 @@ class SolverJFO:
 
     def _update_zone_mask(self, p_off, p_on):
         """
-        Active-set zone mask update for GPU JFO solver.
+        Update zone_mask based on hysteresis thresholds.
 
-        - Active nodes (mask=1) are demoted to cavitation using current
-          solved pressure P (which is meaningful in active zone).
-        - Cavitated nodes (mask=0) are re-activated using trial pressure
-          P_trial computed from the stencil, because the SOR kernel
-          clamps P=0 in cavitation zone by construction.
-        - Hysteresis band: p_off <= P <= p_on keeps previous state.
+        Since P is solved on the ENTIRE domain (with P>=0 clamp),
+        the actual P values are meaningful everywhere. This matches
+        the CPU-reference logic (solver_jfo_splitting_cpu._update_zone_state):
+          P > p_on  -> full-film (mask=1)
+          P < p_off -> cavitation (mask=0)
+          p_off <= P <= p_on -> keep previous state (hysteresis band)
 
-        Only interior nodes [1:-1, 1:-1] are updated.
+        Only updates interior nodes; boundary rows stay unchanged.
         """
         N_Z, N_phi = self.N_Z, self.N_phi
 
-        # Compute P_trial for cavitated nodes via stencil
-        # Phi neighbors using current ghost-column convention (no cp.roll)
-        P_jp = cp.empty_like(self._P)
-        P_jp[:, 1:-1] = self._P[:, 2:]
-        P_jp[:, 0] = self._P[:, 1]
-        P_jp[:, -1] = self._P[:, 1]
+        interior = cp.zeros((N_Z, N_phi), dtype=cp.bool_)
+        interior[1:-1, 1:-1] = True
 
-        P_jm = cp.empty_like(self._P)
-        P_jm[:, 1:-1] = self._P[:, :-2]
-        P_jm[:, 0] = self._P[:, -2]
-        P_jm[:, -1] = self._P[:, -2]
+        to_full = interior & (self._P > p_on)
+        to_cav = interior & (self._P < p_off)
 
-        # Z neighbors: direct slicing (no periodicity in Z)
-        P_trial = cp.zeros_like(self._P)
-        P_trial[1:-1, 1:-1] = (
-            self._A[1:-1, 1:-1] * P_jp[1:-1, 1:-1]
-            + self._B[1:-1, 1:-1] * P_jm[1:-1, 1:-1]
-            + self._C[1:-1, 1:-1] * self._P[2:, 1:-1]
-            + self._D[1:-1, 1:-1] * self._P[:-2, 1:-1]
-            - self._F[1:-1, 1:-1]
-        ) / (self._E[1:-1, 1:-1] + 1e-30)
-
-        active = (self._mask == 1)
-        cav = (self._mask == 0)
-
-        to_cav = cp.zeros((N_Z, N_phi), dtype=cp.bool_)
-        to_full = cp.zeros((N_Z, N_phi), dtype=cp.bool_)
-
-        # Active -> cavitation: by current solved pressure
-        to_cav[1:-1, 1:-1] = active[1:-1, 1:-1] & (self._P[1:-1, 1:-1] < p_off)
-
-        # Cavitation -> active: by trial pressure
-        to_full[1:-1, 1:-1] = cav[1:-1, 1:-1] & (P_trial[1:-1, 1:-1] > p_on)
-
-        self._mask[to_cav] = 0
         self._mask[to_full] = 1
+        self._mask[to_cav] = 0
 
-        self._P[to_cav] = 0.0
         self._theta[to_full] = 1.0
 
     def solve(
@@ -276,7 +277,8 @@ class SolverJFO:
             self._mask[:] = 1
 
         # Get compiled kernels
-        sor_kernel = get_rb_sor_jfo_kernel()
+        sor_kernel = get_rb_sor_kernel()       # solve P everywhere with P>=0 clamp
+        jfo_sor_kernel = get_rb_sor_jfo_kernel()  # active-set (for frozen diagnostics)
         sweep_kernel = get_update_theta_sweep_kernel()
         bc_kernel = get_apply_bc_kernel()
 
@@ -292,6 +294,7 @@ class SolverJFO:
         n_inner_total = 0
         residual_P = 1.0
         residual_theta = 1.0
+        W_prev = 0.0
 
         # Sync ghost columns before iteration
         self._sync_periodic()
@@ -306,22 +309,33 @@ class SolverJFO:
             self._theta_prev[:] = self._theta
             self._P_old[:] = self._P
 
-            # (a) Inner SOR: solve P with current self._F as RHS
+            # (a) Inner SOR: solve P on entire domain with P>=0 clamp
             inner_iters = 0
             dP_inner_last = 0.0
-            dP_inner_best = float('inf')
-            for inner in range(max_inner):
-                P_before = self._P.copy()
-                self._run_jfo_sor_iteration(sor_kernel, bc_kernel, omega)
-                n_inner_total += 1
-                inner_iters += 1
+            if update_mask:
+                # Full-domain SOR (like CPU reference)
+                for inner in range(max_inner):
+                    P_before = self._P.copy()
+                    self._run_sor_iteration(sor_kernel, bc_kernel, omega)
+                    n_inner_total += 1
+                    inner_iters += 1
 
-                delta_P_inner = float(cp.max(cp.abs(self._P - P_before)))
-                dP_inner_last = delta_P_inner
-                if delta_P_inner < dP_inner_best:
-                    dP_inner_best = delta_P_inner
-                if delta_P_inner < tol_inner:
-                    break
+                    delta_P_inner = float(cp.max(cp.abs(self._P - P_before)))
+                    dP_inner_last = delta_P_inner
+                    if delta_P_inner < tol_inner:
+                        break
+            else:
+                # Frozen diagnostics: active-set SOR
+                for inner in range(max_inner):
+                    P_before = self._P.copy()
+                    self._run_jfo_sor_iteration(jfo_sor_kernel, bc_kernel, omega)
+                    n_inner_total += 1
+                    inner_iters += 1
+
+                    delta_P_inner = float(cp.max(cp.abs(self._P - P_before)))
+                    dP_inner_last = delta_P_inner
+                    if delta_P_inner < tol_inner:
+                        break
             hit_max_inner = (inner_iters == max_inner)
 
             # (b) Update zone mask with adaptive hysteresis thresholds
@@ -331,9 +345,7 @@ class SolverJFO:
                 adaptive_p_off = 1e-6 * maxP if maxP > 0 else 1e-11
                 self._update_zone_mask(adaptive_p_off, adaptive_p_on)
 
-            # (c) Strict projection: enforce invariants immediately
-            cav = (self._mask == 0)
-            self._P[cav] = 0.0
+            # (c) Projection: enforce theta=1 in active zone, P>=0
             act = (self._mask == 1)
             self._theta[act] = 1.0
             cp.maximum(self._P, 0.0, out=self._P)
@@ -358,7 +370,7 @@ class SolverJFO:
                 (self._P, np.int32(N_Z), np.int32(N_phi)),
             )
 
-            # (f) Check outer convergence
+            # (f) Check outer convergence (dW_rel like CPU reference)
             diff_mask = self._mask != self._mask_old
             mask_changed_count = int(cp.sum(diff_mask))
             n_0to1 = int(cp.sum((self._mask_old == 0) & (self._mask == 1)))
@@ -366,6 +378,10 @@ class SolverJFO:
             residual_P = float(cp.max(cp.abs(self._P - self._P_old)))
             residual_theta = float(cp.max(cp.abs(self._theta - self._theta_prev)))
             cav_frac = float(cp.mean((self._theta < 1.0 - 1e-6).astype(cp.float64)))
+
+            W = float(cp.sum(self._P))
+            dW_rel = abs(W - W_prev) / (abs(W) + 1e-30) if outer > 0 else 1.0
+            W_prev = W
 
             if verbose and (outer % 20 == 0 or outer < 5):
                 hit_flag = "!" if hit_max_inner else " "
@@ -379,7 +395,8 @@ class SolverJFO:
                     f"dPi={dP_inner_last:.2e}"
                 )
 
-            if (mask_changed_count == 0) and residual_P < tol_P and residual_theta < tol_theta:
+            # Convergence: dW_rel (like CPU reference) + dP
+            if dW_rel < tol_P and outer > 5 and residual_P < tol_P:
                 if verbose:
                     print(f"    Converged at outer={outer}")
                 break
