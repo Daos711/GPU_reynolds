@@ -117,10 +117,10 @@ def precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L, closure=None):
 
 def build_F_theta_gpu(H_gpu, theta_gpu, d_phi):
     """
-    Build JFO RHS: F_theta = d(H*theta)/dphi using face-based fluxes.
+    Build JFO RHS: F_theta = d_phi * (H_{j+1/2} * theta_j - H_{j-1/2} * theta_{j-1}).
 
-    Uses the same ghost/physical indexing and face scheme as F_orig
-    in precompute_coefficients_gpu.
+    Upwind discretization: H is averaged at cell faces, theta is taken from
+    the upwind side (Couette flow in +phi direction).
 
     When theta=1 everywhere, F_theta == F_orig to machine precision.
 
@@ -135,20 +135,22 @@ def build_F_theta_gpu(H_gpu, theta_gpu, d_phi):
     F_theta : cupy.ndarray, shape (N_Z, N_phi), float64
     """
     N_Z, N_phi = H_gpu.shape
-    Hth = H_gpu * theta_gpu
 
-    S_plus_half = 0.5 * (Hth[:, :-1] + Hth[:, 1:])
+    # Face H values (same averaging as precompute_coefficients_gpu)
+    H_face_p = cp.empty((N_Z, N_phi), dtype=cp.float64)
+    H_face_p[:, :-1] = 0.5 * (H_gpu[:, :-1] + H_gpu[:, 1:])
+    H_face_p[:, -1] = 0.5 * (H_gpu[:, -1] + H_gpu[:, 0])
 
-    S_minus_half = cp.empty_like(S_plus_half)
-    S_minus_half[:, 1:] = S_plus_half[:, :-1]
-    S_minus_half[:, 0] = S_plus_half[:, -1]
+    H_face_m = cp.empty((N_Z, N_phi), dtype=cp.float64)
+    H_face_m[:, 1:] = H_face_p[:, :-1]
+    H_face_m[:, 0] = H_face_p[:, -1]
 
-    F_half = d_phi * (S_plus_half - S_minus_half)
+    # Upwind theta: at face j+1/2 take theta_j, at face j-1/2 take theta_{j-1}
+    theta_jm1 = cp.empty_like(theta_gpu)
+    theta_jm1[:, 1:] = theta_gpu[:, :-1]
+    theta_jm1[:, 0] = theta_gpu[:, -1]  # periodic
 
-    F_theta = cp.zeros((N_Z, N_phi), dtype=cp.float64)
-    F_theta[:, :-1] = F_half
-    F_theta[:, -1] = F_half[:, 0]
-
+    F_theta = d_phi * (H_face_p * theta_gpu - H_face_m * theta_jm1)
     return F_theta
 
 

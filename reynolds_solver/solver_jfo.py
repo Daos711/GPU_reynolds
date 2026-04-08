@@ -108,15 +108,14 @@ class SolverJFO:
         self._mask[:, 0] = self._mask[:, N_phi - 2]
         self._mask[:, N_phi - 1] = self._mask[:, 1]
 
-    def _run_theta_sweep(self, sweep_kernel, H_gpu, direction=0):
-        """Run theta line-sweep: one thread per Z-row, sequential along phi."""
+    def _run_theta_sweep(self, sweep_kernel, H_face_p, H_face_m):
+        """Run rupture-anchored theta march: one thread per Z-row, face-based H."""
         N_Z, N_phi = self.N_Z, self.N_phi
         sweep_kernel(
             self._sweep_grid, self._sweep_block,
             (
-                self._theta, H_gpu, self._mask,
+                self._theta, H_face_p, H_face_m, self._mask,
                 np.int32(N_Z), np.int32(N_phi),
-                np.int32(direction),
             ),
         )
 
@@ -208,11 +207,6 @@ class SolverJFO:
         if tol_inner is None:
             tol_inner = tol_P
 
-        if p_on <= p_off:
-            raise ValueError(
-                f"p_on ({p_on}) must be strictly greater than p_off ({p_off})"
-            )
-
         N_Z, N_phi = self.N_Z, self.N_phi
 
         # Load stencil coefficients
@@ -269,6 +263,15 @@ class SolverJFO:
         sweep_kernel = get_update_theta_sweep_kernel()
         bc_kernel = get_apply_bc_kernel()
 
+        # Precompute face H values for theta sweep kernel
+        H_face_p = cp.empty((N_Z, N_phi), dtype=cp.float64)
+        H_face_p[:, :-1] = 0.5 * (H_gpu[:, :-1] + H_gpu[:, 1:])
+        H_face_p[:, -1] = 0.5 * (H_gpu[:, -1] + H_gpu[:, 0])
+
+        H_face_m = cp.empty((N_Z, N_phi), dtype=cp.float64)
+        H_face_m[:, 1:] = H_face_p[:, :-1]
+        H_face_m[:, 0] = H_face_p[:, -1]
+
         n_inner_total = 0
         residual_P = 1.0
         residual_theta = 1.0
@@ -304,9 +307,12 @@ class SolverJFO:
                     break
             hit_max_inner = (inner_iters == max_inner)
 
-            # (b) Update zone mask with hysteresis
+            # (b) Update zone mask with adaptive hysteresis thresholds
             if update_mask:
-                self._update_zone_mask(p_off, p_on)
+                maxP = float(cp.max(self._P))
+                adaptive_p_on = 1e-5 * maxP if maxP > 0 else 1e-10
+                adaptive_p_off = 1e-6 * maxP if maxP > 0 else 1e-11
+                self._update_zone_mask(adaptive_p_off, adaptive_p_on)
 
             # (c) Strict projection: enforce invariants immediately
             cav = (self._mask == 0)
@@ -318,12 +324,16 @@ class SolverJFO:
 
             # (d) Theta sweep in cavitation zone
             if run_theta_sweep:
-                self._run_theta_sweep(sweep_kernel, H_gpu, direction=sweep_direction)
+                self._run_theta_sweep(sweep_kernel, H_face_p, H_face_m)
                 self._sync_periodic()
 
-            # (e) Rebuild F_theta from current theta (for next SOR iteration)
+            # (e) Rebuild F_theta from current theta with blending for stability
             if use_F_theta:
-                self._F[:] = build_F_theta_gpu(H_gpu, self._theta, d_phi)
+                F_theta_new = build_F_theta_gpu(H_gpu, self._theta, d_phi)
+                if outer == 0:
+                    self._F[:] = F_theta_new
+                else:
+                    self._F[:] = 0.5 * F_theta_new + 0.5 * self._F
 
             # Apply BCs
             bc_kernel(
@@ -338,7 +348,7 @@ class SolverJFO:
             n_1to0 = int(cp.sum((self._mask_old == 1) & (self._mask == 0)))
             residual_P = float(cp.max(cp.abs(self._P - self._P_old)))
             residual_theta = float(cp.max(cp.abs(self._theta - self._theta_prev)))
-            cav_frac = float(cp.mean((self._mask == 0).astype(cp.float64)))
+            cav_frac = float(cp.mean((self._theta < 1.0 - 1e-6).astype(cp.float64)))
 
             if verbose and (outer % 20 == 0 or outer < 5):
                 hit_flag = "!" if hit_max_inner else " "
