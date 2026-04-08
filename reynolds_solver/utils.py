@@ -117,10 +117,14 @@ def precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L, closure=None):
 
 def build_F_theta_gpu(H_gpu, theta_gpu, d_phi):
     """
-    Build JFO RHS: F_theta = d_phi * (H_{j+1/2} * theta_j - H_{j-1/2} * theta_{j-1}).
+    Build JFO RHS with upwind theta, packing-compatible with
+    precompute_coefficients_gpu().
 
-    Upwind discretization: H is averaged at cell faces, theta is taken from
-    the upwind side (Couette flow in +phi direction).
+    IMPORTANT: F uses a different packing than P/theta ghost columns.
+    precompute_coefficients_gpu() packs F as:
+        F_full[:, :-1] = F_half          (N_phi-1 face values)
+        F_full[:, -1]  = F_half[:, 0]    (copy of first face)
+    This function reproduces that packing exactly.
 
     When theta=1 everywhere, F_theta == F_orig to machine precision.
 
@@ -136,21 +140,28 @@ def build_F_theta_gpu(H_gpu, theta_gpu, d_phi):
     """
     N_Z, N_phi = H_gpu.shape
 
-    # Face H values (same averaging as precompute_coefficients_gpu)
-    H_face_p = cp.empty((N_Z, N_phi), dtype=cp.float64)
-    H_face_p[:, :-1] = 0.5 * (H_gpu[:, :-1] + H_gpu[:, 1:])
-    H_face_p[:, -1] = 0.5 * (H_gpu[:, -1] + H_gpu[:, 0])
+    # Face H values on (N_Z, N_phi-1) grid — same as precompute_coefficients_gpu
+    H_face_p = 0.5 * (H_gpu[:, :-1] + H_gpu[:, 1:])       # (N_Z, N_phi-1)
 
-    H_face_m = cp.empty((N_Z, N_phi), dtype=cp.float64)
+    H_face_m = cp.empty_like(H_face_p)                      # (N_Z, N_phi-1)
     H_face_m[:, 1:] = H_face_p[:, :-1]
-    H_face_m[:, 0] = H_face_p[:, -1]
+    H_face_m[:, 0] = H_face_p[:, -1]                        # periodic wrap
 
-    # Upwind theta: at face j+1/2 take theta_j, at face j-1/2 take theta_{j-1}
-    theta_jm1 = cp.empty_like(theta_gpu)
-    theta_jm1[:, 1:] = theta_gpu[:, :-1]
-    theta_jm1[:, 0] = theta_gpu[:, -1]  # periodic
+    # Upwind theta on the same (N_phi-1) packing
+    theta_j = theta_gpu[:, :-1]                              # (N_Z, N_phi-1)
 
-    F_theta = d_phi * (H_face_p * theta_gpu - H_face_m * theta_jm1)
+    theta_jm1 = cp.empty_like(theta_j)                      # (N_Z, N_phi-1)
+    theta_jm1[:, 1:] = theta_gpu[:, :-2]
+    theta_jm1[:, 0] = theta_gpu[:, N_phi - 2]               # periodic: last physical col
+
+    # F_half with upwind theta
+    F_half = d_phi * (H_face_p * theta_j - H_face_m * theta_jm1)  # (N_Z, N_phi-1)
+
+    # Pack into full array EXACTLY like precompute_coefficients_gpu
+    F_theta = cp.zeros((N_Z, N_phi), dtype=cp.float64)
+    F_theta[:, :-1] = F_half
+    F_theta[:, -1] = F_half[:, 0]
+
     return F_theta
 
 
