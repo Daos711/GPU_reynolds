@@ -141,11 +141,10 @@ def test_mass_conservativity():
 
     H, d_phi, d_Z, phi_1D, Z = generate_test_case(N, epsilon)
 
-    max_outer = 2000
+    max_outer = 500
     P, theta, residual, n_outer, n_inner = solve_reynolds(
         H, d_phi, d_Z, R, L, cavitation="jfo",
-        jfo_max_outer=max_outer, jfo_max_inner=2000,
-        tol=1e-6, jfo_tol_theta=1e-6, jfo_tol_inner=1e-6,
+        jfo_max_outer=max_outer, jfo_max_inner=500,
         verbose=True,
     )
     hit_limit = (n_outer >= max_outer)

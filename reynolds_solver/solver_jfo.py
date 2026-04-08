@@ -383,13 +383,10 @@ class SolverJFO:
                     f"dPi={dP_inner_last:.2e}"
                 )
 
-            # Convergence: require all conditions simultaneously
-            converged = (
-                dW_rel < tol_P
-                and residual_P < tol_P
-                and mask_changed_count == 0
-                and outer > 5
-            )
+            # Convergence by dW_rel (like CPU reference) — mask stability
+            # is NOT required since boundary nodes may oscillate indefinitely
+            # with full-domain SOR + P>=0 clamp
+            converged = (dW_rel < tol_P and residual_P < tol_P and outer > 5)
             if converged:
                 if verbose:
                     print(f"    Converged at outer={outer}")
