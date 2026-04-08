@@ -121,25 +121,55 @@ class SolverJFO:
 
     def _update_zone_mask(self, p_off, p_on):
         """
-        Update zone_mask based on hysteresis thresholds.
+        Active-set zone mask update for GPU JFO solver.
 
-        Matches CPU-reference logic (solver_jfo_splitting_cpu._update_zone_state):
-          P > p_on  -> full-film (mask=1)
-          P < p_off -> cavitation (mask=0)
-          p_off <= P <= p_on -> keep previous state (hysteresis band)
+        - Active nodes (mask=1) are demoted to cavitation using current
+          solved pressure P (which is meaningful in active zone).
+        - Cavitated nodes (mask=0) are re-activated using trial pressure
+          P_trial computed from the stencil, because the SOR kernel
+          clamps P=0 in cavitation zone by construction.
+        - Hysteresis band: p_off <= P <= p_on keeps previous state.
 
-        Only updates interior nodes; boundary rows stay unchanged.
+        Only interior nodes [1:-1, 1:-1] are updated.
         """
         N_Z, N_phi = self.N_Z, self.N_phi
 
-        interior = cp.zeros((N_Z, N_phi), dtype=cp.bool_)
-        interior[1:-1, 1:-1] = True
+        # Compute P_trial for cavitated nodes via stencil
+        # Phi neighbors using current ghost-column convention (no cp.roll)
+        P_jp = cp.empty_like(self._P)
+        P_jp[:, 1:-1] = self._P[:, 2:]
+        P_jp[:, 0] = self._P[:, 1]
+        P_jp[:, -1] = self._P[:, 1]
 
-        to_full = interior & (self._P > p_on)
-        to_cav = interior & (self._P < p_off)
+        P_jm = cp.empty_like(self._P)
+        P_jm[:, 1:-1] = self._P[:, :-2]
+        P_jm[:, 0] = self._P[:, -2]
+        P_jm[:, -1] = self._P[:, -2]
 
-        self._mask[to_full] = 1
+        # Z neighbors: direct slicing (no periodicity in Z)
+        P_trial = cp.zeros_like(self._P)
+        P_trial[1:-1, 1:-1] = (
+            self._A[1:-1, 1:-1] * P_jp[1:-1, 1:-1]
+            + self._B[1:-1, 1:-1] * P_jm[1:-1, 1:-1]
+            + self._C[1:-1, 1:-1] * self._P[2:, 1:-1]
+            + self._D[1:-1, 1:-1] * self._P[:-2, 1:-1]
+            - self._F[1:-1, 1:-1]
+        ) / (self._E[1:-1, 1:-1] + 1e-30)
+
+        active = (self._mask == 1)
+        cav = (self._mask == 0)
+
+        to_cav = cp.zeros((N_Z, N_phi), dtype=cp.bool_)
+        to_full = cp.zeros((N_Z, N_phi), dtype=cp.bool_)
+
+        # Active -> cavitation: by current solved pressure
+        to_cav[1:-1, 1:-1] = active[1:-1, 1:-1] & (self._P[1:-1, 1:-1] < p_off)
+
+        # Cavitation -> active: by trial pressure
+        to_full[1:-1, 1:-1] = cav[1:-1, 1:-1] & (P_trial[1:-1, 1:-1] > p_on)
+
         self._mask[to_cav] = 0
+        self._mask[to_full] = 1
 
         self._P[to_cav] = 0.0
         self._theta[to_full] = 1.0
