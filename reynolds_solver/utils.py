@@ -4,10 +4,44 @@ Utility functions for the Reynolds equation GPU solver.
 - GPU-side coefficient precomputation
 - Dynamic RHS modification
 - Gap field with ellipsoidal depressions
+- Auto SOR relaxation parameter
 """
 
 import numpy as np
 import cupy as cp
+
+
+def compute_auto_omega(N_phi: int, N_Z: int, R: float, L: float,
+                       cap: float = 1.97) -> float:
+    """
+    Recommended SOR omega based on anisotropic Young (1954) estimate.
+
+    Not a strict optimum for the full nonlinear Reynolds equation
+    (variable H³, cavitation, piezoviscosity), but a good automatic
+    choice that prevents false convergence on fine grids.
+
+    Parameters
+    ----------
+    N_phi, N_Z : int — grid dimensions
+    R, L : float — bearing radius and length (m)
+    cap : float — upper limit on omega (default 1.97).
+        For nonlinear paths (piezoviscous, JFO) use 1.93–1.95.
+
+    Returns
+    -------
+    float — omega in [1.0, cap]
+    """
+    d_phi = 2 * np.pi / N_phi
+    d_Z = 2.0 / (N_Z - 1)
+    D_over_L = 2.0 * R / L
+    alpha_sq = (D_over_L * d_phi / d_Z) ** 2
+
+    cos_z = np.cos(np.pi / (N_Z - 1))
+    cos_phi = np.cos(np.pi / N_phi)
+    rho_J = (cos_z + alpha_sq * cos_phi) / (1.0 + alpha_sq)
+
+    omega_raw = 2.0 / (1.0 + np.sqrt(max(1.0 - rho_J ** 2, 1e-30)))
+    return float(max(1.0, min(omega_raw, cap)))
 
 
 def precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L, closure=None):

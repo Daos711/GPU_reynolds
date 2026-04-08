@@ -96,7 +96,7 @@ class ReynoldsSolverGPU:
         L: float,
         omega: float = 1.5,
         tol: float = 1e-5,
-        max_iter: int = 50000,
+        max_iter: int = 200000,
         check_every: int = 500,
         closure=None,
         P_init=None,
@@ -162,30 +162,41 @@ class ReynoldsSolverGPU:
         sor_kernel = get_rb_sor_kernel()
         bc_kernel = get_apply_bc_kernel()
 
-        # 3. Iterative Red-Black SOR loop
+        # 3. Iterative Red-Black SOR loop (block-based convergence check)
         delta = 1.0
         iteration = 0
+        min_iter = max(100, check_every)
+        converged = False
 
         while iteration < max_iter:
-            need_check = ((iteration + 1) % check_every == 0) or (iteration == 0)
+            # Save P before block
+            self._P_old[:] = self._P
 
-            # Save P before iterations if we need to check residual
-            if need_check:
-                self._P_old[:] = self._P
+            # Run a block of check_every iterations
+            n_block = min(check_every, max_iter - iteration)
+            for _ in range(n_block):
+                self._run_sor_iteration(sor_kernel, bc_kernel, N_Z, N_phi, omega)
+                iteration += 1
 
-            # Run SOR iteration (no atomicAdd — pure update)
-            self._run_sor_iteration(sor_kernel, bc_kernel, N_Z, N_phi, omega)
-            iteration += 1
-
-            # Compute residual via CuPy array ops
-            if need_check:
+            # Check convergence over entire block
+            if iteration >= min_iter:
                 delta = self._compute_residual()
                 if delta < tol:
+                    converged = True
                     break
+
+        if not converged:
+            import warnings
+            warnings.warn(
+                f"SOR did not converge: {iteration} iters, delta={delta:.2e}, "
+                f"tol={tol:.1e}, omega={omega:.4f}",
+                RuntimeWarning,
+                stacklevel=3,
+            )
 
         # 4. Transfer result to CPU
         P_cpu = cp.asnumpy(self._P)
-        return P_cpu, float(delta), iteration
+        return P_cpu, float(delta), iteration, converged
 
     def solve_with_rhs(
         self,
@@ -232,22 +243,24 @@ class ReynoldsSolverGPU:
 
         delta = 1.0
         iteration = 0
+        min_iter = max(100, check_every)
+        converged = False
 
         while iteration < max_iter:
-            need_check = ((iteration + 1) % check_every == 0) or (iteration == 0)
+            self._P_old[:] = self._P
 
-            if need_check:
-                self._P_old[:] = self._P
+            n_block = min(check_every, max_iter - iteration)
+            for _ in range(n_block):
+                self._run_sor_iteration(sor_kernel, bc_kernel, N_Z, N_phi, omega)
+                iteration += 1
 
-            self._run_sor_iteration(sor_kernel, bc_kernel, N_Z, N_phi, omega)
-            iteration += 1
-
-            if need_check:
+            if iteration >= min_iter:
                 delta = self._compute_residual()
                 if delta < tol:
+                    converged = True
                     break
 
-        return self._P.copy(), float(delta), iteration
+        return self._P.copy(), float(delta), iteration, converged
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +285,7 @@ def solve_reynolds_gpu(
     L: float,
     omega: float = 1.5,
     tol: float = 1e-5,
-    max_iter: int = 50000,
+    max_iter: int = 200000,
     check_every: int = 500,
     closure=None,
     P_init=None,

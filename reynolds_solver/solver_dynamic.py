@@ -73,7 +73,7 @@ def solve_reynolds_gpu_dynamic(
     add_dynamic_rhs_gpu(F_full, d_phi, N_Z, N_phi, xprime, yprime, beta, phase_shift)
 
     # 3. Solve with pre-computed coefficients
-    P_gpu, delta, n_iter = solver.solve_with_rhs(
+    P_gpu, delta, n_iter, converged = solver.solve_with_rhs(
         H_gpu, F_full, A, B, C, D, E,
         omega=omega, tol=tol, max_iter=max_iter, check_every=check_every,
         P_init=P_init,
@@ -81,4 +81,4 @@ def solve_reynolds_gpu_dynamic(
 
     # 4. Transfer result to CPU
     P_cpu = cp.asnumpy(P_gpu)
-    return P_cpu, delta, n_iter
+    return P_cpu, delta, n_iter, converged

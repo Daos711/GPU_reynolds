@@ -115,7 +115,7 @@ def solve_reynolds_transformed(
         Phi_init = cp.asarray(P_init, dtype=cp.float64)
 
     # Step 2: solve laminar equation for Φ (standard GPU SOR)
-    Phi_gpu, delta, n_iter = solver.solve_with_rhs(
+    Phi_gpu, delta, n_iter, _ = solver.solve_with_rhs(
         H_gpu, F_full, A, B, C, D, E,
         omega=omega, tol=tol, max_iter=max_iter, check_every=check_every,
         P_init=Phi_init,

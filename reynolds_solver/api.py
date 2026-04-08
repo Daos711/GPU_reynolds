@@ -48,10 +48,11 @@ def solve_reynolds(
     mu: float = None,
     c_clearance: float = None,
     # Solver settings (Half-Sommerfeld)
-    omega: float = 1.5,
+    omega: float = None,
     tol: float = 1e-5,
-    max_iter: int = 50000,
+    max_iter: int = 200000,
     check_every: int = 500,
+    return_converged: bool = False,
     P_init: np.ndarray = None,
     # Subcell quadrature for conductance
     subcell_quad: bool = False,
@@ -161,6 +162,18 @@ def solve_reynolds(
         n_outer : int
         n_inner_total : int
     """
+    # --- Auto omega ---
+    if omega is None:
+        from reynolds_solver.utils import compute_auto_omega
+        N_Z, N_phi = H.shape
+        if alpha_pv is not None:
+            cap = 1.95
+        elif cavitation == "jfo":
+            cap = 1.95
+        else:
+            cap = 1.97
+        omega = compute_auto_omega(N_phi, N_Z, R, L, cap=cap)
+
     # --- Build closure object ---
     if closure == "laminar":
         import cupy as cp
@@ -246,26 +259,33 @@ def solve_reynolds(
                 "Valid: 'iterative', 'transformed'."
             )
 
+    # --- Helper: strip converged flag for backward compat ---
+    def _maybe_strip(result_4):
+        """Strip 4th element (converged) if not requested."""
+        if return_converged:
+            return result_4
+        return result_4[:3]
+
     # --- Dispatch by cavitation model ---
     if cavitation == "half_sommerfeld":
         is_dynamic = abs(xprime) > 1e-15 or abs(yprime) > 1e-15
 
         if is_dynamic:
-            return solve_reynolds_gpu_dynamic(
+            return _maybe_strip(solve_reynolds_gpu_dynamic(
                 H, d_phi, d_Z, R, L,
                 xprime=xprime, yprime=yprime, beta=beta,
                 phase_shift=phase_shift,
                 closure=closure_obj,
                 omega=omega, tol=tol, max_iter=max_iter, check_every=check_every,
                 P_init=P_init,
-            )
+            ))
         else:
-            return solve_reynolds_gpu(
+            return _maybe_strip(solve_reynolds_gpu(
                 H, d_phi, d_Z, R, L,
                 closure=closure_obj,
                 omega=omega, tol=tol, max_iter=max_iter, check_every=check_every,
                 P_init=P_init,
-            )
+            ))
 
     elif cavitation == "jfo":
         if closure != "laminar":
