@@ -30,7 +30,7 @@ print()
 
 # JFO with different max_outer — EACH TIME FROM SCRATCH
 results = []
-for max_out in [100, 300, 500, 1000, 2000]:
+for max_out in [100, 300, 500, 1000]:
     P_jfo, theta, res, n_out, n_in = solve_reynolds(
         H, d_phi, d_Z, R, L, cavitation="jfo",
         omega=None,
