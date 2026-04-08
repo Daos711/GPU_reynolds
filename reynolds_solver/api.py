@@ -65,7 +65,7 @@ def solve_reynolds(
     jfo_max_outer: int = 500,
     jfo_max_inner: int = 500,
     jfo_p_off: float = 0.0,
-    jfo_p_on: float = 1e-6,
+    jfo_p_on: float = 0.0,
     jfo_tol_theta: float = 1e-5,
     jfo_tol_inner: float = None,
     theta_init: np.ndarray = None,
@@ -75,6 +75,8 @@ def solve_reynolds(
     use_F_theta: bool = True,
     update_mask: bool = True,
     run_theta_sweep: bool = True,
+    # JFO diagnostic
+    jfo_return_rhs: bool = False,
     # Piezoviscous parameters
     alpha_pv: float = None,
     p_scale: float = None,
@@ -312,6 +314,7 @@ def solve_reynolds(
             use_F_theta=use_F_theta,
             update_mask=update_mask,
             run_theta_sweep=run_theta_sweep,
+            return_rhs=jfo_return_rhs,
         )
 
     else:

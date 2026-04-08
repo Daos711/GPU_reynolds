@@ -187,7 +187,7 @@ class SolverJFO:
         max_outer=500,
         max_inner=500,
         p_off=0.0,
-        p_on=1e-6,
+        p_on=0.0,
         P_init=None,
         theta_init=None,
         mask_init=None,
@@ -196,6 +196,7 @@ class SolverJFO:
         use_F_theta=True,
         update_mask=True,
         run_theta_sweep=True,
+        return_rhs=False,
     ):
         """
         Solve Reynolds equation with JFO cavitation.
@@ -222,8 +223,24 @@ class SolverJFO:
         n_outer : int
         n_inner_total : int
         """
+        import warnings
+
         if tol_inner is None:
             tol_inner = tol_P
+
+        if sweep_direction != 0:
+            warnings.warn(
+                "sweep_direction is deprecated and ignored",
+                DeprecationWarning, stacklevel=2,
+            )
+
+        # Validate manual hysteresis thresholds
+        use_adaptive_thresholds = not (p_off > 0 and p_on > 0)
+        if not use_adaptive_thresholds and p_on <= p_off:
+            raise ValueError(
+                f"Manual hysteresis requires p_on > p_off > 0, "
+                f"got p_on={p_on}, p_off={p_off}"
+            )
 
         N_Z, N_phi = self.N_Z, self.N_phi
 
@@ -326,12 +343,16 @@ class SolverJFO:
                     break
             hit_max_inner = (inner_iters == max_inner)
 
-            # (b) Update zone mask with adaptive hysteresis thresholds
+            # (b) Update zone mask with hysteresis thresholds
             if update_mask:
-                maxP = float(cp.max(self._P))
-                adaptive_p_on = 1e-5 * maxP if maxP > 0 else 1e-10
-                adaptive_p_off = 1e-6 * maxP if maxP > 0 else 1e-11
-                self._update_zone_mask(adaptive_p_off, adaptive_p_on)
+                if use_adaptive_thresholds:
+                    maxP = float(cp.max(self._P))
+                    eff_p_on = 1e-5 * maxP if maxP > 0 else 1e-10
+                    eff_p_off = 1e-6 * maxP if maxP > 0 else 1e-11
+                else:
+                    eff_p_on = p_on
+                    eff_p_off = p_off
+                self._update_zone_mask(eff_p_off, eff_p_on)
 
             # (c) Projection: enforce theta=1 in active zone, P>=0
             act = (self._mask == 1)
@@ -383,10 +404,14 @@ class SolverJFO:
                     f"dPi={dP_inner_last:.2e}"
                 )
 
-            # Convergence by dW_rel (like CPU reference) — mask stability
-            # is NOT required since boundary nodes may oscillate indefinitely
-            # with full-domain SOR + P>=0 clamp
-            converged = (dW_rel < tol_P and residual_P < tol_P and outer > 5)
+            # Convergence: all conditions must be satisfied simultaneously
+            converged = (
+                dW_rel < tol_P
+                and residual_P < tol_P
+                and residual_theta < tol_theta
+                and mask_changed_count == 0
+                and outer > 5
+            )
             if converged:
                 if verbose:
                     print(f"    Converged at outer={outer}")
@@ -397,6 +422,9 @@ class SolverJFO:
 
         P_cpu = cp.asnumpy(self._P)
         theta_cpu = cp.asnumpy(self._theta)
+        if return_rhs:
+            F_final_cpu = cp.asnumpy(self._F)
+            return P_cpu, theta_cpu, float(residual), n_outer, n_inner_total, F_final_cpu
         return P_cpu, theta_cpu, float(residual), n_outer, n_inner_total
 
 
@@ -428,7 +456,7 @@ def solve_reynolds_gpu_jfo(
     max_outer: int = 500,
     max_inner: int = 500,
     p_off: float = 0.0,
-    p_on: float = 1e-6,
+    p_on: float = 0.0,
     P_init=None,
     theta_init=None,
     mask_init=None,
@@ -437,17 +465,17 @@ def solve_reynolds_gpu_jfo(
     use_F_theta: bool = True,
     update_mask: bool = True,
     run_theta_sweep: bool = True,
+    return_rhs: bool = False,
 ) -> tuple:
     """
     Solve Reynolds equation with JFO cavitation on GPU.
 
     Returns
     -------
-    P : numpy.ndarray, float64, (N_Z, N_phi)
-    theta : numpy.ndarray, float64, (N_Z, N_phi)
-    residual : float
-    n_outer : int
-    n_inner_total : int
+    Standard (return_rhs=False):
+        P, theta, residual, n_outer, n_inner_total  (5-tuple)
+    Diagnostic (return_rhs=True):
+        P, theta, residual, n_outer, n_inner_total, F_final  (6-tuple)
     """
     N_Z, N_phi = H.shape
     solver = _get_jfo_solver(N_Z, N_phi)
@@ -473,4 +501,5 @@ def solve_reynolds_gpu_jfo(
         use_F_theta=use_F_theta,
         update_mask=update_mask,
         run_theta_sweep=run_theta_sweep,
+        return_rhs=return_rhs,
     )

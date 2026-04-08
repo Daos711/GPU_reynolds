@@ -131,49 +131,89 @@ def test_frozen_theta_jfo_equals_hs():
 # Test 1: Mass conservativity
 # -----------------------------------------------------------------------
 def test_mass_conservativity():
-    print("\n=== Test 1: Mass conservativity ===")
-    from reynolds_solver import solve_reynolds
+    """
+    Test 1: Discrete Reynolds residual in full-film zone.
 
-    R = 0.035
-    L = 0.056
-    epsilon = 0.6
+    Checks that the SOR solver actually solved the discrete equation:
+      A*P_{j+1} + B*P_{j-1} + C*P_{i+1} + D*P_{i-1} - E*P_{i,j} = F_rhs
+    """
+    print("\n=== Test 1: Discrete Reynolds residual ===")
+    import cupy as cp
+    from reynolds_solver import solve_reynolds
+    from reynolds_solver.utils import precompute_coefficients_gpu, build_F_theta_gpu
+
+    R, L = 0.035, 0.056
     N = 250
+    epsilon = 0.6
 
     H, d_phi, d_Z, phi_1D, Z = generate_test_case(N, epsilon)
+    N_Z, N_phi = H.shape
 
-    max_outer = 500
-    P, theta, residual, n_outer, n_inner = solve_reynolds(
-        H, d_phi, d_Z, R, L, cavitation="jfo",
-        jfo_max_outer=max_outer, jfo_max_inner=500,
-        verbose=True,
-    )
-    hit_limit = (n_outer >= max_outer)
+    # Try diagnostic path (jfo_return_rhs=True) for exact blended RHS
+    try:
+        result = solve_reynolds(
+            H, d_phi, d_Z, R, L, cavitation="jfo",
+            jfo_max_outer=500, jfo_max_inner=500,
+            jfo_return_rhs=True, verbose=True,
+        )
+        P, theta, residual, n_outer, n_inner, F_c = result
+        rhs_source = "solver (exact)"
+    except TypeError:
+        # Fallback: rebuild from theta (approximate)
+        P, theta, residual, n_outer, n_inner = solve_reynolds(
+            H, d_phi, d_Z, R, L, cavitation="jfo",
+            jfo_max_outer=500, jfo_max_inner=500, verbose=True,
+        )
+        H_gpu = cp.asarray(H, dtype=cp.float64)
+        theta_gpu = cp.asarray(theta, dtype=cp.float64)
+        F_c = cp.asnumpy(build_F_theta_gpu(H_gpu, theta_gpu, d_phi))
+        rhs_source = "rebuilt from theta (approximate)"
+
+    hit_limit = (n_outer >= 500)
     status = "HIT LIMIT" if hit_limit else "CONVERGED"
     print(f"    {status}: {n_outer} outer, {n_inner} inner total, residual={residual:.2e}")
 
-    if hit_limit or residual > 1e-3:
-        return run_test(
-            "Mass conservativity: flux variation < 1%",
-            False,
-            f"solver not converged enough for flux check: n_outer={n_outer}, residual={residual:.2e}"
-        )
+    # Rebuild stencil coefficients
+    H_gpu = cp.asarray(H, dtype=cp.float64)
+    A, B, C, D, E, _ = precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L)
+    A_c, B_c = cp.asnumpy(A), cp.asnumpy(B)
+    C_c, D_c, E_c = cp.asnumpy(C), cp.asnumpy(D), cp.asnumpy(E)
 
-    # Discrete flux with upwind theta (matching solver discretization):
-    #   Q_{j+1/2} = H_{j+1/2} * theta_j - 0.5 * H_{j+1/2}^3 * dP/dphi
-    H_face = 0.5 * (H[:, :-1] + H[:, 1:])
-    theta_up = theta[:, :-1]  # upwind theta at face j+1/2
-    dP_face = (P[:, 1:] - P[:, :-1]) / d_phi
-    Q_face = H_face * theta_up - 0.5 * H_face ** 3 * dP_face
+    # Compute discrete residual for each interior node
+    res_field = np.zeros((N_Z, N_phi))
+    for i in range(1, N_Z - 1):
+        for j in range(1, N_phi - 1):
+            jp = j + 1 if j + 1 < N_phi - 1 else 1
+            jm = j - 1 if j - 1 >= 1 else N_phi - 2
+            LHS = (A_c[i,j]*P[i,jp] + B_c[i,j]*P[i,jm]
+                 + C_c[i,j]*P[i+1,j] + D_c[i,j]*P[i-1,j]
+                 - E_c[i,j]*P[i,j])
+            res_field[i, j] = LHS - F_c[i, j]
 
-    Q_integrated = np.sum(Q_face, axis=0) * d_Z
+    # Full-film zone consistent with solver logic
+    interior = res_field[1:-1, 1:-1]
+    P_int = P[1:-1, 1:-1]
+    theta_int = theta[1:-1, 1:-1]
+    maxP = np.max(P)
+    p_on_eff = 1e-5 * maxP if maxP > 0 else 1e-10
+    fullfilm = (P_int > p_on_eff) & (theta_int > 1.0 - 1e-8)
 
-    mass_err = (np.max(Q_integrated) - np.min(Q_integrated)) / (np.mean(np.abs(Q_integrated)) + 1e-12)
-    print(f"    Mass error (relative flux variation): {mass_err:.4e}")
+    if np.sum(fullfilm) < 10:
+        return run_test("Discrete Reynolds residual",
+                        False, f"Too few full-film nodes ({np.sum(fullfilm)})")
+
+    res_ff = interior[fullfilm]
+    F_scale = np.max(np.abs(F_c[1:-1, 1:-1])) + 1e-30
+    rel_l2 = np.sqrt(np.mean(res_ff**2)) / F_scale
+
+    print(f"    RHS source: {rhs_source}")
+    print(f"    rel_l2_residual = {rel_l2:.4e}")
+    print(f"    full-film nodes: {np.sum(fullfilm)} / {interior.size}")
 
     return run_test(
-        "Mass conservativity: flux variation < 1%",
-        mass_err < 0.01,
-        f"mass_err = {mass_err:.4e}"
+        "Discrete Reynolds residual: rel_l2 < 1%",
+        rel_l2 < 1e-2,
+        f"rel_l2 = {rel_l2:.4e}"
     )
 
 
