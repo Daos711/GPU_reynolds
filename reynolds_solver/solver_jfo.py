@@ -123,39 +123,26 @@ class SolverJFO:
         """
         Update zone_mask based on hysteresis thresholds.
 
-        Active -> cavitation: P <= p_off
-        Cavitation -> active: P_trial > p_on (computed via local stencil)
+        Matches CPU-reference logic (solver_jfo_splitting_cpu._update_zone_state):
+          P > p_on  -> full-film (mask=1)
+          P < p_off -> cavitation (mask=0)
+          p_off <= P <= p_on -> keep previous state (hysteresis band)
 
-        Uses self._F which contains F_theta (or F_orig in diagnostic mode).
+        Only updates interior nodes; boundary rows stay unchanged.
         """
         N_Z, N_phi = self.N_Z, self.N_phi
 
-        # Active nodes going to cavitation: P <= p_off
-        go_cavitation = (self._mask == 1) & (self._P <= p_off)
-        self._mask[go_cavitation] = 0
-        self._P[go_cavitation] = 0.0
-
-        # Cavitation nodes potentially returning to active: compute P_trial
-        cav_mask = (self._mask == 0)
         interior = cp.zeros((N_Z, N_phi), dtype=cp.bool_)
         interior[1:-1, 1:-1] = True
-        candidates = cav_mask & interior
 
-        if cp.any(candidates):
-            P_jp1 = cp.roll(self._P, -1, axis=1)
-            P_jm1 = cp.roll(self._P, 1, axis=1)
-            P_ip1 = cp.roll(self._P, -1, axis=0)
-            P_im1 = cp.roll(self._P, 1, axis=0)
+        to_full = interior & (self._P > p_on)
+        to_cav = interior & (self._P < p_off)
 
-            P_trial = (
-                self._A * P_jp1 + self._B * P_jm1 +
-                self._C * P_ip1 + self._D * P_im1 -
-                self._F
-            ) / (self._E + 1e-30)
+        self._mask[to_full] = 1
+        self._mask[to_cav] = 0
 
-            reactivate = candidates & (P_trial > p_on)
-            self._mask[reactivate] = 1
-            self._theta[reactivate] = 1.0
+        self._P[to_cav] = 0.0
+        self._theta[to_full] = 1.0
 
     def solve(
         self,
