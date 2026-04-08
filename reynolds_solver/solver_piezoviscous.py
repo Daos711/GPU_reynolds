@@ -210,7 +210,7 @@ def solve_reynolds_piezoviscous(
             P_init_cp = cp.asarray(P_init, dtype=cp.float64)
         else:
             P_init_cp = None
-        P_gpu, delta, n_iter = solver.solve_with_rhs(
+        P_gpu, delta, n_iter, _ = solver.solve_with_rhs(
             H_gpu, F_full, A_base, B_base, C_base, D_base, E_base,
             omega=omega, tol=tol, max_iter=max_iter, check_every=check_every,
             P_init=P_init_cp,
@@ -220,7 +220,7 @@ def solve_reynolds_piezoviscous(
     # --- Outer iteration loop (piezoviscous) ---
 
     # Step 1: Initial solve with μ = μ₀ (laminar)
-    P_gpu, delta, n_iter_total = solver.solve_with_rhs(
+    P_gpu, delta, n_iter_total, _ = solver.solve_with_rhs(
         H_gpu, F_full, A_base, B_base, C_base, D_base, E_base,
         omega=omega, tol=tol, max_iter=max_iter, check_every=check_every,
         P_init=cp.asarray(P_init, dtype=cp.float64) if P_init is not None else None,
@@ -248,7 +248,7 @@ def solve_reynolds_piezoviscous(
                                       N_Z, N_phi)
 
         # Step 4: re-solve with warm start
-        P_gpu_new, delta, n_iter = solver.solve_with_rhs(
+        P_gpu_new, delta, n_iter, _ = solver.solve_with_rhs(
             H_gpu, F_full, A_pv, B_pv, C_pv, D_pv, E_pv,
             omega=omega, tol=tol, max_iter=max_iter, check_every=check_every,
             P_init=P_gpu,  # warm start from previous
