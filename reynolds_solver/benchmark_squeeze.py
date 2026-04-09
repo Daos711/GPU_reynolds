@@ -347,6 +347,7 @@ def run_benchmark(
         # relaxation with complementarity Branch-1 / Branch-2 logic.
         inner_k = 0
         used_thomas = False
+        nucleation_step = False
         if prev_cav == 0:
             # theta is all 1.0 here; Thomas acts purely on P.
             min_P = _thomas_full_film(P, c_prev, H_n, s, beta, p0, N1)
@@ -355,10 +356,41 @@ def run_benchmark(
                 used_thomas = True
                 # Ensure theta = 1 everywhere (it already is in pre-rupture).
                 theta[:] = 1.0
+            else:
+                # Nucleation step. Thomas says some cells want P < 0, i.e.
+                # those are the newly cavitated cells. Use that map as a
+                # starting guess for SGS:
+                #   * clamp P_thomas to 0 in the "wants-cavitation" set
+                #     (and keep the positive values for the full-film lobes
+                #     near the boundaries),
+                #   * seed θ there to c_prev_i / H_n so that mass content
+                #     is continuous at the old → new time slab,
+                # which is orders of magnitude closer to the Branch-1/2
+                # equilibrium than a plain warm-start from the previous
+                # time step. Without this hint, SGS would need to propagate
+                # the cavitation front from the rupture seed at ~1 cell
+                # per iteration (thousands of iterations for the physical
+                # width), which typically hits max_relax on this one step.
+                nucleation_step = True
+                for i in range(1, N1 - 1):
+                    if P[i] < 0.0:
+                        P[i] = 0.0
+                        frac = c_prev[i] / H_n
+                        if frac < 1.0:
+                            if frac < 0.0:
+                                frac = 0.0
+                            theta[i] = frac
+                P[0] = p0
+                P[-1] = p0
+                theta[0] = 1.0
+                theta[-1] = 1.0
 
         if not used_thomas:
-            # Iterative SGS relaxation with complementarity.
-            for k in range(max_relax):
+            # Iterative SGS relaxation with complementarity. Nucleation
+            # needs a bigger budget than the post-rupture steps since the
+            # active set is changing on this step.
+            step_budget = max_relax * 5 if nucleation_step else max_relax
+            for k in range(step_budget):
                 dP, dth = _squeeze_sgs_sweep(
                     P, theta, c_prev, H_n, s, beta,
                     omega_p, omega_theta, N1,
@@ -403,7 +435,12 @@ def run_benchmark(
                 tag = "  <<< RUPTURE"
             if reformed:
                 tag = "  <<< REFORMED"
-            solver_tag = "Thomas" if used_thomas else f"SGS{inner_k:>4d}"
+            if used_thomas:
+                solver_tag = "Thomas"
+            elif nucleation_step:
+                solver_tag = f"NUC{inner_k:>4d}"
+            else:
+                solver_tag = f"SGS{inner_k:>4d}"
             print(f"  {n_step:>5d}  {t:>7.4f}  {H_n:>7.4f}  "
                   f"{solver_tag:>8s}  {P.max():>10.3e}  {theta.min():>6.4f}  "
                   f"{n_cav:>4d}  {sig_n_s:>7s}  {sig_e_s:>7s}  "
