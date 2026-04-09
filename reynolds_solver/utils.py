@@ -117,10 +117,14 @@ def precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L, closure=None):
 
 def build_F_theta_gpu(H_gpu, theta_gpu, d_phi):
     """
-    Build JFO RHS: F_theta = d(H*theta)/dphi using face-based fluxes.
+    Build JFO RHS with upwind theta, packing-compatible with
+    precompute_coefficients_gpu().
 
-    Uses the same ghost/physical indexing and face scheme as F_orig
-    in precompute_coefficients_gpu.
+    IMPORTANT: F uses a different packing than P/theta ghost columns.
+    precompute_coefficients_gpu() packs F as:
+        F_full[:, :-1] = F_half          (N_phi-1 face values)
+        F_full[:, -1]  = F_half[:, 0]    (copy of first face)
+    This function reproduces that packing exactly.
 
     When theta=1 everywhere, F_theta == F_orig to machine precision.
 
@@ -135,16 +139,25 @@ def build_F_theta_gpu(H_gpu, theta_gpu, d_phi):
     F_theta : cupy.ndarray, shape (N_Z, N_phi), float64
     """
     N_Z, N_phi = H_gpu.shape
-    Hth = H_gpu * theta_gpu
 
-    S_plus_half = 0.5 * (Hth[:, :-1] + Hth[:, 1:])
+    # Face H values on (N_Z, N_phi-1) grid — same as precompute_coefficients_gpu
+    H_face_p = 0.5 * (H_gpu[:, :-1] + H_gpu[:, 1:])       # (N_Z, N_phi-1)
 
-    S_minus_half = cp.empty_like(S_plus_half)
-    S_minus_half[:, 1:] = S_plus_half[:, :-1]
-    S_minus_half[:, 0] = S_plus_half[:, -1]
+    H_face_m = cp.empty_like(H_face_p)                      # (N_Z, N_phi-1)
+    H_face_m[:, 1:] = H_face_p[:, :-1]
+    H_face_m[:, 0] = H_face_p[:, -1]                        # periodic wrap
 
-    F_half = d_phi * (S_plus_half - S_minus_half)
+    # Upwind theta on the same (N_phi-1) packing
+    theta_j = theta_gpu[:, :-1]                              # (N_Z, N_phi-1)
 
+    theta_jm1 = cp.empty_like(theta_j)                      # (N_Z, N_phi-1)
+    theta_jm1[:, 1:] = theta_gpu[:, :-2]
+    theta_jm1[:, 0] = theta_gpu[:, N_phi - 2]               # periodic: last physical col
+
+    # F_half with upwind theta
+    F_half = d_phi * (H_face_p * theta_j - H_face_m * theta_jm1)  # (N_Z, N_phi-1)
+
+    # Pack into full array EXACTLY like precompute_coefficients_gpu
     F_theta = cp.zeros((N_Z, N_phi), dtype=cp.float64)
     F_theta[:, :-1] = F_half
     F_theta[:, -1] = F_half[:, 0]

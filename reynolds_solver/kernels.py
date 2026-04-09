@@ -115,65 +115,123 @@ extern "C" __global__ void rb_sor_jfo_step(
 """
 
 # ---------------------------------------------------------------------------
-# CUDA kernel: upwind theta line-sweep along phi (one thread per Z-row)
-# Sequential within each row to propagate H*theta = const fully.
-# Two passes handle periodic wrap-around of cavitation zones.
+# CUDA kernel: rupture-anchored theta march along phi (one thread per Z-row)
+# Uses face-based H values for mass-conservative transport.
+#
+# Algorithm per row:
+#   1. Set full-film nodes (zone_mask=1) to theta=1; detect if any cavitation
+#   2. Find rupture point: first transition full-film -> cavitation
+#   3. March theta through cavitation zone: theta_j = H_face_m[j]/H_face_p[j] * theta_{j-1}
+#   4. Stop at reformation (first zone_mask=1 encountered)
 # ---------------------------------------------------------------------------
 _UPDATE_THETA_SWEEP_KERNEL_CODE = r"""
 extern "C" __global__ void update_theta_sweep(
     double* __restrict__ theta,
-    const double* __restrict__ H,
+    const double* __restrict__ H_face_p,
+    const double* __restrict__ H_face_m,
     const int* __restrict__ zone_mask,
     const int N_Z,
-    const int N_phi,
-    const int direction
+    const int N_phi
 )
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N_Z) return;
 
-    // Physical columns: j = 1 .. N_phi-2  (columns 0 and N_phi-1 are ghosts)
-    // Two passes to handle periodic wrap-around of cavitation zone.
-    for (int pass = 0; pass < 2; pass++) {
-        if (direction == 0) {
-            // Forward sweep (+phi): j from 1 to N_phi-2, upstream = j-1
-            for (int j = 1; j <= N_phi - 2; j++) {
-                int idx = i * N_phi + j;
-                if (zone_mask[idx] == 0) {
-                    int j_prev = (j == 1) ? (N_phi - 2) : (j - 1);
-                    double H_here = H[idx];
-                    double H_prev = H[i * N_phi + j_prev];
-                    double theta_prev = theta[i * N_phi + j_prev];
-                    double val = (H_prev / H_here) * theta_prev;
-                    if (val < 0.0) val = 0.0;
-                    if (val > 1.0) val = 1.0;
-                    theta[idx] = val;
-                } else {
-                    theta[idx] = 1.0;
-                }
-            }
+    // Boundary rows: theta = 1 everywhere
+    if (i == 0 || i == N_Z - 1) {
+        for (int j = 0; j < N_phi; j++)
+            theta[i * N_phi + j] = 1.0;
+        return;
+    }
+
+    int n_phys = N_phi - 2;  // physical columns: j = 1 .. N_phi-2
+
+    // Pass 1: set full-film nodes to theta=1, detect any cavitation
+    int any_cav = 0;
+    for (int j = 1; j <= N_phi - 2; j++) {
+        int idx = i * N_phi + j;
+        if (zone_mask[idx] == 1) {
+            theta[idx] = 1.0;
         } else {
-            // Backward sweep (-phi): j from N_phi-2 to 1, upstream = j+1
-            for (int j = N_phi - 2; j >= 1; j--) {
-                int idx = i * N_phi + j;
-                if (zone_mask[idx] == 0) {
-                    int j_next = (j == N_phi - 2) ? 1 : (j + 1);
-                    double H_here = H[idx];
-                    double H_next = H[i * N_phi + j_next];
-                    double theta_next = theta[i * N_phi + j_next];
-                    double val = (H_next / H_here) * theta_next;
-                    if (val < 0.0) val = 0.0;
-                    if (val > 1.0) val = 1.0;
-                    theta[idx] = val;
-                } else {
-                    theta[idx] = 1.0;
-                }
-            }
+            any_cav = 1;
         }
-        // Sync ghost columns after each pass
+    }
+
+    if (!any_cav) {
+        // Entire row is full-film
         theta[i * N_phi + 0]           = theta[i * N_phi + (N_phi - 2)];
         theta[i * N_phi + (N_phi - 1)] = theta[i * N_phi + 1];
+        return;
     }
+
+    // Find rupture point: first transition full-film(1) -> cavitation(0)
+    int rupture_j = -1;
+    for (int jj = 0; jj < n_phys; jj++) {
+        int j = 1 + jj;
+        int j_next = (j + 1 <= N_phi - 2) ? (j + 1) : 1;
+        int idx_j    = i * N_phi + j;
+        int idx_next = i * N_phi + j_next;
+        if (zone_mask[idx_j] == 1 && zone_mask[idx_next] == 0) {
+            rupture_j = j;
+            break;
+        }
+    }
+
+    if (rupture_j < 0) {
+        // Entire row cavitated (no full-film anchor)
+        // March one full revolution from column 1 with theta_prev = 1.0
+        double theta_prev = 1.0;
+        int j = 1;
+        for (int step = 0; step < n_phys; step++) {
+            int idx = i * N_phi + j;
+            if (zone_mask[idx] == 1) {
+                theta_prev = 1.0;
+            } else {
+                double Hfp = H_face_p[idx];
+                double Hfm = H_face_m[idx];
+                double val = 0.0;
+                if (Hfp > 1e-30) {
+                    val = Hfm * theta_prev / Hfp;
+                    if (val < 0.0) val = 0.0;
+                    if (val > 1.0) val = 1.0;
+                }
+                theta[idx] = val;
+                theta_prev = val;
+            }
+            j++;
+            if (j > N_phi - 2) j = 1;
+        }
+    } else {
+        // March from rupture point through cavitation zone
+        double theta_prev = 1.0;  // entering cavitation from full-film
+        int j = rupture_j + 1;
+        if (j > N_phi - 2) j = 1;  // periodic wrap
+
+        for (int step = 0; step < n_phys; step++) {
+            int idx = i * N_phi + j;
+            if (zone_mask[idx] == 1) {
+                break;  // reached reformation point
+            }
+
+            double Hfp = H_face_p[idx];
+            double Hfm = H_face_m[idx];
+            double val = 0.0;
+            if (Hfp > 1e-30) {
+                val = Hfm * theta_prev / Hfp;
+                if (val < 0.0) val = 0.0;
+                if (val > 1.0) val = 1.0;
+            }
+            theta[idx] = val;
+            theta_prev = val;
+
+            j++;
+            if (j > N_phi - 2) j = 1;
+        }
+    }
+
+    // Sync ghost columns (periodic)
+    theta[i * N_phi + 0]           = theta[i * N_phi + (N_phi - 2)];
+    theta[i * N_phi + (N_phi - 1)] = theta[i * N_phi + 1];
 }
 """
 

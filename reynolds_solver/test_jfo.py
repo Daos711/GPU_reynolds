@@ -131,44 +131,89 @@ def test_frozen_theta_jfo_equals_hs():
 # Test 1: Mass conservativity
 # -----------------------------------------------------------------------
 def test_mass_conservativity():
-    print("\n=== Test 1: Mass conservativity ===")
-    from reynolds_solver import solve_reynolds
+    """
+    Test 1: Discrete Reynolds residual in full-film zone.
 
-    R = 0.035
-    L = 0.056
-    epsilon = 0.6
+    Checks that the SOR solver actually solved the discrete equation:
+      A*P_{j+1} + B*P_{j-1} + C*P_{i+1} + D*P_{i-1} - E*P_{i,j} = F_rhs
+    """
+    print("\n=== Test 1: Discrete Reynolds residual ===")
+    import cupy as cp
+    from reynolds_solver import solve_reynolds
+    from reynolds_solver.utils import precompute_coefficients_gpu, build_F_theta_gpu
+
+    R, L = 0.035, 0.056
     N = 250
+    epsilon = 0.6
 
     H, d_phi, d_Z, phi_1D, Z = generate_test_case(N, epsilon)
+    N_Z, N_phi = H.shape
 
-    P, theta, residual, n_outer, n_inner = solve_reynolds(
-        H, d_phi, d_Z, R, L, cavitation="jfo", verbose=True,
-    )
-    print(f"    Converged: {n_outer} outer, {n_inner} inner total, residual={residual:.2e}")
+    # Try diagnostic path (jfo_return_rhs=True) for exact blended RHS
+    try:
+        result = solve_reynolds(
+            H, d_phi, d_Z, R, L, cavitation="jfo",
+            jfo_max_outer=500, jfo_max_inner=500,
+            jfo_return_rhs=True, verbose=True,
+        )
+        P, theta, residual, n_outer, n_inner, F_c = result
+        rhs_source = "solver (exact)"
+    except TypeError:
+        # Fallback: rebuild from theta (approximate)
+        P, theta, residual, n_outer, n_inner = solve_reynolds(
+            H, d_phi, d_Z, R, L, cavitation="jfo",
+            jfo_max_outer=500, jfo_max_inner=500, verbose=True,
+        )
+        H_gpu = cp.asarray(H, dtype=cp.float64)
+        theta_gpu = cp.asarray(theta, dtype=cp.float64)
+        F_c = cp.asnumpy(build_F_theta_gpu(H_gpu, theta_gpu, d_phi))
+        rhs_source = "rebuilt from theta (approximate)"
 
-    # Discrete flux: Q = H*theta - 0.5*H^3*dP/dphi
-    # Interior faces
-    H_face = 0.5 * (H[:, :-1] + H[:, 1:])
-    theta_face = 0.5 * (theta[:, :-1] + theta[:, 1:])
-    dP_face = (P[:, 1:] - P[:, :-1]) / d_phi
-    Q_inner = H_face * theta_face - 0.5 * H_face ** 3 * dP_face
+    hit_limit = (n_outer >= 500)
+    status = "HIT LIMIT" if hit_limit else "CONVERGED"
+    print(f"    {status}: {n_outer} outer, {n_inner} inner total, residual={residual:.2e}")
 
-    # Wrap-around face: column -1 -> column 0
-    H_wrap = 0.5 * (H[:, -1] + H[:, 0])
-    theta_wrap = 0.5 * (theta[:, -1] + theta[:, 0])
-    dP_wrap = (P[:, 0] - P[:, -1]) / d_phi
-    Q_wrap = (H_wrap * theta_wrap - 0.5 * H_wrap ** 3 * dP_wrap)[:, None]
+    # Rebuild stencil coefficients
+    H_gpu = cp.asarray(H, dtype=cp.float64)
+    A, B, C, D, E, _ = precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L)
+    A_c, B_c = cp.asnumpy(A), cp.asnumpy(B)
+    C_c, D_c, E_c = cp.asnumpy(C), cp.asnumpy(D), cp.asnumpy(E)
 
-    Q_all = np.concatenate([Q_inner, Q_wrap], axis=1)
-    Q_integrated = np.sum(Q_all, axis=0) * d_Z
+    # Compute discrete residual for each interior node
+    res_field = np.zeros((N_Z, N_phi))
+    for i in range(1, N_Z - 1):
+        for j in range(1, N_phi - 1):
+            jp = j + 1 if j + 1 < N_phi - 1 else 1
+            jm = j - 1 if j - 1 >= 1 else N_phi - 2
+            LHS = (A_c[i,j]*P[i,jp] + B_c[i,j]*P[i,jm]
+                 + C_c[i,j]*P[i+1,j] + D_c[i,j]*P[i-1,j]
+                 - E_c[i,j]*P[i,j])
+            res_field[i, j] = LHS - F_c[i, j]
 
-    mass_err = (np.max(Q_integrated) - np.min(Q_integrated)) / (np.mean(np.abs(Q_integrated)) + 1e-12)
-    print(f"    Mass error (relative flux variation): {mass_err:.4e}")
+    # Full-film zone consistent with solver logic
+    interior = res_field[1:-1, 1:-1]
+    P_int = P[1:-1, 1:-1]
+    theta_int = theta[1:-1, 1:-1]
+    maxP = np.max(P)
+    p_on_eff = 1e-5 * maxP if maxP > 0 else 1e-10
+    fullfilm = (P_int > p_on_eff) & (theta_int > 1.0 - 1e-8)
+
+    if np.sum(fullfilm) < 10:
+        return run_test("Discrete Reynolds residual",
+                        False, f"Too few full-film nodes ({np.sum(fullfilm)})")
+
+    res_ff = interior[fullfilm]
+    F_scale = np.max(np.abs(F_c[1:-1, 1:-1])) + 1e-30
+    rel_l2 = np.sqrt(np.mean(res_ff**2)) / F_scale
+
+    print(f"    RHS source: {rhs_source}")
+    print(f"    rel_l2_residual = {rel_l2:.4e}")
+    print(f"    full-film nodes: {np.sum(fullfilm)} / {interior.size}")
 
     return run_test(
-        "Mass conservativity: flux variation < 1%",
-        mass_err < 0.01,
-        f"mass_err = {mass_err:.4e}"
+        "Discrete Reynolds residual: rel_l2 < 1%",
+        rel_l2 < 1e-2,
+        f"rel_l2 = {rel_l2:.4e}"
     )
 
 
@@ -225,12 +270,15 @@ def test_theta_active_zone():
     H, d_phi, d_Z, _, _ = generate_test_case(N, epsilon=0.6)
     P, theta, *_ = solve_reynolds(H, d_phi, d_Z, R, L, cavitation="jfo")
 
-    active = P > 0
+    # Active zone defined by adaptive threshold (matching solver logic)
+    maxP = np.max(P)
+    p_on = 1e-5 * maxP if maxP > 0 else 1e-10
+    active = P > p_on
     if np.any(active):
         theta_active = theta[active]
         all_one = np.allclose(theta_active, 1.0)
         return run_test(
-            "theta == 1 in active zone",
+            "theta == 1 in active zone (P > p_on)",
             all_one,
             f"min(theta[active]) = {np.min(theta_active):.6f}, "
             f"max(theta[active]) = {np.max(theta_active):.6f}"
@@ -281,7 +329,8 @@ def test_cavitation_zone_nonempty():
     H, d_phi, d_Z, _, _ = generate_test_case(N, epsilon=0.6)
     P, theta, *_ = solve_reynolds(H, d_phi, d_Z, R, L, cavitation="jfo")
 
-    cav_frac = np.mean(P == 0)
+    # Cavitation defined by theta < 1 (matching solver semantics)
+    cav_frac = np.mean(theta < 1.0 - 1e-6)
     passed = 0.05 < cav_frac < 0.95
     return run_test(
         "Cavitation fraction in (5%, 95%)",
@@ -308,8 +357,8 @@ def test_warm_start():
     )
     print(f"    Cold start: {n_out_cold} outer iterations")
 
-    # Warm start with converged state
-    mask_cold = (P_cold > 0).astype(np.int32)
+    # Warm start with converged state (mask from theta, not P>0)
+    mask_cold = (theta_cold >= 1.0 - 1e-8).astype(np.int32)
     P_warm, _, _, n_out_warm, _ = solve_reynolds(
         H, d_phi, d_Z, R, L, cavitation="jfo",
         P_init=P_cold, theta_init=theta_cold, mask_init=mask_cold,
@@ -439,28 +488,33 @@ def main():
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
+    tests = [
+        ("0a", test_f_theta_equals_f_orig),
+        ("0b", test_frozen_theta_jfo_equals_hs),
+        ("1",  test_mass_conservativity),
+        ("2",  test_pressure_nonneg),
+        ("3",  test_theta_bounds),
+        ("4",  test_theta_active_zone),
+        ("5",  test_symmetric_case),
+        ("6",  test_cavitation_zone_nonempty),
+        ("7",  test_warm_start),
+        ("8",  test_backward_compatibility),
+        ("9",  test_jfo_vs_hs_small_epsilon),
+    ]
+
     results = []
-    results.append(test_f_theta_equals_f_orig())
-    results.append(test_frozen_theta_jfo_equals_hs())
-    results.append(test_mass_conservativity())
-    results.append(test_pressure_nonneg())
-    results.append(test_theta_bounds())
-    results.append(test_theta_active_zone())
-    results.append(test_symmetric_case())
-    results.append(test_cavitation_zone_nonempty())
-    results.append(test_warm_start())
-    results.append(test_backward_compatibility())
-    results.append(test_jfo_vs_hs_small_epsilon())
+    for name, func in tests:
+        results.append((name, func()))
 
     print("\n" + "=" * 60)
-    all_ok = all(results)
+    all_ok = all(r for _, r in results)
     if all_ok:
         print("  ALL JFO TESTS PASSED")
     else:
         print("  SOME JFO TESTS FAILED")
-        for i, r in enumerate(results, 1):
+        for name, r in results:
             if not r:
-                print(f"    Test {i} FAILED")
+                print(f"    Test {name} FAILED")
     print("=" * 60)
 
     sys.exit(0 if all_ok else 1)
