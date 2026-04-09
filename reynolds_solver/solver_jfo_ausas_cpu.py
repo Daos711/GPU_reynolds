@@ -254,7 +254,15 @@ def solve_jfo_ausas_cpu(
     n_iter : int (HS + Ausas iterations combined)
     """
     N_Z, N_phi = H.shape
-    H = np.ascontiguousarray(H, dtype=np.float64)
+    # Defensive H ghost packing: ensure column 0 and column N_phi-1 are
+    # proper periodic copies of the physical seam (N_phi-2 and 1). The test
+    # case generator fills these with H(phi=0) = H(phi=2π), which does not
+    # match the ghost-wrap expected by the vectorized coefficient assembly
+    # and produces a ~0.1% error on A[:,N_phi-2] and B[:,1]. Defensive and
+    # safe: if H already satisfies this, it is a no-op.
+    H = np.ascontiguousarray(H, dtype=np.float64).copy()
+    H[:, 0] = H[:, N_phi - 2]
+    H[:, N_phi - 1] = H[:, 1]
 
     A, B, C, D, E = _build_coefficients(H, d_phi, d_Z, R, L)
 
@@ -297,6 +305,9 @@ def solve_jfo_ausas_cpu(
                     print(f"  [HS warmup] CONVERGED at iter={k}, dP={dP:.4e}")
                 break
 
+    if verbose:
+        print(f"  [HS warmup DONE] n_iter={n_iter}, maxP={P.max():.4e}")
+
     # Ausas relaxation
     residual = 1.0
     for k in range(max_iter):
@@ -307,8 +318,22 @@ def solve_jfo_ausas_cpu(
         n_iter += 1
 
         if verbose and (k % check_every == 0 or k < 5):
+            # Diagnostic: zombie (theta~1 & P~0), full-film (theta~1 & P>0),
+            # cavitation (theta<1), computed on interior only.
+            P_int = P[1:-1, 1:-1]
+            th_int = theta[1:-1, 1:-1]
+            ff_mask = (th_int > 1.0 - 1e-8) & (P_int > 1e-12)
+            zombie_mask = (th_int > 1.0 - 1e-8) & (P_int <= 1e-12)
+            cav_mask = th_int < 1.0 - 1e-8
+            n_ff = int(np.sum(ff_mask))
+            n_zombie = int(np.sum(zombie_mask))
+            n_cav = int(np.sum(cav_mask))
             cav_frac = float(np.mean(theta < 1.0 - 1e-6))
-            print(f"  [Ausas] iter={k:>5d}: residual={residual:.4e}, cav={cav_frac:.3f}, maxP={P.max():.4e}")
+            print(
+                f"  [Ausas] iter={k:>5d}: residual={residual:.4e}, "
+                f"cav={cav_frac:.3f}, maxP={P.max():.4e}, "
+                f"zombie={n_zombie}, ff={n_ff}, cav_n={n_cav}"
+            )
 
         if residual < tol and k > 5:
             if verbose:

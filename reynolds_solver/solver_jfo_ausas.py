@@ -205,6 +205,12 @@ class SolverJFOAusas:
         N_Z, N_phi = self.N_Z, self.N_phi
         flooded_flag = 1 if flooded_ends else 0
 
+        # Defensive H ghost packing: force periodic wrap on columns 0 and
+        # N_phi-1 before computing coefficients. Matches the CPU reference.
+        H_gpu = H_gpu.copy()
+        H_gpu[:, 0] = H_gpu[:, N_phi - 2]
+        H_gpu[:, N_phi - 1] = H_gpu[:, 1]
+
         # Compute Ausas stencil coefficients (average-of-cubes conductance)
         # and cell-centered HS warmup RHS.
         A, B, C, D, E, F_hs = _compute_ausas_coefficients_gpu(
