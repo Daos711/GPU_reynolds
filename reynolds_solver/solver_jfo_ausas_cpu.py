@@ -183,23 +183,31 @@ def _build_coefficients(H, d_phi, d_Z, R, L):
     C_{i,j} = alpha_sq * 0.5 * (h^3_{i,j}   + h^3_{i+1,j}),  Z face (+)
     D_{i,j} = alpha_sq * 0.5 * (h^3_{i-1,j} + h^3_{i,j}  ),  Z face (-)
     E = A + B + C + D
+
+    Requires H to be ghost-packed (H[:, 0] = H[:, N_phi-2],
+    H[:, N_phi-1] = H[:, 1]) so that the wrap-around face at j=1/j=N_phi-2
+    is computed from the correct physical neighbours.
     """
     N_Z, N_phi = H.shape
     alpha_sq = (2.0 * R / L * d_phi / d_Z) ** 2
 
-    # phi-direction face conductance (average of cubes, NOT cube of average)
+    # phi-direction face conductance (average of cubes, NOT cube of average).
+    # Ah[:, k] = face between cells k and k+1, for k in [0, N_phi-2].
     Ah = 0.5 * (H[:, :-1] ** 3 + H[:, 1:] ** 3)     # shape (N_Z, N_phi-1)
-    Bh = np.empty_like(Ah)
-    Bh[:, 1:] = Ah[:, :-1]
-    Bh[:, 0] = Ah[:, -1]
 
     A = np.zeros((N_Z, N_phi))
+    # A[:, j] is the "plus" face of cell j: face between j and j+1 = Ah[:, j].
+    # Correct for physical j in [1, N_phi-3]. For j=N_phi-2 the wrap to jp=1
+    # is provided by the ghost H[:, N_phi-1] = H[:, 1] inside Ah[:, N_phi-2].
     A[:, :-1] = Ah
-    A[:, -1] = Ah[:, 0]
+    A[:, -1] = Ah[:, 0]   # ghost col (unused by the sweep)
 
     B = np.zeros((N_Z, N_phi))
-    B[:, 1:] = Bh
-    B[:, 0] = Bh[:, -1]
+    # B[:, j] is the "minus" face of cell j: face between j-1 and j = Ah[:, j-1].
+    # Correct for physical j in [2, N_phi-2]. For j=1 the wrap to jm=N_phi-2
+    # is provided by the ghost H[:, 0] = H[:, N_phi-2] inside Ah[:, 0].
+    B[:, 1:] = Ah
+    B[:, 0] = Ah[:, -1]   # ghost col (unused by the sweep)
 
     # Z-direction face conductance (average of cubes)
     H_jph3 = 0.5 * (H[:-1, :] ** 3 + H[1:, :] ** 3)  # shape (N_Z-1, N_phi)

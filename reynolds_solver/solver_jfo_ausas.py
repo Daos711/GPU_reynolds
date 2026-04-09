@@ -53,18 +53,20 @@ def _compute_ausas_coefficients_gpu(H_gpu, d_phi, d_Z, R, L):
 
     H3 = H_gpu ** 3
 
-    # phi-direction face conductance (average of cubes)
+    # phi-direction face conductance (average of cubes).
+    # Ah[:, k] = face between cells k and k+1, for k in [0, N_phi-2].
+    # Requires H_gpu to be ghost-packed so the wrap-around face at
+    # j=1/j=N_phi-2 is computed from the correct physical neighbours.
     Ah = 0.5 * (H3[:, :-1] + H3[:, 1:])           # shape (N_Z, N_phi-1)
-    Bh = cp.empty_like(Ah)
-    Bh[:, 1:] = Ah[:, :-1]
-    Bh[:, 0] = Ah[:, -1]
 
     A = cp.zeros((N_Z, N_phi), dtype=cp.float64)
     B = cp.zeros((N_Z, N_phi), dtype=cp.float64)
+    # A[:, j] = Ah[:, j] = face between j and j+1 (plus face of cell j).
     A[:, :-1] = Ah
-    A[:, -1] = Ah[:, 0]
-    B[:, 1:] = Bh
-    B[:, 0] = Bh[:, -1]
+    A[:, -1] = Ah[:, 0]   # ghost col (unused by the sweep)
+    # B[:, j] = Ah[:, j-1] = face between j-1 and j (minus face of cell j).
+    B[:, 1:] = Ah
+    B[:, 0] = Ah[:, -1]   # ghost col (unused by the sweep)
 
     # Z-direction face conductance (average of cubes)
     H_jph3 = 0.5 * (H3[:-1, :] + H3[1:, :])       # shape (N_Z-1, N_phi)
