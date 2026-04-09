@@ -77,6 +77,14 @@ def solve_reynolds(
     run_theta_sweep: bool = True,
     # JFO diagnostic
     jfo_return_rhs: bool = False,
+    # Ausas-style JFO parameters
+    jfo_ausas_omega_p: float = 1.0,
+    jfo_ausas_omega_theta: float = 1.0,
+    jfo_ausas_omega_hs: float = 1.7,
+    jfo_ausas_max_iter: int = 50000,
+    jfo_ausas_check_every: int = 50,
+    jfo_ausas_hs_warmup_iter: int = 2000,
+    jfo_ausas_hs_warmup_tol: float = 1e-7,
     # Piezoviscous parameters
     alpha_pv: float = None,
     p_scale: float = None,
@@ -317,8 +325,30 @@ def solve_reynolds(
             return_rhs=jfo_return_rhs,
         )
 
+    elif cavitation == "jfo_ausas":
+        if closure != "laminar":
+            raise NotImplementedError(
+                "cavitation='jfo_ausas' is only supported with closure='laminar'."
+            )
+
+        from reynolds_solver.solver_jfo_ausas import solve_reynolds_gpu_jfo_ausas
+        return solve_reynolds_gpu_jfo_ausas(
+            H, d_phi, d_Z, R, L,
+            omega_p=jfo_ausas_omega_p,
+            omega_theta=jfo_ausas_omega_theta,
+            omega_hs=jfo_ausas_omega_hs,
+            tol=tol,
+            max_iter=jfo_ausas_max_iter,
+            check_every=jfo_ausas_check_every,
+            hs_warmup_iter=jfo_ausas_hs_warmup_iter,
+            hs_warmup_tol=jfo_ausas_hs_warmup_tol,
+            P_init=P_init,
+            theta_init=theta_init,
+            verbose=verbose,
+        )
+
     else:
         raise NotImplementedError(
             f"cavitation='{cavitation}' not implemented. "
-            "Supported: 'half_sommerfeld', 'jfo'."
+            "Supported: 'half_sommerfeld', 'jfo', 'jfo_ausas'."
         )
