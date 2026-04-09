@@ -85,6 +85,7 @@ def solve_reynolds(
     jfo_ausas_check_every: int = 50,
     jfo_ausas_hs_warmup_iter: int = 2000,
     jfo_ausas_hs_warmup_tol: float = 1e-7,
+    jfo_ausas_flooded_ends: bool = True,
     # Piezoviscous parameters
     alpha_pv: float = None,
     p_scale: float = None,
@@ -344,6 +345,7 @@ def solve_reynolds(
             hs_warmup_tol=jfo_ausas_hs_warmup_tol,
             P_init=P_init,
             theta_init=theta_init,
+            flooded_ends=jfo_ausas_flooded_ends,
             verbose=verbose,
         )
 

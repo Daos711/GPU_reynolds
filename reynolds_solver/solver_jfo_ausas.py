@@ -27,7 +27,65 @@ from reynolds_solver.kernels import (
     get_rb_sor_kernel,
     get_apply_bc_kernel,
 )
-from reynolds_solver.utils import precompute_coefficients_gpu
+
+
+def _compute_ausas_coefficients_gpu(H_gpu, d_phi, d_Z, R, L):
+    """
+    Compute Ausas discretization coefficients on GPU (average-of-cubes).
+
+    A_{i,j} = 0.5 * (h^3_{i,j}   + h^3_{i,j+1}),       phi face (+)
+    B_{i,j} = 0.5 * (h^3_{i,j-1} + h^3_{i,j}  ),       phi face (-)
+    C_{i,j} = alpha_sq * 0.5 * (h^3_{i,j}   + h^3_{i+1,j}),  Z face (+)
+    D_{i,j} = alpha_sq * 0.5 * (h^3_{i-1,j} + h^3_{i,j}  ),  Z face (-)
+    E = A + B + C + D
+    alpha_sq = (2R/L * d_phi/d_Z)^2
+
+    Also builds F_hs, the HS-warmup RHS with cell-centered upwind dh/dphi:
+        F_hs[i, j] = d_phi * (h_{i,j} - h_{i,j-1})
+    (periodic in j).
+
+    Returns
+    -------
+    A, B, C, D, E, F_hs : cupy.ndarray, shape (N_Z, N_phi), float64
+    """
+    N_Z, N_phi = H_gpu.shape
+    alpha_sq = (2.0 * R / L * d_phi / d_Z) ** 2
+
+    H3 = H_gpu ** 3
+
+    # phi-direction face conductance (average of cubes)
+    Ah = 0.5 * (H3[:, :-1] + H3[:, 1:])           # shape (N_Z, N_phi-1)
+    Bh = cp.empty_like(Ah)
+    Bh[:, 1:] = Ah[:, :-1]
+    Bh[:, 0] = Ah[:, -1]
+
+    A = cp.zeros((N_Z, N_phi), dtype=cp.float64)
+    B = cp.zeros((N_Z, N_phi), dtype=cp.float64)
+    A[:, :-1] = Ah
+    A[:, -1] = Ah[:, 0]
+    B[:, 1:] = Bh
+    B[:, 0] = Bh[:, -1]
+
+    # Z-direction face conductance (average of cubes)
+    H_jph3 = 0.5 * (H3[:-1, :] + H3[1:, :])       # shape (N_Z-1, N_phi)
+
+    C = cp.zeros((N_Z, N_phi), dtype=cp.float64)
+    D = cp.zeros((N_Z, N_phi), dtype=cp.float64)
+    C[1:-1, :] = alpha_sq * H_jph3[1:, :]
+    D[1:-1, :] = alpha_sq * H_jph3[:-1, :]
+
+    E = A + B + C + D
+
+    # HS warmup RHS: cell-centered upwind F_hs[i, j] = d_phi * (h_{i,j} - h_{i,j-1})
+    F_hs = cp.zeros((N_Z, N_phi), dtype=cp.float64)
+    # j = 1 wraps to jm = N_phi - 2
+    F_hs[:, 1] = d_phi * (H_gpu[:, 1] - H_gpu[:, N_phi - 2])
+    # j = 2 .. N_phi - 2: jm = j - 1
+    F_hs[:, 2:N_phi - 1] = d_phi * (
+        H_gpu[:, 2:N_phi - 1] - H_gpu[:, 1:N_phi - 2]
+    )
+
+    return A, B, C, D, E, F_hs
 
 
 class SolverJFOAusas:
@@ -60,9 +118,8 @@ class SolverJFOAusas:
         self._D = cp.empty(shape, dtype=cp.float64)
         self._E = cp.empty(shape, dtype=cp.float64)
 
-        # Face H buffers
-        self._H_face_p = cp.empty(shape, dtype=cp.float64)
-        self._H_face_m = cp.empty(shape, dtype=cp.float64)
+        # Cell-centered gap buffer (used by ausas_rb_step for mass content)
+        self._H = cp.empty(shape, dtype=cp.float64)
 
         # CUDA launch config for interior points
         self._block = (32, 8, 1)
@@ -76,7 +133,8 @@ class SolverJFOAusas:
         self._bc_block = (256, 1, 1)
         self._bc_grid = ((max_dim + 255) // 256, 1, 1)
 
-    def _run_color_pass(self, kernel, bc_kernel, d_phi, omega_p, omega_theta, color):
+    def _run_color_pass(self, kernel, bc_kernel, d_phi,
+                        omega_p, omega_theta, color, flooded_ends):
         """Run one color (red/black) pass + BC sync."""
         N_Z, N_phi = self.N_Z, self.N_phi
         kernel(
@@ -84,7 +142,7 @@ class SolverJFOAusas:
             (
                 self._P, self._theta,
                 self._A, self._B, self._C, self._D, self._E,
-                self._H_face_p, self._H_face_m,
+                self._H,
                 np.int32(N_Z), np.int32(N_phi),
                 np.float64(d_phi),
                 np.float64(omega_p), np.float64(omega_theta),
@@ -93,7 +151,9 @@ class SolverJFOAusas:
         )
         bc_kernel(
             self._bc_grid, self._bc_block,
-            (self._P, self._theta, np.int32(N_Z), np.int32(N_phi)),
+            (self._P, self._theta,
+             np.int32(N_Z), np.int32(N_phi),
+             np.int32(flooded_ends)),
         )
 
     def solve(
@@ -109,6 +169,7 @@ class SolverJFOAusas:
         hs_warmup_tol=1e-7,
         P_init=None,
         theta_init=None,
+        flooded_ends=True,
         verbose=False,
     ):
         """
@@ -130,6 +191,8 @@ class SolverJFOAusas:
         hs_warmup_iter : int — max HS warmup iterations (0 to skip)
         hs_warmup_tol : float — HS warmup convergence tolerance
         P_init, theta_init : array-like or None — warm start
+        flooded_ends : bool — if True (default), force theta=1 on Z boundaries
+            (flooded bearing); otherwise clamp theta to [0, 1].
         verbose : bool
 
         Returns
@@ -140,20 +203,21 @@ class SolverJFOAusas:
         n_iter : int (HS warmup + Ausas combined)
         """
         N_Z, N_phi = self.N_Z, self.N_phi
+        flooded_flag = 1 if flooded_ends else 0
 
-        # Precompute stencil coefficients and F_orig (for HS warmup)
-        A, B, C, D, E, F_orig = precompute_coefficients_gpu(H_gpu, d_phi, d_Z, R, L)
+        # Compute Ausas stencil coefficients (average-of-cubes conductance)
+        # and cell-centered HS warmup RHS.
+        A, B, C, D, E, F_hs = _compute_ausas_coefficients_gpu(
+            H_gpu, d_phi, d_Z, R, L
+        )
         self._A[:] = A
         self._B[:] = B
         self._C[:] = C
         self._D[:] = D
         self._E[:] = E
 
-        # Precompute face H values for upwind RHS
-        self._H_face_p[:, :-1] = 0.5 * (H_gpu[:, :-1] + H_gpu[:, 1:])
-        self._H_face_p[:, -1] = 0.5 * (H_gpu[:, -1] + H_gpu[:, 0])
-        self._H_face_m[:, 1:] = self._H_face_p[:, :-1]
-        self._H_face_m[:, 0] = self._H_face_p[:, -1]
+        # Store cell-centered H for the Ausas kernel
+        self._H[:] = H_gpu
 
         # Initialize P
         if P_init is not None:
@@ -183,6 +247,9 @@ class SolverJFOAusas:
         # Apply initial BCs
         self._P[0, :] = 0.0
         self._P[-1, :] = 0.0
+        if flooded_ends:
+            self._theta[0, :] = 1.0
+            self._theta[-1, :] = 1.0
 
         ausas_kernel = get_ausas_rb_kernel()
         bc_kernel = get_apply_bc_ausas_kernel()
@@ -191,9 +258,10 @@ class SolverJFOAusas:
 
         n_iter = 0
 
-        # HS warmup: solve P with theta=1 fixed (only if no warm-start P)
+        # HS warmup: solve P with theta=1 fixed (only if no warm-start P).
+        # Uses F_hs built with cell-centered upwind dh/dphi.
         if hs_warmup_iter > 0 and P_init is None:
-            F_warmup = cp.asarray(F_orig, dtype=cp.float64)
+            F_warmup = F_hs
             for k in range(hs_warmup_iter):
                 P_before = self._P.copy()
                 # Red pass
@@ -235,9 +303,15 @@ class SolverJFOAusas:
             self._theta_old[:] = self._theta
 
             # Red pass
-            self._run_color_pass(ausas_kernel, bc_kernel, d_phi, omega_p, omega_theta, 0)
+            self._run_color_pass(
+                ausas_kernel, bc_kernel, d_phi,
+                omega_p, omega_theta, 0, flooded_flag,
+            )
             # Black pass
-            self._run_color_pass(ausas_kernel, bc_kernel, d_phi, omega_p, omega_theta, 1)
+            self._run_color_pass(
+                ausas_kernel, bc_kernel, d_phi,
+                omega_p, omega_theta, 1, flooded_flag,
+            )
 
             n_iter += 1
 
@@ -294,6 +368,7 @@ def solve_reynolds_gpu_jfo_ausas(
     hs_warmup_tol: float = 1e-7,
     P_init=None,
     theta_init=None,
+    flooded_ends: bool = True,
     verbose: bool = False,
 ) -> tuple:
     """
@@ -323,5 +398,6 @@ def solve_reynolds_gpu_jfo_ausas(
         hs_warmup_tol=hs_warmup_tol,
         P_init=P_init,
         theta_init=theta_init,
+        flooded_ends=flooded_ends,
         verbose=verbose,
     )

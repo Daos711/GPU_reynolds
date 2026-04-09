@@ -8,16 +8,17 @@ Cavitation", ASME J. Tribology, 131(3), 031702.
 This is the splitting-free version that updates P and theta at each
 node simultaneously with complementarity check (Table 1 of the paper).
 
-Discretization is consistent with precompute_coefficients_gpu():
+Discretization (Ausas eq. 13, cell-centered mass content):
   A*P_{j+1} + B*P_{j-1} + C*P_{i+1} + D*P_{i-1} - E*P_{i,j} = F_theta
-where
-  A = H_face_p^3 (j+1/2)
-  B = H_face_m^3 (j-1/2)
-  C = alpha_sq * H_jph^3 (i+1/2)
-  D = alpha_sq * H_jmh^3 (i-1/2)
+where (average-of-cubes conductance):
+  A = 0.5 * (h^3_{i,j}   + h^3_{i,j+1}) at phi face +
+  B = 0.5 * (h^3_{i,j-1} + h^3_{i,j}  ) at phi face -
+  C = alpha_sq * 0.5 * (h^3_{i,j}   + h^3_{i+1,j}) at Z face +
+  D = alpha_sq * 0.5 * (h^3_{i-1,j} + h^3_{i,j}  ) at Z face -
   E = A + B + C + D
-  F_theta = d_phi * (H_face_p * theta_{i,j} - H_face_m * theta_{i,j-1})
-  alpha_sq = (D/L * d_phi/d_Z)^2
+  alpha_sq = (2R/L * d_phi/d_Z)^2
+and the (upwind) mass-content RHS uses cell-centered h (NOT face):
+  F_theta = d_phi * (h_{i,j} * theta_{i,j} - h_{i,j-1} * theta_{i,j-1})
 
 Per-node update rule:
   Branch 1: if (P > 0 OR theta == 1):
@@ -67,11 +68,13 @@ def _hs_sor_sweep(P, A, B, C, D, E, F_hs, omega, N_Z, N_phi):
 
 
 @njit(cache=True)
-def _ausas_relax_sweep(P, theta, A, B, C, D, E, H_face_p, H_face_m,
-                       d_phi, omega_p, omega_theta, N_Z, N_phi):
+def _ausas_relax_sweep(P, theta, H, A, B, C, D, E,
+                       d_phi, omega_p, omega_theta, N_Z, N_phi, flooded_ends):
     """
     One full lexicographic Gauss-Seidel sweep (Ausas update rule).
     Returns sqrt(sum dP^2) + sqrt(sum dth^2) over interior nodes.
+
+    Mass content is cell-centered: c_{i,j} = theta_{i,j} * h_{i,j} (NOT face).
     """
     dP_sum = 0.0
     dth_sum = 0.0
@@ -83,8 +86,8 @@ def _ausas_relax_sweep(P, theta, A, B, C, D, E, H_face_p, H_face_m,
 
             P_old = P[i, j]
             th_old = theta[i, j]
-            H_jp = H_face_p[i, j]
-            H_jm = H_face_m[i, j]
+            h_ij = H[i, j]
+            h_jm = H[i, jm]
             th_up = theta[i, jm]
 
             A_l = A[i, j]
@@ -103,8 +106,9 @@ def _ausas_relax_sweep(P, theta, A, B, C, D, E, H_face_p, H_face_m,
 
             # Branch 1: pressure update if was full-film
             if P_old > 0.0 or th_old >= 1.0 - 1e-12:
-                # Convention: full-film means theta_{i,j} = 1 in the upwind RHS
-                F_full = d_phi * (H_jp - H_jm * th_up)
+                # Cell-centered mass content with theta_{i,j} = 1 locally:
+                # F_full = d_phi * (h_{i,j} * 1 - h_{i,j-1} * theta_{i,j-1})
+                F_full = d_phi * (h_ij - h_jm * th_up)
                 P_trial = (
                     A_l * Pjp + B_l * Pjm + C_l * Pip + D_l * Pim - F_full
                 ) / (E_l + 1e-30)
@@ -119,12 +123,12 @@ def _ausas_relax_sweep(P, theta, A, B, C, D, E, H_face_p, H_face_m,
 
             # Branch 2: theta update if cavitation or partial
             if P_cur <= 0.0 or th_cur < 1.0 - 1e-12:
-                # From mass balance, solve for theta_{i,j}:
-                # d_phi*H_jp*theta_{i,j} = stencil(P) - E*P_cur + d_phi*H_jm*th_up
+                # Cell-centered mass balance, solve for theta_{i,j}:
+                # d_phi*h_{i,j}*theta_{i,j} = stencil(P) - E*P_cur + d_phi*h_{i,j-1}*th_up
                 stencil = (
                     A_l * Pjp + B_l * Pjm + C_l * Pip + D_l * Pim - E_l * P_cur
                 )
-                Theta_trial = (stencil + d_phi * H_jm * th_up) / (d_phi * H_jp + 1e-30)
+                Theta_trial = (stencil + d_phi * h_jm * th_up) / (d_phi * h_ij + 1e-30)
                 th_new = omega_theta * Theta_trial + (1.0 - omega_theta) * th_cur
 
                 if th_new < 1.0:
@@ -149,33 +153,42 @@ def _ausas_relax_sweep(P, theta, A, B, C, D, E, H_face_p, H_face_m,
         theta[i, 0] = theta[i, N_phi - 2]
         theta[i, N_phi - 1] = theta[i, 1]
 
-    # Z boundaries: Dirichlet P=0, theta clamped (NOT forced to 1)
+    # Z boundaries: Dirichlet P=0; theta=1 for flooded bearing (default),
+    # otherwise clamped to [0, 1].
     for j in range(N_phi):
         P[0, j] = 0.0
         P[N_Z - 1, j] = 0.0
-        if theta[0, j] < 0.0:
-            theta[0, j] = 0.0
-        elif theta[0, j] > 1.0:
+        if flooded_ends != 0:
             theta[0, j] = 1.0
-        if theta[N_Z - 1, j] < 0.0:
-            theta[N_Z - 1, j] = 0.0
-        elif theta[N_Z - 1, j] > 1.0:
             theta[N_Z - 1, j] = 1.0
+        else:
+            if theta[0, j] < 0.0:
+                theta[0, j] = 0.0
+            elif theta[0, j] > 1.0:
+                theta[0, j] = 1.0
+            if theta[N_Z - 1, j] < 0.0:
+                theta[N_Z - 1, j] = 0.0
+            elif theta[N_Z - 1, j] > 1.0:
+                theta[N_Z - 1, j] = 1.0
 
     return np.sqrt(dP_sum) + np.sqrt(dth_sum)
 
 
 def _build_coefficients(H, d_phi, d_Z, R, L):
-    """Build A, B, C, D, E and face-H values matching precompute_coefficients_gpu."""
+    """
+    Build Ausas A, B, C, D, E with average-of-cubes conductance (Ausas eq. 13).
+
+    A_{i,j} = 0.5 * (h^3_{i,j}   + h^3_{i,j+1}),   phi face (+)
+    B_{i,j} = 0.5 * (h^3_{i,j-1} + h^3_{i,j}  ),   phi face (-)
+    C_{i,j} = alpha_sq * 0.5 * (h^3_{i,j}   + h^3_{i+1,j}),  Z face (+)
+    D_{i,j} = alpha_sq * 0.5 * (h^3_{i-1,j} + h^3_{i,j}  ),  Z face (-)
+    E = A + B + C + D
+    """
     N_Z, N_phi = H.shape
     alpha_sq = (2.0 * R / L * d_phi / d_Z) ** 2
 
-    H_iph = 0.5 * (H[:, :-1] + H[:, 1:])
-    H_imh = np.empty_like(H_iph)
-    H_imh[:, 1:] = H_iph[:, :-1]
-    H_imh[:, 0] = H_iph[:, -1]
-
-    Ah = H_iph ** 3
+    # phi-direction face conductance (average of cubes, NOT cube of average)
+    Ah = 0.5 * (H[:, :-1] ** 3 + H[:, 1:] ** 3)     # shape (N_Z, N_phi-1)
     Bh = np.empty_like(Ah)
     Bh[:, 1:] = Ah[:, :-1]
     Bh[:, 0] = Ah[:, -1]
@@ -188,8 +201,8 @@ def _build_coefficients(H, d_phi, d_Z, R, L):
     B[:, 1:] = Bh
     B[:, 0] = Bh[:, -1]
 
-    H_jph = 0.5 * (H[:-1, :] + H[1:, :])
-    H_jph3 = H_jph ** 3
+    # Z-direction face conductance (average of cubes)
+    H_jph3 = 0.5 * (H[:-1, :] ** 3 + H[1:, :] ** 3)  # shape (N_Z-1, N_phi)
 
     C = np.zeros((N_Z, N_phi))
     D = np.zeros((N_Z, N_phi))
@@ -198,16 +211,7 @@ def _build_coefficients(H, d_phi, d_Z, R, L):
 
     E = A + B + C + D
 
-    # Face H values for the upwind RHS (matching solver_jfo.py face H)
-    H_face_p = np.zeros((N_Z, N_phi))
-    H_face_p[:, :-1] = H_iph
-    H_face_p[:, -1] = 0.5 * (H[:, -1] + H[:, 0])
-
-    H_face_m = np.zeros((N_Z, N_phi))
-    H_face_m[:, 1:] = H_face_p[:, :-1]
-    H_face_m[:, 0] = H_face_p[:, -1]
-
-    return A, B, C, D, E, H_face_p, H_face_m
+    return A, B, C, D, E
 
 
 def solve_jfo_ausas_cpu(
@@ -216,7 +220,9 @@ def solve_jfo_ausas_cpu(
     omega_hs=1.7,
     tol=1e-6, max_iter=50000, check_every=50,
     hs_warmup_iter=2000, hs_warmup_tol=1e-7,
-    P_init=None, theta_init=None, verbose=False,
+    P_init=None, theta_init=None,
+    flooded_ends=True,
+    verbose=False,
 ):
     """
     Ausas-style mass-conserving JFO solver — CPU reference (Numba JIT).
@@ -237,6 +243,8 @@ def solve_jfo_ausas_cpu(
     hs_warmup_iter : int — max HS warmup iterations (0 to skip)
     hs_warmup_tol : float — HS warmup convergence tolerance
     P_init, theta_init : (N_Z, N_phi) float64 or None — warm start
+    flooded_ends : bool — if True (default, flooded bearing) force theta=1
+        on Z boundaries; otherwise clamp theta to [0, 1] without forcing.
     verbose : bool
 
     Returns
@@ -246,8 +254,9 @@ def solve_jfo_ausas_cpu(
     n_iter : int (HS + Ausas iterations combined)
     """
     N_Z, N_phi = H.shape
+    H = np.ascontiguousarray(H, dtype=np.float64)
 
-    A, B, C, D, E, H_face_p, H_face_m = _build_coefficients(H, d_phi, d_Z, R, L)
+    A, B, C, D, E = _build_coefficients(H, d_phi, d_Z, R, L)
 
     if P_init is not None:
         P = np.maximum(P_init.copy().astype(np.float64), 0.0)
@@ -261,16 +270,22 @@ def solve_jfo_ausas_cpu(
 
     P[0, :] = 0.0
     P[-1, :] = 0.0
+    if flooded_ends:
+        theta[0, :] = 1.0
+        theta[-1, :] = 1.0
+
+    flooded_flag = 1 if flooded_ends else 0
 
     n_iter = 0
 
-    # HS warmup: solve P with theta=1 fixed (only if no warm start P provided)
+    # HS warmup: solve P with theta=1 fixed (only if no warm start P provided).
+    # RHS uses cell-centered upwind mass content: F_hs = d_phi*(h_{i,j} - h_{i,j-1}).
     if hs_warmup_iter > 0 and P_init is None:
         F_hs = np.zeros((N_Z, N_phi), dtype=np.float64)
         for i in range(1, N_Z - 1):
             for j in range(1, N_phi - 1):
                 jm = j - 1 if j - 1 >= 1 else N_phi - 2
-                F_hs[i, j] = d_phi * (H_face_p[i, j] - H_face_m[i, j])
+                F_hs[i, j] = d_phi * (H[i, j] - H[i, jm])
 
         for k in range(hs_warmup_iter):
             dP = _hs_sor_sweep(P, A, B, C, D, E, F_hs, omega_hs, N_Z, N_phi)
@@ -286,8 +301,8 @@ def solve_jfo_ausas_cpu(
     residual = 1.0
     for k in range(max_iter):
         residual = _ausas_relax_sweep(
-            P, theta, A, B, C, D, E, H_face_p, H_face_m,
-            d_phi, omega_p, omega_theta, N_Z, N_phi,
+            P, theta, H, A, B, C, D, E,
+            d_phi, omega_p, omega_theta, N_Z, N_phi, flooded_flag,
         )
         n_iter += 1
 
