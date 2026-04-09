@@ -11,11 +11,11 @@ single Δτ that:
   * converges warm and cold starts to the SAME state.
 
 Run:
-    python -m reynolds_solver.diag_pt_sweep
+    python -m reynolds_solver.experiments.diagnostics.diag_pt_sweep
 """
 import numpy as np
 
-from reynolds_solver.diagnostic_ausas_seam import pt_trace
+from reynolds_solver.experiments.diagnostics.diagnostic_ausas_seam import pt_trace
 
 
 def run_sweep(

@@ -19,11 +19,11 @@ Checks several hypotheses from the Ausas validation TЗ:
      a valid fix.
 
 Run:
-    python -m reynolds_solver.diagnostic_ausas_seam
+    python -m reynolds_solver.experiments.diagnostics.diagnostic_ausas_seam
 """
 import numpy as np
 
-from reynolds_solver.solver_jfo_ausas_cpu import (
+from reynolds_solver.cavitation.ausas.solver_cpu import (
     _build_coefficients,
     _hs_sor_sweep,
     _ausas_relax_sweep,

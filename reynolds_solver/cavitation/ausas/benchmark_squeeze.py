@@ -43,7 +43,7 @@ Solver strategy (per time step)
       solution symmetric around x = 0.5.
 
 Run:
-    python -m reynolds_solver.benchmark_squeeze
+    python -m reynolds_solver.cavitation.ausas.benchmark_squeeze
 """
 import numpy as np
 from numba import njit

@@ -9,7 +9,7 @@ Run:
 
 import numpy as np
 from reynolds_solver import solve_reynolds
-from reynolds_solver.solver_jfo import solve_reynolds_gpu_jfo
+from reynolds_solver.cavitation.legacy.solver_jfo import solve_reynolds_gpu_jfo
 from reynolds_solver.physics.closures import LaminarClosure
 
 

@@ -40,7 +40,7 @@ def generate_test_case(N_phi, N_Z, epsilon=0.6):
 # -----------------------------------------------------------------------
 def test_cpu_reference():
     print("\n=== Test 0: CPU reference (ε=0.6) ===")
-    from reynolds_solver.solver_jfo_ausas_cpu import solve_jfo_ausas_cpu
+    from reynolds_solver.cavitation.ausas.solver_cpu import solve_jfo_ausas_cpu
 
     R, L = 0.035, 0.056
     N_phi, N_Z = 100, 40
@@ -175,7 +175,7 @@ def test_invariants():
 def test_gpu_vs_cpu():
     print("\n=== Test 4: GPU vs CPU reference (ε=0.6) ===")
     from reynolds_solver import solve_reynolds
-    from reynolds_solver.solver_jfo_ausas_cpu import solve_jfo_ausas_cpu
+    from reynolds_solver.cavitation.ausas.solver_cpu import solve_jfo_ausas_cpu
 
     R, L = 0.035, 0.056
     N_phi, N_Z = 100, 40
