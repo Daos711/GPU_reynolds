@@ -1,15 +1,22 @@
 """
 Diagnostic for the Ausas-JFO CPU solver.
 
-Checks two hypotheses from the Ausas validation TЗ:
+Checks several hypotheses from the Ausas validation TЗ:
 
   A. Periodic-seam inconsistency in H during coefficient assembly.
      Compares vectorized `_build_coefficients()` with an explicit
      jm/jp-wrap loop, element-by-element on the interior.
 
-  B. Cascade collapse: runs the HS warmup alone, then a fixed number of
-     Ausas sweeps and prints per-iteration {maxP, cav_frac, zombie, ff,
-     cav_nodes}, where zombie = interior cells with (θ ≈ 1, P ≈ 0).
+  B. Cascade collapse / slow drift with the in-place GS scheme: runs the
+     HS warmup alone, then a fixed number of Ausas sweeps and prints
+     per-iteration {maxP, cav_frac, zombie, ff, cav_nodes}.
+
+  D. Frozen-iterate (Jacobi) sweep: same trace, but with the new
+     `_ausas_relax_sweep_jacobi`. Two starts:
+        - HS-warm: HS warmup → Jacobi
+        - Cold:    P=0, θ=1 → Jacobi (no HS warmup)
+     Both starts should converge to the same physical state if Jacobi is
+     a valid fix.
 
 Run:
     python -m reynolds_solver.diagnostic_ausas_seam
@@ -20,6 +27,7 @@ from reynolds_solver.solver_jfo_ausas_cpu import (
     _build_coefficients,
     _hs_sor_sweep,
     _ausas_relax_sweep,
+    _ausas_relax_sweep_jacobi,
 )
 
 
@@ -214,6 +222,76 @@ def cascade_trace(apply_ghost_pack=True, n_warmup=2000, n_ausas=200,
 
 
 # ----------------------------------------------------------------------------
+# Step D: frozen-iterate (Jacobi) Ausas trace
+# ----------------------------------------------------------------------------
+def jacobi_trace(start="hs_warm", n_warmup=2000, n_jacobi=1000,
+                 omega_p=1.0, omega_theta=1.0, epsilon=0.6):
+    print()
+    print("=" * 60)
+    print(f"Step D: Jacobi trace (start={start}, "
+          f"omega_p={omega_p}, omega_theta={omega_theta}, eps={epsilon})")
+    print("=" * 60)
+
+    R, L = 0.035, 0.056
+    N_phi, N_Z = 100, 40
+    H, d_phi, d_Z = generate_test_case(N_phi, N_Z, epsilon=epsilon)
+    H = pack_ghost(H)
+
+    A, B, C, D, E = _build_coefficients(H, d_phi, d_Z, R, L)
+
+    P = np.zeros((N_Z, N_phi), dtype=np.float64)
+
+    if start == "hs_warm":
+        F_hs = np.zeros((N_Z, N_phi), dtype=np.float64)
+        for i in range(1, N_Z - 1):
+            for j in range(1, N_phi - 1):
+                jm = j - 1 if j - 1 >= 1 else N_phi - 2
+                F_hs[i, j] = d_phi * (H[i, j] - H[i, jm])
+
+        last_dP = 0.0
+        for k in range(n_warmup):
+            last_dP = _hs_sor_sweep(P, A, B, C, D, E, F_hs, 1.7, N_Z, N_phi)
+            if last_dP < 1e-7 and k > 5:
+                break
+        print(f"  HS warmup done: iter={k}, dP={last_dP:.3e}, "
+              f"maxP={P.max():.4e}")
+    elif start == "cold":
+        print(f"  Cold start: P=0, theta=1, maxP={P.max():.4e}")
+    else:
+        raise ValueError(f"Unknown start: {start}")
+
+    theta = np.ones((N_Z, N_phi), dtype=np.float64)
+    P[0, :] = 0.0
+    P[-1, :] = 0.0
+    theta[0, :] = 1.0
+    theta[-1, :] = 1.0
+    flooded_flag = 1
+
+    P_new = P.copy()
+    theta_new = theta.copy()
+
+    print(f"\n  Jacobi relaxation ({n_jacobi} iters):")
+    print(f"    {'iter':>5s}  {'residual':>12s}  {'maxP':>10s}  "
+          f"{'cav_frac':>9s}  {'zombie':>7s}  {'ff':>7s}  {'cav':>7s}")
+    for k in range(n_jacobi):
+        residual = _ausas_relax_sweep_jacobi(
+            P_new, P, theta_new, theta, H, A, B, C, D, E,
+            d_phi, omega_p, omega_theta, N_Z, N_phi, flooded_flag,
+        )
+        # Swap
+        P, P_new = P_new, P
+        theta, theta_new = theta_new, theta
+
+        if k < 5 or k % 50 == 0 or k == n_jacobi - 1:
+            cav_frac = float(np.mean(theta < 1.0 - 1e-6))
+            zombie, ff, cav = count_states(P, theta)
+            print(f"    {k:>5d}  {residual:>12.3e}  {P.max():>10.4e}  "
+                  f"{cav_frac:>9.3f}  {zombie:>7d}  {ff:>7d}  {cav:>7d}")
+
+    return P, theta
+
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 def main():
@@ -233,6 +311,35 @@ def main():
     for omega in (0.7, 0.5, 0.3):
         cascade_trace(apply_ghost_pack=True, n_warmup=2000, n_ausas=200,
                       omega_p=omega, omega_theta=omega)
+
+    # Frozen-iterate (Jacobi) reference: HS-warm and cold starts at ε=0.6.
+    P_warm, th_warm = jacobi_trace(start="hs_warm", n_jacobi=1000,
+                                   omega_p=1.0, omega_theta=1.0,
+                                   epsilon=0.6)
+    P_cold, th_cold = jacobi_trace(start="cold", n_jacobi=1000,
+                                   omega_p=1.0, omega_theta=1.0,
+                                   epsilon=0.6)
+
+    print()
+    print("=" * 60)
+    print("Step D summary: warm vs cold final states (eps=0.6, 1000 iters)")
+    print("=" * 60)
+    print(f"  warm:  maxP={P_warm.max():.4e}, cav_frac="
+          f"{float(np.mean(th_warm < 1.0 - 1e-6)):.3f}")
+    print(f"  cold:  maxP={P_cold.max():.4e}, cav_frac="
+          f"{float(np.mean(th_cold < 1.0 - 1e-6)):.3f}")
+    diff_P = float(np.max(np.abs(P_warm - P_cold)))
+    diff_th = float(np.max(np.abs(th_warm - th_cold)))
+    print(f"  max|P_warm - P_cold| = {diff_P:.3e}")
+    print(f"  max|θ_warm - θ_cold| = {diff_th:.3e}")
+
+    # Quick sanity at ε=0.1: should be close to HS load (test 1's check).
+    print()
+    print("=" * 60)
+    print("Step D sanity at eps=0.1 (Jacobi, HS-warm, 1000 iters)")
+    print("=" * 60)
+    jacobi_trace(start="hs_warm", n_jacobi=1000,
+                 omega_p=1.0, omega_theta=1.0, epsilon=0.1)
 
 
 if __name__ == "__main__":
