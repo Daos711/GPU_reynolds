@@ -292,6 +292,9 @@ def _ausas_relax_sweep_jacobi(P_new, P_old, theta_new, theta_old, H,
                 theta_new[N_Z - 1, j] = 1.0
 
     return np.sqrt(dP_sum) + np.sqrt(dth_sum)
+
+
+def _build_coefficients(H, d_phi, d_Z, R, L):
     """
     Build Ausas A, B, C, D, E with average-of-cubes conductance (Ausas eq. 13).
 
