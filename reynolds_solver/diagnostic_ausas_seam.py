@@ -28,6 +28,7 @@ from reynolds_solver.solver_jfo_ausas_cpu import (
     _hs_sor_sweep,
     _ausas_relax_sweep,
     _ausas_relax_sweep_jacobi,
+    _ausas_relax_sweep_pt,
 )
 
 
@@ -292,6 +293,117 @@ def jacobi_trace(start="hs_warm", n_warmup=2000, n_jacobi=1000,
 
 
 # ----------------------------------------------------------------------------
+# Step E: pseudo-transient (Ausas eq. 12 with time term) trace
+# ----------------------------------------------------------------------------
+def pt_trace(start="hs_warm", n_warmup=2000,
+             dt_pseudo=0.1, max_time_steps=200, max_inner=50,
+             inner_tol=1e-4, omega_p=1.0, omega_theta=1.0, epsilon=0.6):
+    """
+    Pseudo-transient Ausas trace: marches in pseudo-time τ with an inner
+    Jacobi Ausas relaxation at each step. The temporal term
+    β (c^n - c^{n-1}), β = 2 d_phi² / Δτ, anchors θ to the previous time
+    slab and enlarges the θ denominator from d_phi·h_ij to
+    (β + d_phi)·h_ij, damping the drift to the trivial c = θh ≈ const.
+    """
+    print()
+    print("=" * 60)
+    print(
+        f"Step E: pseudo-transient trace "
+        f"(start={start}, dt={dt_pseudo}, "
+        f"ω_p={omega_p}, ω_θ={omega_theta}, eps={epsilon})"
+    )
+    print("=" * 60)
+
+    R, L = 0.035, 0.056
+    N_phi, N_Z = 100, 40
+    H, d_phi, d_Z = generate_test_case(N_phi, N_Z, epsilon=epsilon)
+    H = pack_ghost(H)
+
+    A, B, C, D, E = _build_coefficients(H, d_phi, d_Z, R, L)
+    beta_pt = 2.0 * d_phi * d_phi / dt_pseudo
+    print(f"  d_phi={d_phi:.4f}, d_phi^2={d_phi**2:.4e}, "
+          f"β = 2 d_phi² / dτ = {beta_pt:.4e}")
+
+    P = np.zeros((N_Z, N_phi), dtype=np.float64)
+
+    if start == "hs_warm":
+        F_hs = np.zeros((N_Z, N_phi), dtype=np.float64)
+        for i in range(1, N_Z - 1):
+            for j in range(1, N_phi - 1):
+                jm = j - 1 if j - 1 >= 1 else N_phi - 2
+                F_hs[i, j] = d_phi * (H[i, j] - H[i, jm])
+
+        last_dP = 0.0
+        for k in range(n_warmup):
+            last_dP = _hs_sor_sweep(P, A, B, C, D, E, F_hs, 1.7, N_Z, N_phi)
+            if last_dP < 1e-7 and k > 5:
+                break
+        print(f"  HS warmup done: iter={k}, dP={last_dP:.3e}, "
+              f"maxP={P.max():.4e}")
+    elif start == "cold":
+        print(f"  Cold start: P=0, theta=1, maxP={P.max():.4e}")
+    else:
+        raise ValueError(f"Unknown start: {start}")
+
+    theta = np.ones((N_Z, N_phi), dtype=np.float64)
+    P[0, :] = 0.0
+    P[-1, :] = 0.0
+    theta[0, :] = 1.0
+    theta[-1, :] = 1.0
+    flooded_flag = 1
+
+    P_new = P.copy()
+    theta_new = theta.copy()
+    c_prev = theta * H
+
+    print(
+        f"\n  Pseudo-transient march "
+        f"({max_time_steps} steps × ≤{max_inner} inner):"
+    )
+    print(
+        f"    {'step':>5s}  {'inner_k':>7s}  {'inner_res':>11s}  "
+        f"{'steady':>11s}  {'maxP':>10s}  {'cav_frac':>9s}  "
+        f"{'zombie':>7s}  {'ff':>7s}  {'cav':>7s}"
+    )
+
+    for n_step in range(max_time_steps):
+        P_prev_step = P.copy()
+        theta_prev_step = theta.copy()
+
+        inner_res = 1.0
+        inner_k = 0
+        for inner_k in range(max_inner):
+            inner_res = _ausas_relax_sweep_pt(
+                P_new, P, theta_new, theta, H, c_prev,
+                A, B, C, D, E,
+                d_phi, beta_pt, omega_p, omega_theta,
+                N_Z, N_phi, flooded_flag,
+            )
+            P, P_new = P_new, P
+            theta, theta_new = theta_new, theta
+            if inner_res < inner_tol and inner_k > 2:
+                break
+
+        c_prev = theta * H
+
+        steady_res = (
+            float(np.sqrt(np.sum((P - P_prev_step) ** 2)))
+            + float(np.sqrt(np.sum((theta - theta_prev_step) ** 2)))
+        )
+
+        if n_step < 5 or n_step % 10 == 0 or n_step == max_time_steps - 1:
+            cav_frac = float(np.mean(theta < 1.0 - 1e-6))
+            zombie, ff, cav = count_states(P, theta)
+            print(
+                f"    {n_step:>5d}  {inner_k + 1:>7d}  {inner_res:>11.3e}  "
+                f"{steady_res:>11.3e}  {P.max():>10.4e}  "
+                f"{cav_frac:>9.3f}  {zombie:>7d}  {ff:>7d}  {cav:>7d}"
+            )
+
+    return P, theta
+
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 def main():
@@ -340,6 +452,49 @@ def main():
     print("=" * 60)
     jacobi_trace(start="hs_warm", n_jacobi=1000,
                  omega_p=1.0, omega_theta=1.0, epsilon=0.1)
+
+    # ---- Step E: pseudo-transient Ausas (ε=0.6) ----
+    # Compare warm vs cold at ε=0.6. If PT is a valid fix, both starts
+    # should converge to the SAME stationary state (unlike the
+    # stationary GS/Jacobi solver).
+    P_warm_pt, th_warm_pt = pt_trace(
+        start="hs_warm",
+        dt_pseudo=0.1, max_time_steps=200, max_inner=50,
+        omega_p=1.0, omega_theta=1.0, epsilon=0.6,
+    )
+    P_cold_pt, th_cold_pt = pt_trace(
+        start="cold",
+        dt_pseudo=0.1, max_time_steps=200, max_inner=50,
+        omega_p=1.0, omega_theta=1.0, epsilon=0.6,
+    )
+
+    print()
+    print("=" * 60)
+    print("Step E summary: PT warm vs cold final states (eps=0.6)")
+    print("=" * 60)
+    print(
+        f"  warm:  maxP={P_warm_pt.max():.4e}, cav_frac="
+        f"{float(np.mean(th_warm_pt < 1.0 - 1e-6)):.3f}"
+    )
+    print(
+        f"  cold:  maxP={P_cold_pt.max():.4e}, cav_frac="
+        f"{float(np.mean(th_cold_pt < 1.0 - 1e-6)):.3f}"
+    )
+    diff_P = float(np.max(np.abs(P_warm_pt - P_cold_pt)))
+    diff_th = float(np.max(np.abs(th_warm_pt - th_cold_pt)))
+    print(f"  max|P_warm - P_cold| = {diff_P:.3e}")
+    print(f"  max|θ_warm - θ_cold| = {diff_th:.3e}")
+
+    # PT sanity at ε=0.1.
+    print()
+    print("=" * 60)
+    print("Step E sanity at eps=0.1 (pseudo-transient, HS-warm)")
+    print("=" * 60)
+    pt_trace(
+        start="hs_warm",
+        dt_pseudo=0.1, max_time_steps=200, max_inner=50,
+        omega_p=1.0, omega_theta=1.0, epsilon=0.1,
+    )
 
 
 if __name__ == "__main__":
