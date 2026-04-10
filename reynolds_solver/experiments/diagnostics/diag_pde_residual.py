@@ -182,9 +182,15 @@ def main():
         ax2.grid(True, alpha=0.3)
 
         plt.tight_layout()
-        plt.savefig("pde_residual_breakdown.png", dpi=120)
+        import os
+        out_dir = os.path.join(
+            os.path.dirname(__file__), "..", "..", "..", "results", "payvar_salant"
+        )
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "pde_residual_breakdown.png")
+        plt.savefig(out_path, dpi=120)
         plt.close(fig)
-        print("\n  [plot] saved to: pde_residual_breakdown.png")
+        print(f"\n  [plot] saved to: {out_path}")
     except Exception as e:
         print(f"\n  [plot] skipped: {e}")
 

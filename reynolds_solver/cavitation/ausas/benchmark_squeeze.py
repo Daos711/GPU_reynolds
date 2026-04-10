@@ -614,7 +614,7 @@ def evaluate_success(result):
 # ----------------------------------------------------------------------------
 # Optional plotting
 # ----------------------------------------------------------------------------
-def plot_sigma(result, out_path="squeeze_sigma.png"):
+def plot_sigma(result, out_path=None):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -636,6 +636,13 @@ def plot_sigma(result, out_path="squeeze_sigma.png"):
     ax.legend(loc="lower right")
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
+    if out_path is None:
+        import os
+        out_dir = os.path.join(
+            os.path.dirname(__file__), "..", "..", "..", "results", "ausas"
+        )
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "squeeze_sigma.png")
     plt.savefig(out_path, dpi=120)
     plt.close(fig)
     print(f"  [plot] saved to: {out_path}")

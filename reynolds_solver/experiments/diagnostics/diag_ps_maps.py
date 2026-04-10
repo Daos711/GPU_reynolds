@@ -125,10 +125,16 @@ def plot_one_eps(epsilon, R, L, N_phi, N_Z):
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
+    import os
+    out_dir = os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "results", "payvar_salant"
+    )
+    os.makedirs(out_dir, exist_ok=True)
     fname = f"ps_maps_eps{epsilon:.1f}.png"
-    plt.savefig(fname, dpi=120)
+    out_path = os.path.join(out_dir, fname)
+    plt.savefig(out_path, dpi=120)
     plt.close(fig)
-    print(f"  saved: {fname}  (n_iter={n}, cav_frac={cav_frac:.3f})")
+    print(f"  saved: {out_path}  (n_iter={n}, cav_frac={cav_frac:.3f})")
 
 
 def main():
