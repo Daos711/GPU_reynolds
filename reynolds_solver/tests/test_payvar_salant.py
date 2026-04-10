@@ -128,7 +128,7 @@ def test_invariants_strong_eccentricity():
     p_max = float(P.max())
     th_min = float(theta.min())
     th_max = float(theta.max())
-    cav_frac = float(np.mean(theta < 1.0 - 1e-6))
+    cav_frac = float(np.mean(theta[1:-1, 1:-1] < 1.0 - 1e-6))
 
     # Checkerboard detection: relative L2 norm of the 4-point Laplacian of θ
     # inside the cavitation zone. A smooth field has small high-frequency
@@ -192,7 +192,7 @@ def test_continuation_sweep():
 
         p_ok = (P.min() >= -1e-12) and (P.max() > 1e-3)
         th_ok = (theta.min() >= -1e-12) and (theta.max() <= 1.0 + 1e-12)
-        cav_frac = float(np.mean(theta < 1.0 - 1e-6))
+        cav_frac = float(np.mean(theta[1:-1, 1:-1] < 1.0 - 1e-6))
         maxP = float(P.max())
         converged = res < 1e-3
 
@@ -338,10 +338,36 @@ def test_load_vs_hs_multiple_epsilon():
 
 
 # -----------------------------------------------------------------------
-# Test 6: GPU vs CPU agreement
+# Test 6: API smoke test
+# -----------------------------------------------------------------------
+def test_api_smoke():
+    print("\n=== Test 6: solve_reynolds(..., cavitation='payvar_salant') ===")
+    from reynolds_solver import solve_reynolds
+
+    R, L = 0.035, 0.056
+    H, d_phi, d_Z, _, _ = generate_test_case(50, 30, epsilon=0.3)
+
+    result = solve_reynolds(H, d_phi, d_Z, R, L, cavitation="payvar_salant")
+    P, theta, residual, n_iter = result
+
+    p_ok = P.min() >= -1e-12 and P.max() > 1e-3
+    th_ok = 0 <= theta.min() and theta.max() <= 1.0 + 1e-12
+
+    print(f"    maxP={P.max():.4e}, θ=[{theta.min():.4f}, {theta.max():.4f}], "
+          f"n_iter={n_iter}, res={residual:.2e}")
+
+    return run_test(
+        "API smoke: cavitation='payvar_salant'",
+        p_ok and th_ok,
+        f"maxP={P.max():.2e}, θ_min={theta.min():.4f}",
+    )
+
+
+# -----------------------------------------------------------------------
+# Test 7: GPU vs CPU agreement
 # -----------------------------------------------------------------------
 def test_gpu_vs_cpu():
-    print("\n=== Test 6: GPU vs CPU agreement (ε=0.6) ===")
+    print("\n=== Test 7: GPU vs CPU agreement (ε=0.6) ===")
     from reynolds_solver.cavitation.payvar_salant import solve_payvar_salant_cpu
 
     try:
@@ -409,7 +435,8 @@ def main():
         ("3", test_continuation_sweep),
         ("4", test_two_residuals_and_no_drift),
         ("5", test_load_vs_hs_multiple_epsilon),
-        ("6", test_gpu_vs_cpu),
+        ("6", test_api_smoke),
+        ("7", test_gpu_vs_cpu),
     ]
 
     results = []
@@ -433,7 +460,66 @@ def main():
             if not r:
                 print(f"    Test {name} FAILED")
     print("=" * 60)
+
+    # Diagnostic (informational only, no pass/fail)
+    diag_mass_flux_balance()
+
     sys.exit(0 if all_ok else 1)
+
+
+# -----------------------------------------------------------------------
+# Diagnostic: mass flux balance (prints only, NOT a pass/fail test)
+# -----------------------------------------------------------------------
+def diag_mass_flux_balance():
+    """
+    Print mass flux balance at the Z boundaries vs cavitation deficit.
+
+    For a steady bearing the net axial leakage flux through the two
+    Z-end faces should balance the mass deficit in the cavitation zone.
+    This is a soft sanity check, not a hard assertion.
+    """
+    from reynolds_solver.cavitation.payvar_salant import solve_payvar_salant_cpu
+    from reynolds_solver.cavitation.payvar_salant.solver_cpu import (
+        _build_coefficients,
+    )
+
+    print()
+    print("  ---- Mass flux balance (diagnostic, info only) ----")
+
+    R, L = 0.035, 0.056
+    N_phi, N_Z = 100, 40
+    epsilon = 0.6
+    H, d_phi, d_Z, phi_1D, Z = generate_test_case(N_phi, N_Z, epsilon)
+
+    P, theta, res, n = solve_payvar_salant_cpu(
+        H, d_phi, d_Z, R, L, tol=1e-7, max_iter=20000,
+    )
+
+    H_pack = H.copy()
+    H_pack[:, 0] = H_pack[:, -2]
+    H_pack[:, -1] = H_pack[:, 1]
+    A, B, C, D, E = _build_coefficients(H_pack, d_phi, d_Z, R, L)
+
+    # Axial flux through Z=0 face (row i=1, leaking into the bearing)
+    # flux_z0[j] = C[1,j] * P[1,j] (approx: face gradient × conductance)
+    # ... summing the Z-gradient pressure flux at the two Z ends.
+    # dP/dZ at Z=0 ≈ (P[1,j] - P[0,j]) / d_Z = P[1,j] / d_Z
+    # Flux per unit phi = h³_face * dP/dZ
+    # We approximate using coefficient D which = alpha_sq * 0.5*(h³[0]+h³[1])
+    flux_z0 = float(np.sum(D[1, :] * P[1, :]))
+    flux_zL = float(np.sum(C[-2, :] * P[-2, :]))
+    total_flux_in = flux_z0 + flux_zL
+
+    # Mass deficit in cavitation zone: sum of (1 - θ) * h * dφ * dZ
+    deficit = float(np.sum((1.0 - theta[1:-1, 1:-1]) * H_pack[1:-1, 1:-1])
+                    * d_phi * d_Z)
+
+    print(f"  flux_in (Z ends):   {total_flux_in:.4e}")
+    print(f"  cav mass deficit:   {deficit:.4e}")
+    if abs(total_flux_in) > 1e-12:
+        ratio = deficit / total_flux_in
+        print(f"  deficit / flux_in:  {ratio:.4f}")
+    print("  (These should be O(1) of each other for a balanced solution)")
 
 
 if __name__ == "__main__":

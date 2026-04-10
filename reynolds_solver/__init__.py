@@ -16,7 +16,7 @@ Subpackages:
     dynamic/            — unsteady / squeeze Reynolds solvers
     piezoviscous/       — Barus / Roelands piezoviscous solvers
     cavitation.ausas    — dynamic Ausas (2009) JFO solver (validated)
-    cavitation.payvar_salant — steady mass-conserving JFO (planned)
+    cavitation.payvar_salant — steady mass-conserving JFO (Elrod-Adams, CPU + GPU)
     cavitation.legacy   — archived JFO experiments
     tests/              — active validation and regression tests
     experiments/        — diagnostic / exploratory scripts

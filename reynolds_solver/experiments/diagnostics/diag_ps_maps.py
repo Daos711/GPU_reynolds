@@ -67,7 +67,7 @@ def plot_one_eps(epsilon, R, L, N_phi, N_Z):
         H, d_phi, d_Z, R, L,
         omega=1.0, tol=1e-7, max_iter=20000,
     )
-    cav_frac = float(np.mean(theta_ps < 1.0 - 1e-6))
+    cav_frac = float(np.mean(theta_ps[1:-1, 1:-1] < 1.0 - 1e-6))
 
     # HS reference
     P_hs = hs_reference(H, d_phi, d_Z, R, L)

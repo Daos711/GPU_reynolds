@@ -59,9 +59,12 @@ def _build_coefficients_gpu(H_gpu, d_phi, d_Z, R, L):
 # -----------------------------------------------------------------------
 # GPU solver
 # -----------------------------------------------------------------------
+DEFAULT_PS_OMEGA = 1.0  # verified default for pinned active set
+
+
 def solve_payvar_salant_gpu(
     H, d_phi, d_Z, R, L,
-    omega=1.0,
+    omega=None,
     tol=1e-6,
     max_iter=50000,
     check_every=100,
@@ -71,6 +74,7 @@ def solve_payvar_salant_gpu(
     pin_active_set=True,
     max_outer_active_set=10,
     cav_threshold=1e-10,
+    g_init=None,
     verbose=False,
 ):
     """
@@ -78,7 +82,13 @@ def solve_payvar_salant_gpu(
 
     Parameters match `solve_payvar_salant_cpu`. Returns (P, theta,
     residual, n_iter) as numpy arrays on host.
+
+    If ``g_init`` is supplied, the HS warmup is skipped and the initial
+    active set is derived from ``g_init < 0`` (for ε-continuation).
     """
+    if omega is None:
+        omega = DEFAULT_PS_OMEGA
+
     N_Z, N_phi = H.shape
 
     # Ghost-pack H on host, then upload
@@ -104,61 +114,67 @@ def solve_payvar_salant_gpu(
     n_iter_total = 0
 
     # ------------------------------------------------------------------
-    # HS warmup on GPU (reuse existing rb_sor_step kernel)
+    # Initial g: from g_init (continuation) or HS warmup
     # ------------------------------------------------------------------
-    hs_kernel = get_rb_sor_kernel()
-    hs_bc_kernel = get_apply_bc_kernel()
+    if g_init is not None:
+        g = cp.asarray(
+            np.ascontiguousarray(g_init, dtype=np.float64)
+        ).copy()
+        g[:, 0] = g[:, N_phi - 2]
+        g[:, N_phi - 1] = g[:, 1]
+        g[0, :] = 0.0
+        g[-1, :] = 0.0
+        if verbose:
+            print("  [PS-GPU] warm start from g_init (HS warmup skipped)")
+    else:
+        # HS warmup on GPU
+        hs_kernel = get_rb_sor_kernel()
+        hs_bc_kernel = get_apply_bc_kernel()
 
-    # Build F_hs = d_phi * (H[i,j] - H[i,jm]) on GPU
-    F_hs = cp.zeros((N_Z, N_phi), dtype=cp.float64)
-    F_hs[:, 1:] = d_phi * (H_gpu[:, 1:] - H_gpu[:, :-1])
-    F_hs[:, 0] = d_phi * (H_gpu[:, 0] - H_gpu[:, -1])
-    # Correct the wrap at column 1: jm=N_phi-2
-    F_hs[:, 1] = d_phi * (H_gpu[:, 1] - H_gpu[:, N_phi - 2])
+        F_hs = cp.zeros((N_Z, N_phi), dtype=cp.float64)
+        F_hs[:, 1:] = d_phi * (H_gpu[:, 1:] - H_gpu[:, :-1])
+        F_hs[:, 0] = d_phi * (H_gpu[:, 0] - H_gpu[:, -1])
+        F_hs[:, 1] = d_phi * (H_gpu[:, 1] - H_gpu[:, N_phi - 2])
 
-    P_hs = cp.zeros((N_Z, N_phi), dtype=cp.float64)
+        P_hs = cp.zeros((N_Z, N_phi), dtype=cp.float64)
+        P_hs_prev = cp.zeros_like(P_hs)
 
-    if verbose:
-        print("  [PS-GPU] HS warmup starting...")
+        if verbose:
+            print("  [PS-GPU] HS warmup starting...")
 
-    for k in range(hs_warmup_iter):
-        for color in (0, 1):
-            hs_kernel(
-                grid, block,
-                (
-                    P_hs, A, B, C, D, E, F_hs,
-                    np.int32(N_Z), np.int32(N_phi),
-                    np.float64(hs_warmup_omega), np.int32(color),
-                ),
+        for k in range(hs_warmup_iter):
+            for color in (0, 1):
+                hs_kernel(
+                    grid, block,
+                    (
+                        P_hs, A, B, C, D, E, F_hs,
+                        np.int32(N_Z), np.int32(N_phi),
+                        np.float64(hs_warmup_omega), np.int32(color),
+                    ),
+                )
+            hs_bc_kernel(
+                bc_grid, bc_block,
+                (P_hs, np.int32(N_Z), np.int32(N_phi)),
             )
-        hs_bc_kernel(bc_grid, bc_block, (P_hs, np.int32(N_Z), np.int32(N_phi)))
-        n_iter_total += 1
+            n_iter_total += 1
 
-        if k % 50 == 0 or k == hs_warmup_iter - 1:
-            hs_max = float(cp.max(P_hs))
-            if k > 5 and hs_max > 0:
-                # Quick convergence estimate from max change
-                pass
+            # Early stopping check every 50 iters (avoid GPU sync overhead)
+            if k > 5 and k % 50 == 0:
+                hs_res = float(cp.max(cp.abs(P_hs - P_hs_prev)))
+                if hs_res < hs_warmup_tol:
+                    break
+                P_hs_prev[:] = P_hs
 
-        if k > 5:
-            # Use a simple max|ΔP| check every 50 iters
-            if k % 50 == 0:
-                # For efficiency, just check max(P) stability
-                pass
+        if verbose:
+            print(
+                f"  [PS-GPU] HS warmup done: iter={n_iter_total}, "
+                f"maxP={float(cp.max(P_hs)):.4e}"
+            )
 
-    if verbose:
-        print(
-            f"  [PS-GPU] HS warmup done: iter={n_iter_total}, "
-            f"maxP={float(cp.max(P_hs)):.4e}"
-        )
+        g = P_hs
 
     # ------------------------------------------------------------------
-    # g = P_hs (full-film seed)
-    # ------------------------------------------------------------------
-    g = P_hs  # reuse buffer
-
-    # ------------------------------------------------------------------
-    # Cav mask from HS
+    # Cav mask from initial g
     # ------------------------------------------------------------------
     cav_mask = (g < cav_threshold).astype(cp.int32)
     cav_mask[0, :] = 0
@@ -166,7 +182,6 @@ def solve_payvar_salant_gpu(
     cav_mask[:, 0] = cav_mask[:, N_phi - 2]
     cav_mask[:, N_phi - 1] = cav_mask[:, 1]
 
-    # Seed g = 0 in cavitation set
     if pin_active_set:
         g[cav_mask.astype(bool)] = 0.0
 
