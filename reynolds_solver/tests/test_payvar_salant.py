@@ -292,6 +292,52 @@ def test_two_residuals_and_no_drift():
 
 
 # -----------------------------------------------------------------------
+# Test 5: load integral vs HS at multiple ε
+# -----------------------------------------------------------------------
+def test_load_vs_hs_multiple_epsilon():
+    print("\n=== Test 5: load vs HS at ε = 0.1, 0.3, 0.5 ===")
+    from reynolds_solver.cavitation.payvar_salant import solve_payvar_salant_cpu
+    from reynolds_solver import solve_reynolds
+
+    R, L = 0.035, 0.056
+    N_phi, N_Z = 200, 100
+    # Tolerances loosen with ε because JFO and HS are genuinely
+    # different models at high eccentricity.
+    eps_tol = [(0.1, 0.05), (0.3, 0.10), (0.5, 0.15)]
+
+    all_ok = True
+    for eps, tol_rel in eps_tol:
+        H, d_phi, d_Z, phi_1D, Z = generate_test_case(N_phi, N_Z, eps)
+        Phi, _ = np.meshgrid(phi_1D, Z)
+
+        P_hs, _, _ = solve_reynolds(H, d_phi, d_Z, R, L)
+        P_ps, theta_ps, res, n = solve_payvar_salant_cpu(
+            H, d_phi, d_Z, R, L,
+            omega=1.0, tol=1e-7, max_iter=30000,
+        )
+
+        W_hs = float(np.trapezoid(
+            np.trapezoid(P_hs * np.cos(Phi), phi_1D, axis=1), Z
+        ))
+        W_ps = float(np.trapezoid(
+            np.trapezoid(P_ps * np.cos(Phi), phi_1D, axis=1), Z
+        ))
+        rel = abs(W_ps - W_hs) / (abs(W_hs) + 1e-12)
+        ok = rel < tol_rel
+        if not ok:
+            all_ok = False
+        print(
+            f"  ε={eps}: W_hs={W_hs:.4e}, W_ps={W_ps:.4e}, "
+            f"rel={rel:.4f}, tol={tol_rel} → {'OK' if ok else 'FAIL'}"
+        )
+
+    return run_test(
+        "Load integrals at ε=0.1/0.3/0.5 within tolerance vs HS",
+        all_ok,
+    )
+
+
+# -----------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------
 def main():
@@ -305,6 +351,7 @@ def main():
         ("2", test_invariants_strong_eccentricity),
         ("3", test_continuation_sweep),
         ("4", test_two_residuals_and_no_drift),
+        ("5", test_load_vs_hs_multiple_epsilon),
     ]
 
     results = []

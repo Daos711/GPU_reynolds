@@ -94,8 +94,10 @@ def solve_reynolds(
     closure : str
         Conductance model: "laminar" or "constantinescu".
     cavitation : str
-        Cavitation model: "half_sommerfeld" (the only supported value —
-        mass-conserving JFO is no longer exposed here, see module note).
+        Cavitation model:
+          "half_sommerfeld" — classic P ≥ 0 clamping (GPU, default).
+          "payvar_salant"   — steady mass-conserving JFO via Elrod-Adams
+              frozen-active-set method with unified variable g (CPU).
     xprime, yprime : float
         Dimensionless velocities (for dynamic equation, 0 = static).
     beta : float
@@ -126,6 +128,12 @@ def solve_reynolds(
     For cavitation="half_sommerfeld":
         P : np.ndarray, shape (N_Z, N_phi), float64
         delta : float
+        n_iter : int
+
+    For cavitation="payvar_salant":
+        P : np.ndarray, shape (N_Z, N_phi), float64
+        theta : np.ndarray, shape (N_Z, N_phi), float64
+        residual : float
         n_iter : int
     """
     # --- Auto omega ---
@@ -248,11 +256,28 @@ def solve_reynolds(
                 P_init=P_init,
             ))
 
+    elif cavitation == "payvar_salant":
+        if closure != "laminar":
+            raise NotImplementedError(
+                "cavitation='payvar_salant' is only supported with "
+                "closure='laminar'."
+            )
+
+        from reynolds_solver.cavitation.payvar_salant import (
+            solve_payvar_salant_cpu,
+        )
+        P, theta, residual, n_iter = solve_payvar_salant_cpu(
+            H, d_phi, d_Z, R, L,
+            tol=tol,
+            max_iter=max_iter,
+            verbose=verbose,
+        )
+        return P, theta, residual, n_iter
+
     else:
         raise NotImplementedError(
             f"cavitation='{cavitation}' not implemented. "
-            "Supported: 'half_sommerfeld'. "
-            "For dynamic Ausas import reynolds_solver.cavitation.ausas.solver_cpu "
-            "directly; a steady Payvar-Salant solver is planned under "
-            "reynolds_solver.cavitation.payvar_salant."
+            "Supported: 'half_sommerfeld', 'payvar_salant'. "
+            "For dynamic Ausas import reynolds_solver.cavitation.ausas "
+            "directly."
         )
