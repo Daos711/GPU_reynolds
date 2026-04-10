@@ -45,7 +45,7 @@ def run_test(name, passed, details=""):
 def test_fullfilm_hs():
     print("\n=== Test 0a: Full-film = HS ===")
     from reynolds_solver import solve_reynolds
-    from reynolds_solver.solver_jfo_splitting_cpu import (
+    from reynolds_solver.cavitation.legacy.solver_jfo_splitting_cpu import (
         _sor_solve_P, _build_F_theta,
     )
 
@@ -143,7 +143,7 @@ def check_mass_discrete(P, theta, A, B, C, D, E, Hfp, Hfm, d_phi):
 def test_mass_discrete(P, theta, H, d_phi, d_Z):
     """Test 2a: discrete algebra consistency."""
     print("\n=== Test 2a: Discrete algebra consistency (Reynolds residual) ===")
-    from reynolds_solver.solver_jfo_splitting_cpu import _sor_solve_P, _build_F_theta
+    from reynolds_solver.cavitation.legacy.solver_jfo_splitting_cpu import _sor_solve_P, _build_F_theta
 
     N_Z, N_phi = H.shape
     alpha_sq = (2.0 * R / L * d_phi / d_Z) ** 2
@@ -208,7 +208,7 @@ def test_mass_conservation(H, P, theta, d_phi, d_Z):
 def test_load_comparison():
     print("\n=== Test 3: Load comparison JFO vs HS ===")
     from reynolds_solver import solve_reynolds
-    from reynolds_solver.solver_jfo_splitting_cpu import solve_jfo_splitting_cpu
+    from reynolds_solver.cavitation.legacy.solver_jfo_splitting_cpu import solve_jfo_splitting_cpu
 
     all_ok = True
     for eps in [0.6, 0.1]:
@@ -247,7 +247,7 @@ def save_maps(eps, N=250):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from reynolds_solver import solve_reynolds
-    from reynolds_solver.solver_jfo_splitting_cpu import solve_jfo_splitting_cpu
+    from reynolds_solver.cavitation.legacy.solver_jfo_splitting_cpu import solve_jfo_splitting_cpu
 
     H, d_phi, d_Z, phi_1D, Z, Phi_mesh, Z_mesh = generate_test_case(N, eps)
 
@@ -309,7 +309,7 @@ def sweep_cav_frac():
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from reynolds_solver.solver_jfo_splitting_cpu import solve_jfo_splitting_cpu
+    from reynolds_solver.cavitation.legacy.solver_jfo_splitting_cpu import solve_jfo_splitting_cpu
 
     epsilons = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
     cav_fracs = []
@@ -342,7 +342,7 @@ def sweep_cav_frac():
 # ===================================================================
 def rupture_debug():
     print("\n=== Rupture/reformation debug (eps=0.6, Z=0) ===")
-    from reynolds_solver.solver_jfo_splitting_cpu import solve_jfo_splitting_cpu
+    from reynolds_solver.cavitation.legacy.solver_jfo_splitting_cpu import solve_jfo_splitting_cpu
 
     N = 250
     H, d_phi, d_Z, phi_1D, *_ = generate_test_case(N, 0.6)
@@ -386,7 +386,7 @@ def rupture_debug():
 # Main
 # ===================================================================
 def main():
-    from reynolds_solver.solver_jfo_splitting_cpu import solve_jfo_splitting_cpu
+    from reynolds_solver.cavitation.legacy.solver_jfo_splitting_cpu import solve_jfo_splitting_cpu
 
     print("=" * 60)
     print("  JFO splitting diagnostic")

@@ -218,7 +218,7 @@ def test_overflow():
 def test_roelands_formula():
     print("\n=== Test 5b: Roelands formula correctness ===")
     import cupy as cp
-    from reynolds_solver.solver_piezoviscous import _compute_mu_ratio_gpu
+    from reynolds_solver.piezoviscous.solver_piezoviscous import _compute_mu_ratio_gpu
 
     alpha = 18e-9
     p0 = 1.98e8

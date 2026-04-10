@@ -22,11 +22,19 @@ Examples:
 
 import numpy as np
 from reynolds_solver.solver import solve_reynolds_gpu
-from reynolds_solver.solver_dynamic import solve_reynolds_gpu_dynamic
-from reynolds_solver.solver_jfo import solve_reynolds_gpu_jfo
-from reynolds_solver.solver_piezoviscous import solve_reynolds_piezoviscous
-from reynolds_solver.solver_transformed import solve_reynolds_transformed
+from reynolds_solver.dynamic.solver_dynamic import solve_reynolds_gpu_dynamic
+from reynolds_solver.piezoviscous.solver_piezoviscous import solve_reynolds_piezoviscous
+from reynolds_solver.piezoviscous.solver_transformed import solve_reynolds_transformed
 from reynolds_solver.physics.closures import LaminarClosure, ConstantinescuClosure
+
+# Note: cavitation="jfo" and cavitation="jfo_ausas" have been removed
+# from the public API. The stationary reduction of both algorithms is
+# unstable for steady journal bearings (see experiments/diagnostics).
+#   * For dynamic Ausas (squeeze, orbit analysis), import directly:
+#         from reynolds_solver.cavitation.ausas.solver_cpu import
+#             solve_jfo_ausas_cpu
+#   * For steady mass-conserving cavitation, Payvar-Salant is planned
+#     under reynolds_solver.cavitation.payvar_salant.
 
 
 def solve_reynolds(
@@ -61,31 +69,7 @@ def solve_reynolds(
     texture_params: dict = None,
     phi_1D: np.ndarray = None,
     Z_1D: np.ndarray = None,
-    # JFO-specific parameters
-    jfo_max_outer: int = 500,
-    jfo_max_inner: int = 500,
-    jfo_p_off: float = 0.0,
-    jfo_p_on: float = 0.0,
-    jfo_tol_theta: float = 1e-5,
-    jfo_tol_inner: float = None,
-    theta_init: np.ndarray = None,
-    mask_init: np.ndarray = None,
     verbose: bool = False,
-    # JFO debug flags
-    use_F_theta: bool = True,
-    update_mask: bool = True,
-    run_theta_sweep: bool = True,
-    # JFO diagnostic
-    jfo_return_rhs: bool = False,
-    # Ausas-style JFO parameters
-    jfo_ausas_omega_p: float = 1.0,
-    jfo_ausas_omega_theta: float = 1.0,
-    jfo_ausas_omega_hs: float = 1.7,
-    jfo_ausas_max_iter: int = 50000,
-    jfo_ausas_check_every: int = 50,
-    jfo_ausas_hs_warmup_iter: int = 2000,
-    jfo_ausas_hs_warmup_tol: float = 1e-7,
-    jfo_ausas_flooded_ends: bool = True,
     # Piezoviscous parameters
     alpha_pv: float = None,
     p_scale: float = None,
@@ -110,7 +94,10 @@ def solve_reynolds(
     closure : str
         Conductance model: "laminar" or "constantinescu".
     cavitation : str
-        Cavitation model: "half_sommerfeld" or "jfo".
+        Cavitation model:
+          "half_sommerfeld" — classic P ≥ 0 clamping (GPU, default).
+          "payvar_salant"   — steady mass-conserving JFO via Elrod-Adams
+              frozen-active-set method with unified variable g (CPU).
     xprime, yprime : float
         Dimensionless velocities (for dynamic equation, 0 = static).
     beta : float
@@ -128,36 +115,13 @@ def solve_reynolds(
     omega : float
         SOR relaxation parameter (1.0-1.9, optimum ~1.5).
     tol : float
-        Convergence criterion (relative residual). For JFO, used as tol_P.
+        Convergence criterion (relative residual).
     max_iter : int
-        Maximum SOR iterations (Half-Sommerfeld only).
+        Maximum SOR iterations.
     check_every : int
-        Convergence check frequency (Half-Sommerfeld only).
+        Convergence check frequency.
     P_init : np.ndarray or None
         Initial pressure field for warm start. Shape must match H.
-    jfo_max_outer : int
-        Max outer (active-set) iterations for JFO.
-    jfo_max_inner : int
-        Max inner SOR iterations per outer step for JFO.
-    jfo_p_off : float
-        Threshold for entering cavitation zone (P <= p_off).
-    jfo_p_on : float
-        Threshold for leaving cavitation zone (P_trial > p_on). Must be > p_off.
-    jfo_tol_theta : float
-        Convergence tolerance for theta in JFO.
-    jfo_tol_inner : float or None
-        Inner SOR convergence tolerance for JFO. Default: tol * 0.1.
-    theta_init : np.ndarray or None
-        Initial fill fraction for JFO warm start. Values in [0, 1].
-    mask_init : np.ndarray or None
-        Initial zone mask for JFO warm start. Values in {0, 1}.
-    use_F_theta : bool
-        If True (default), use F_theta = d(H*theta)/dphi as SOR RHS.
-        If False, use F_orig = dH/dphi (diagnostic mode).
-    update_mask : bool
-        If True (default), update zone mask each outer iteration.
-    run_theta_sweep : bool
-        If True (default), run theta line-sweep each outer iteration.
 
     Returns
     -------
@@ -166,23 +130,17 @@ def solve_reynolds(
         delta : float
         n_iter : int
 
-    For cavitation="jfo":
+    For cavitation="payvar_salant":
         P : np.ndarray, shape (N_Z, N_phi), float64
         theta : np.ndarray, shape (N_Z, N_phi), float64
         residual : float
-        n_outer : int
-        n_inner_total : int
+        n_iter : int
     """
     # --- Auto omega ---
     if omega is None:
         from reynolds_solver.utils import compute_auto_omega
         N_Z, N_phi = H.shape
-        if alpha_pv is not None:
-            cap = 1.95
-        elif cavitation == "jfo":
-            cap = 1.95
-        else:
-            cap = 1.97
+        cap = 1.95 if alpha_pv is not None else 1.97
         omega = compute_auto_omega(N_phi, N_Z, R, L, cap=cap)
 
     # --- Build closure object ---
@@ -298,59 +256,28 @@ def solve_reynolds(
                 P_init=P_init,
             ))
 
-    elif cavitation == "jfo":
+    elif cavitation == "payvar_salant":
         if closure != "laminar":
             raise NotImplementedError(
-                "cavitation='jfo' is only supported with closure='laminar' in this version. "
-                "Turbulent JFO is planned for step 3."
+                "cavitation='payvar_salant' is only supported with "
+                "closure='laminar'."
             )
 
-        return solve_reynolds_gpu_jfo(
-            H, d_phi, d_Z, R, L,
-            closure=closure_obj,
-            omega=omega,
-            tol_P=tol,
-            tol_theta=jfo_tol_theta,
-            tol_inner=jfo_tol_inner,
-            max_outer=jfo_max_outer,
-            max_inner=jfo_max_inner,
-            p_off=jfo_p_off,
-            p_on=jfo_p_on,
-            P_init=P_init,
-            theta_init=theta_init,
-            mask_init=mask_init,
-            verbose=verbose,
-            use_F_theta=use_F_theta,
-            update_mask=update_mask,
-            run_theta_sweep=run_theta_sweep,
-            return_rhs=jfo_return_rhs,
+        from reynolds_solver.cavitation.payvar_salant import (
+            solve_payvar_salant_cpu,
         )
-
-    elif cavitation == "jfo_ausas":
-        if closure != "laminar":
-            raise NotImplementedError(
-                "cavitation='jfo_ausas' is only supported with closure='laminar'."
-            )
-
-        from reynolds_solver.solver_jfo_ausas import solve_reynolds_gpu_jfo_ausas
-        return solve_reynolds_gpu_jfo_ausas(
+        P, theta, residual, n_iter = solve_payvar_salant_cpu(
             H, d_phi, d_Z, R, L,
-            omega_p=jfo_ausas_omega_p,
-            omega_theta=jfo_ausas_omega_theta,
-            omega_hs=jfo_ausas_omega_hs,
             tol=tol,
-            max_iter=jfo_ausas_max_iter,
-            check_every=jfo_ausas_check_every,
-            hs_warmup_iter=jfo_ausas_hs_warmup_iter,
-            hs_warmup_tol=jfo_ausas_hs_warmup_tol,
-            P_init=P_init,
-            theta_init=theta_init,
-            flooded_ends=jfo_ausas_flooded_ends,
+            max_iter=max_iter,
             verbose=verbose,
         )
+        return P, theta, residual, n_iter
 
     else:
         raise NotImplementedError(
             f"cavitation='{cavitation}' not implemented. "
-            "Supported: 'half_sommerfeld', 'jfo', 'jfo_ausas'."
+            "Supported: 'half_sommerfeld', 'payvar_salant'. "
+            "For dynamic Ausas import reynolds_solver.cavitation.ausas "
+            "directly."
         )

@@ -459,7 +459,7 @@ def test_static_solver():
 def test_dynamic_solver():
     print("\n=== Test 2: Dynamic solver (xprime=0.001, yprime=0.001) ===")
 
-    from reynolds_solver.solver_dynamic import solve_reynolds_gpu_dynamic
+    from reynolds_solver.dynamic.solver_dynamic import solve_reynolds_gpu_dynamic
     import cupy as cp
 
     R = 0.035
@@ -609,7 +609,7 @@ def test_dynamic_solver_legacy_phase():
     """Test dynamic solver with phase_shift=pi/4 (legacy behavior) on both GPU and CPU."""
     print("\n=== Test 4: Dynamic solver with phase_shift=pi/4 (legacy) ===")
 
-    from reynolds_solver.solver_dynamic import solve_reynolds_gpu_dynamic
+    from reynolds_solver.dynamic.solver_dynamic import solve_reynolds_gpu_dynamic
     import cupy as cp
 
     R = 0.035

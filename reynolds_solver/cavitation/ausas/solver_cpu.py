@@ -175,6 +175,143 @@ def _ausas_relax_sweep(P, theta, H, A, B, C, D, E,
 
 
 @njit(cache=True)
+def _ausas_relax_sweep_pt(P_new, P_old, theta_new, theta_old, H, c_prev,
+                          A, B, C, D, E,
+                          d_phi, beta, omega_p, omega_theta,
+                          N_Z, N_phi, flooded_ends):
+    """
+    One frozen-iterate (Jacobi) Ausas sweep WITH the pseudo-transient
+    (∂(θh)/∂τ) term from Ausas eq. (12).
+
+    Let  β = 2 * d_phi^2 / dτ  and  c_prev[i,j] = θ^{n-1}_{i,j} * h_{i,j}.
+    Discretized eq. (12) at node (i,j):
+
+        β (c^n - c_prev) + d_phi (c^n - h_jm θ^n_jm)
+                        = A P_jp + B P_jm + C P_ip + D P_im - E P_ij
+
+    Branch 1 (full-film, θ^n_ij = 1 ⇒ c^n_ij = h_ij):
+        E P_ij = diff - β (h_ij - c_prev_ij) - d_phi (h_ij - h_jm θ_up)
+        P_trial = (diff - F_time - F_couette) / E
+        with  F_time    = β (h_ij - c_prev_ij)
+              F_couette = d_phi (h_ij - h_jm θ_up)
+        (E is unchanged — the time term only enters the RHS.)
+
+    Branch 2 (cavitation, P_ij held at Branch-1 result, solve for θ):
+        (β + d_phi) h_ij θ^n_ij =
+            diff - E P_ij + β c_prev_ij + d_phi h_jm θ_up
+        Θ_trial = (stencil_signed + β c_prev_ij + d_phi h_jm θ_up)
+                  / ((β + d_phi) h_ij)
+
+    As c^n → c_prev the time term vanishes and the update degenerates to
+    the stationary Ausas rule. The enlarged denominator (β + d_phi) h_ij
+    damps θ away from tripping the trivial c = θh ≈ const solution.
+
+    c_prev is mass content from the previous PSEUDO-TIME step; it stays
+    frozen over the whole inner relaxation loop.
+
+    Returns sqrt(sum dP^2) + sqrt(sum dth^2) over interior nodes.
+    """
+    dP_sum = 0.0
+    dth_sum = 0.0
+
+    for i in range(1, N_Z - 1):
+        for j in range(1, N_phi - 1):
+            jp = j + 1 if j + 1 < N_phi - 1 else 1
+            jm = j - 1 if j - 1 >= 1 else N_phi - 2
+
+            # ALL stencil values from OLD arrays
+            P_old_ij = P_old[i, j]
+            th_old_ij = theta_old[i, j]
+            Pjp = P_old[i, jp]
+            Pjm = P_old[i, jm]
+            Pip = P_old[i + 1, j]
+            Pim = P_old[i - 1, j]
+            th_up = theta_old[i, jm]
+
+            h_ij = H[i, j]
+            h_jm = H[i, jm]
+            cp_ij = c_prev[i, j]
+
+            A_l = A[i, j]
+            B_l = B[i, j]
+            C_l = C[i, j]
+            D_l = D[i, j]
+            E_l = E[i, j]
+
+            P_cur = P_old_ij
+            th_cur = th_old_ij
+
+            # Branch 1: pressure update if currently full-film
+            if P_old_ij > 0.0 or th_old_ij >= 1.0 - 1e-12:
+                F_time = beta * (h_ij - cp_ij)
+                F_couette = d_phi * (h_ij - h_jm * th_up)
+                diff = A_l * Pjp + B_l * Pjm + C_l * Pip + D_l * Pim
+                P_trial = (diff - F_time - F_couette) / (E_l + 1e-30)
+                P_relaxed = omega_p * P_trial + (1.0 - omega_p) * P_old_ij
+
+                if P_relaxed >= 0.0:
+                    P_cur = P_relaxed
+                    th_cur = 1.0
+                else:
+                    P_cur = 0.0
+                    # th_cur stays as th_old_ij
+
+            # Branch 2: theta update if cavitation or partial
+            if P_cur <= 0.0 or th_cur < 1.0 - 1e-12:
+                stencil_signed = (
+                    A_l * Pjp + B_l * Pjm + C_l * Pip + D_l * Pim - E_l * P_cur
+                )
+                Theta_num = (
+                    stencil_signed + beta * cp_ij + d_phi * h_jm * th_up
+                )
+                Theta_trial = Theta_num / ((beta + d_phi) * h_ij + 1e-30)
+                th_relaxed = (
+                    omega_theta * Theta_trial + (1.0 - omega_theta) * th_old_ij
+                )
+
+                if th_relaxed < 1.0:
+                    if th_relaxed < 0.0:
+                        th_relaxed = 0.0
+                    th_cur = th_relaxed
+                    P_cur = 0.0
+                else:
+                    th_cur = 1.0
+                    # P_cur stays
+
+            P_new[i, j] = P_cur
+            theta_new[i, j] = th_cur
+
+            dP_sum += (P_cur - P_old_ij) ** 2
+            dth_sum += (th_cur - th_old_ij) ** 2
+
+    # Periodic ghost columns on the NEW arrays
+    for i in range(N_Z):
+        P_new[i, 0] = P_new[i, N_phi - 2]
+        P_new[i, N_phi - 1] = P_new[i, 1]
+        theta_new[i, 0] = theta_new[i, N_phi - 2]
+        theta_new[i, N_phi - 1] = theta_new[i, 1]
+
+    # Z boundaries on the NEW arrays
+    for j in range(N_phi):
+        P_new[0, j] = 0.0
+        P_new[N_Z - 1, j] = 0.0
+        if flooded_ends != 0:
+            theta_new[0, j] = 1.0
+            theta_new[N_Z - 1, j] = 1.0
+        else:
+            if theta_new[0, j] < 0.0:
+                theta_new[0, j] = 0.0
+            elif theta_new[0, j] > 1.0:
+                theta_new[0, j] = 1.0
+            if theta_new[N_Z - 1, j] < 0.0:
+                theta_new[N_Z - 1, j] = 0.0
+            elif theta_new[N_Z - 1, j] > 1.0:
+                theta_new[N_Z - 1, j] = 1.0
+
+    return np.sqrt(dP_sum) + np.sqrt(dth_sum)
+
+
+@njit(cache=True)
 def _ausas_relax_sweep_jacobi(P_new, P_old, theta_new, theta_old, H,
                               A, B, C, D, E,
                               d_phi, omega_p, omega_theta,
@@ -351,6 +488,12 @@ def solve_jfo_ausas_cpu(
     P_init=None, theta_init=None,
     flooded_ends=True,
     scheme="gs",
+    # Pseudo-transient parameters (used only when scheme="pseudo_transient")
+    pt_dt=0.1,
+    pt_max_time_steps=200,
+    pt_max_inner=50,
+    pt_inner_tol=1e-4,
+    pt_steady_tol=1e-6,
     verbose=False,
 ):
     """
@@ -374,12 +517,25 @@ def solve_jfo_ausas_cpu(
     P_init, theta_init : (N_Z, N_phi) float64 or None — warm start
     flooded_ends : bool — if True (default, flooded bearing) force theta=1
         on Z boundaries; otherwise clamp theta to [0, 1] without forcing.
-    scheme : {"gs", "jacobi"} — relaxation scheme.
+    scheme : {"gs", "jacobi", "pseudo_transient"} — relaxation scheme.
         "gs"     — lexicographic in-place Gauss-Seidel (legacy default).
         "jacobi" — frozen-iterate sweep: every stencil neighbour is read
                    from the previous iterate, only the local Branch1→Branch2
                    pair is sequential. Removes the cross-node coupling that
                    in-place GS exhibits inside one sweep.
+        "pseudo_transient" — two-level iteration: march in an artificial
+                   pseudo-time τ (outer loop) with an inner Jacobi Ausas
+                   relaxation. The temporal term β (c^n - c^{n-1}) stabilises
+                   the θ update (enlarged denominator) and anchors the
+                   solution to the previous time step; vanishes at steady
+                   state. See `_ausas_relax_sweep_pt` for the algebra.
+    pt_dt : float — pseudo-time step Δτ (smaller → more damping, slower
+        march; larger → closer to stationary).
+    pt_max_time_steps : int — outer (pseudo-time) steps.
+    pt_max_inner : int — inner Ausas iterations per time step.
+    pt_inner_tol : float — inner-loop convergence on ||dP|| + ||dθ||.
+    pt_steady_tol : float — outer steady-state tolerance
+        ||P^n - P^{n-1}|| + ||θ^n - θ^{n-1}||.
     verbose : bool
 
     Returns
@@ -388,8 +544,11 @@ def solve_jfo_ausas_cpu(
     residual : float
     n_iter : int (HS + Ausas iterations combined)
     """
-    if scheme not in ("gs", "jacobi"):
-        raise ValueError(f"Unknown scheme: '{scheme}'. Use 'gs' or 'jacobi'.")
+    if scheme not in ("gs", "jacobi", "pseudo_transient"):
+        raise ValueError(
+            f"Unknown scheme: '{scheme}'. "
+            "Use 'gs', 'jacobi', or 'pseudo_transient'."
+        )
     N_Z, N_phi = H.shape
     # Defensive H ghost packing: ensure column 0 and column N_phi-1 are
     # proper periodic copies of the physical seam (N_phi-2 and 1). The test
@@ -484,6 +643,60 @@ def solve_jfo_ausas_cpu(
             if residual < tol and k > 5:
                 if verbose:
                     print(f"  [Ausas-Jacobi] CONVERGED at iter={k}, residual={residual:.4e}")
+                break
+    elif scheme == "pseudo_transient":
+        # Two-level iteration: outer pseudo-time marching, inner Jacobi
+        # Ausas relaxation. β = 2 d_phi^2 / Δτ is the temporal coefficient.
+        beta_pt = 2.0 * d_phi * d_phi / pt_dt
+
+        P_new = P.copy()
+        theta_new = theta.copy()
+        c_prev = theta * H  # mass content from previous time step
+
+        residual = 1.0
+        for n_step in range(pt_max_time_steps):
+            P_prev_step = P.copy()
+            theta_prev_step = theta.copy()
+
+            # Inner Ausas relaxation at this pseudo-time step (c_prev frozen)
+            inner_res = 1.0
+            inner_k = 0
+            for inner_k in range(pt_max_inner):
+                inner_res = _ausas_relax_sweep_pt(
+                    P_new, P, theta_new, theta, H, c_prev,
+                    A, B, C, D, E,
+                    d_phi, beta_pt, omega_p, omega_theta,
+                    N_Z, N_phi, flooded_flag,
+                )
+                P, P_new = P_new, P
+                theta, theta_new = theta_new, theta
+                n_iter += 1
+                if inner_res < pt_inner_tol and inner_k > 2:
+                    break
+
+            # Advance mass content to the new time step
+            c_prev = theta * H
+
+            # Steady-state residual between pseudo-time steps
+            residual = (
+                np.sqrt(np.sum((P - P_prev_step) ** 2))
+                + np.sqrt(np.sum((theta - theta_prev_step) ** 2))
+            )
+
+            if verbose and (n_step % check_every == 0 or n_step < 5):
+                cav_frac = float(np.mean(theta < 1.0 - 1e-6))
+                print(
+                    f"  [Ausas-PT] step={n_step:>4d}: inner_k={inner_k + 1:>3d}, "
+                    f"inner_res={inner_res:.3e}, steady={residual:.3e}, "
+                    f"maxP={P.max():.4e}, cav_frac={cav_frac:.3f}"
+                )
+
+            if residual < pt_steady_tol and n_step > 2:
+                if verbose:
+                    print(
+                        f"  [Ausas-PT] STEADY at step={n_step}, "
+                        f"steady_res={residual:.4e}"
+                    )
                 break
     else:  # scheme == "gs"
         for k in range(max_iter):

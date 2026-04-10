@@ -41,7 +41,7 @@ R, L = 0.035, 0.056
 def test_regression():
     print("\n=== Test 1: Regression (zero squeeze = static) ===")
     from reynolds_solver import solve_reynolds
-    from reynolds_solver.squeeze import solve_reynolds_squeeze
+    from reynolds_solver.dynamic.squeeze import solve_reynolds_squeeze
 
     N = 200
     H, d_phi, d_Z, *_ = generate_grid(N, epsilon=0.6)
@@ -77,7 +77,7 @@ def test_regression():
 # -----------------------------------------------------------------------
 def test_rhs_unit():
     print("\n=== Test 2: RHS unit test (squeeze_to_api_params) ===")
-    from reynolds_solver.squeeze import squeeze_to_api_params
+    from reynolds_solver.dynamic.squeeze import squeeze_to_api_params
 
     c = 50e-6
     omega_shaft = 312.0
@@ -123,7 +123,7 @@ def test_rhs_unit():
 # -----------------------------------------------------------------------
 def test_pure_squeeze():
     print("\n=== Test 3: Pure squeeze (H=const, dH/dt<0) ===")
-    from reynolds_solver.squeeze import solve_reynolds_squeeze
+    from reynolds_solver.dynamic.squeeze import solve_reynolds_squeeze
 
     N = 200
     phi_1D = np.linspace(0, 2 * np.pi, N)
@@ -179,7 +179,7 @@ def test_pure_squeeze():
 # -----------------------------------------------------------------------
 def test_sign():
     print("\n=== Test 4: Sign test (squeeze opposes motion) ===")
-    from reynolds_solver.squeeze import solve_reynolds_squeeze
+    from reynolds_solver.dynamic.squeeze import solve_reynolds_squeeze
 
     N = 200
     # Pure squeeze: H=const (no wedge), so force is entirely from squeeze

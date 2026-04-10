@@ -193,7 +193,7 @@ def test_backward_compatibility():
     )
 
     # Dynamic backward compatibility
-    from reynolds_solver.solver_dynamic import solve_reynolds_gpu_dynamic
+    from reynolds_solver.dynamic.solver_dynamic import solve_reynolds_gpu_dynamic
     P_old_d, _, _ = solve_reynolds_gpu_dynamic(
         H, d_phi, d_Z, R, L, xprime=0.001, yprime=0.001, beta=2.0
     )

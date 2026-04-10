@@ -56,7 +56,7 @@ def test_fullfilm_algebraic():
     """force_full_film=True → unified-JFO ≡ HS."""
     print("\n=== Test 0a: Algebraic full-film ≡ HS ===")
     from reynolds_solver import solve_reynolds
-    from reynolds_solver.solver_jfo_unified_cpu import solve_jfo_unified_cpu
+    from reynolds_solver.cavitation.legacy.solver_jfo_unified_cpu import solve_jfo_unified_cpu
 
     N = 250
     epsilon = 0.6
@@ -112,7 +112,7 @@ def test_small_epsilon_physical():
     """At small ε, unified-JFO close to HS."""
     print("\n=== Test 0b: Physical small-ε check ===")
     from reynolds_solver import solve_reynolds
-    from reynolds_solver.solver_jfo_unified_cpu import solve_jfo_unified_cpu
+    from reynolds_solver.cavitation.legacy.solver_jfo_unified_cpu import solve_jfo_unified_cpu
 
     N = 250
     epsilon = 0.05
@@ -155,7 +155,7 @@ def test_small_epsilon_physical():
 def test_mass_conservation_local():
     """Local divergence of face fluxes ≈ 0."""
     print("\n=== Test 1: Mass conservation (A) — local divergence ===")
-    from reynolds_solver.solver_jfo_unified_cpu import solve_jfo_unified_cpu
+    from reynolds_solver.cavitation.legacy.solver_jfo_unified_cpu import solve_jfo_unified_cpu
 
     N = 250
     epsilon = 0.6
@@ -225,7 +225,7 @@ def test_mass_conservation_local():
 def test_mass_conservation_independent():
     """Integrated flux Q(φ) variation across φ-sections."""
     print("\n=== Test 2: Mass conservation (B) — integrated flux variation ===")
-    from reynolds_solver.solver_jfo_unified_cpu import solve_jfo_unified_cpu
+    from reynolds_solver.cavitation.legacy.solver_jfo_unified_cpu import solve_jfo_unified_cpu
 
     N = 250
     epsilon = 0.6
@@ -273,7 +273,7 @@ def test_mass_conservation_independent():
 def test_physical_constraints():
     """P ≥ 0 and θ ∈ [0, 1]."""
     print("\n=== Test 3: P ≥ 0 and θ ∈ [0, 1] ===")
-    from reynolds_solver.solver_jfo_unified_cpu import solve_jfo_unified_cpu
+    from reynolds_solver.cavitation.legacy.solver_jfo_unified_cpu import solve_jfo_unified_cpu
 
     N = 250
     epsilon = 0.6
@@ -312,7 +312,7 @@ def test_physical_constraints():
 def test_cavitation_fraction_diagnostic():
     """Sanity check: cavitation fraction reasonable at ε=0.6."""
     print("\n=== Test 4: Cavitation fraction (DIAGNOSTIC) ===")
-    from reynolds_solver.solver_jfo_unified_cpu import solve_jfo_unified_cpu
+    from reynolds_solver.cavitation.legacy.solver_jfo_unified_cpu import solve_jfo_unified_cpu
 
     N = 250
     epsilon = 0.6
@@ -349,7 +349,7 @@ def test_jfo_vs_hs_small_epsilon():
     """JFO and HS loads within 10% at small ε."""
     print("\n=== Test 5: JFO ≈ HS at small ε ===")
     from reynolds_solver import solve_reynolds
-    from reynolds_solver.solver_jfo_unified_cpu import solve_jfo_unified_cpu
+    from reynolds_solver.cavitation.legacy.solver_jfo_unified_cpu import solve_jfo_unified_cpu
 
     N = 250
     epsilon = 0.1

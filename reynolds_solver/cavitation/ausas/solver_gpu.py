@@ -19,7 +19,7 @@ Method:
 import numpy as np
 import cupy as cp
 
-from reynolds_solver.kernels_ausas import (
+from reynolds_solver.cavitation.ausas.kernels import (
     get_ausas_rb_kernel,
     get_apply_bc_ausas_kernel,
 )
