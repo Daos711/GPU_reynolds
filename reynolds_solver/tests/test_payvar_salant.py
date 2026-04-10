@@ -338,6 +338,63 @@ def test_load_vs_hs_multiple_epsilon():
 
 
 # -----------------------------------------------------------------------
+# Test 6: GPU vs CPU agreement
+# -----------------------------------------------------------------------
+def test_gpu_vs_cpu():
+    print("\n=== Test 6: GPU vs CPU agreement (ε=0.6) ===")
+    from reynolds_solver.cavitation.payvar_salant import solve_payvar_salant_cpu
+
+    try:
+        from reynolds_solver.cavitation.payvar_salant import (
+            solve_payvar_salant_gpu,
+        )
+    except ImportError:
+        print("  [SKIP] cupy not available — GPU test skipped")
+        return run_test("GPU vs CPU", True, "SKIPPED (no cupy)")
+
+    R, L = 0.035, 0.056
+    N_phi, N_Z = 100, 40
+    H, d_phi, d_Z, phi_1D, Z = generate_test_case(N_phi, N_Z, epsilon=0.6)
+    Phi, _ = np.meshgrid(phi_1D, Z)
+
+    P_cpu, th_cpu, res_cpu, n_cpu = solve_payvar_salant_cpu(
+        H, d_phi, d_Z, R, L, omega=1.0, tol=1e-7, max_iter=20000,
+    )
+    P_gpu, th_gpu, res_gpu, n_gpu = solve_payvar_salant_gpu(
+        H, d_phi, d_Z, R, L, omega=1.0, tol=1e-7, max_iter=20000,
+    )
+
+    W_cpu = float(np.trapezoid(
+        np.trapezoid(P_cpu * np.cos(Phi), phi_1D, axis=1), Z
+    ))
+    W_gpu = float(np.trapezoid(
+        np.trapezoid(P_gpu * np.cos(Phi), phi_1D, axis=1), Z
+    ))
+    rel_W = abs(W_gpu - W_cpu) / (abs(W_cpu) + 1e-12)
+
+    maxP_cpu = float(P_cpu.max())
+    maxP_gpu = float(P_gpu.max())
+    rel_maxP = abs(maxP_gpu - maxP_cpu) / (maxP_cpu + 1e-12)
+
+    cav_cpu = float(np.mean(th_cpu[1:-1, 1:-1] < 1.0 - 1e-6))
+    cav_gpu = float(np.mean(th_gpu[1:-1, 1:-1] < 1.0 - 1e-6))
+    diff_cav = abs(cav_gpu - cav_cpu)
+
+    print(f"    CPU: n={n_cpu}, maxP={maxP_cpu:.4e}, cav={cav_cpu:.3f}")
+    print(f"    GPU: n={n_gpu}, maxP={maxP_gpu:.4e}, cav={cav_gpu:.3f}")
+    print(f"    rel_W={rel_W:.4f}, rel_maxP={rel_maxP:.4f}, "
+          f"diff_cav={diff_cav:.4f}")
+
+    ok = rel_W < 0.02 and rel_maxP < 0.02 and diff_cav < 0.01
+    return run_test(
+        "GPU vs CPU: W <2%, maxP <2%, cav_frac <0.01",
+        ok,
+        f"rel_W={rel_W:.4f}, rel_maxP={rel_maxP:.4f}, "
+        f"diff_cav={diff_cav:.4f}",
+    )
+
+
+# -----------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------
 def main():
@@ -352,6 +409,7 @@ def main():
         ("3", test_continuation_sweep),
         ("4", test_two_residuals_and_no_drift),
         ("5", test_load_vs_hs_multiple_epsilon),
+        ("6", test_gpu_vs_cpu),
     ]
 
     results = []

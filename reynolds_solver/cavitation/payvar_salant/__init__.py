@@ -14,3 +14,13 @@ from reynolds_solver.cavitation.payvar_salant.solver_cpu import (
 )
 
 __all__ = ["solve_payvar_salant_cpu"]
+
+# GPU solver requires cupy; import it lazily to avoid breaking
+# CPU-only usage of this package.
+try:
+    from reynolds_solver.cavitation.payvar_salant.solver_gpu import (
+        solve_payvar_salant_gpu,
+    )
+    __all__.append("solve_payvar_salant_gpu")
+except ImportError:
+    pass
