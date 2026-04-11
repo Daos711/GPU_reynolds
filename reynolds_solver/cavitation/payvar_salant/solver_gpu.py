@@ -59,7 +59,7 @@ def _build_coefficients_gpu(H_gpu, d_phi, d_Z, R, L):
 # -----------------------------------------------------------------------
 # GPU solver
 # -----------------------------------------------------------------------
-DEFAULT_PS_OMEGA = 1.0  # verified default for pinned active set
+# Inner PS omega: None = auto via compute_auto_omega
 
 
 def solve_payvar_salant_gpu(
@@ -86,10 +86,11 @@ def solve_payvar_salant_gpu(
     If ``g_init`` is supplied, the HS warmup is skipped and the initial
     active set is derived from ``g_init < 0`` (for ε-continuation).
     """
-    if omega is None:
-        omega = DEFAULT_PS_OMEGA
-
     N_Z, N_phi = H.shape
+
+    if omega is None:
+        from reynolds_solver.utils import compute_auto_omega
+        omega = compute_auto_omega(N_phi, N_Z, R, L)
 
     # Ghost-pack H on host, then upload
     H = np.ascontiguousarray(H, dtype=np.float64).copy()
