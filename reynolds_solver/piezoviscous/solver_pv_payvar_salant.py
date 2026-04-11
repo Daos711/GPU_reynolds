@@ -155,11 +155,16 @@ def solve_payvar_salant_piezoviscous(
         g_init = np.where(P > 1e-12, P, theta - 1.0)
         g_init = np.clip(g_init, -1.0, None)
 
-        # Solve PS with modified coefficients
+        # Solve PS with modified coefficients. max_outer_active_set=1
+        # freezes the cav_mask derived from g_init — prevents the
+        # "cavitation creep" where the active set expands on each PV
+        # iteration (the positive feedback P↓ → cav↑ → P↓ diverges if
+        # the mask is free to drift between PV steps).
         P_new, theta_new, res, n_inner = solve_payvar_salant_gpu(
             H, d_phi, d_Z, R, L,
             coefficients_ext=(A_pv, B_pv, C_pv, D_pv, E_pv),
             g_init=g_init,
+            max_outer_active_set=1,
             tol=tol,
             max_iter=max_iter,
             verbose=False,
