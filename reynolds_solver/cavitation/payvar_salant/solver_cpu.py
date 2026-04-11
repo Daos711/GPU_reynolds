@@ -348,9 +348,9 @@ def solve_payvar_salant_cpu(
     tol=1e-6,
     max_iter=50000,
     check_every=200,
-    hs_warmup_iter=2000,
+    hs_warmup_iter=5000,
     hs_warmup_tol=1e-7,
-    hs_warmup_omega=1.7,
+    hs_warmup_omega=None,
     pin_active_set=True,
     max_outer_active_set=10,
     cav_threshold=1e-10,
@@ -421,8 +421,11 @@ def solve_payvar_salant_cpu(
         (in which case you must supply `g_init`).
     hs_warmup_tol : float
         HS warmup convergence tolerance on max|ΔP|.
-    hs_warmup_omega : float
-        SOR ω for the linear HS warmup.
+    hs_warmup_omega : float or None
+        SOR ω for the linear HS warmup. If None (default), computed
+        automatically via ``compute_auto_omega`` — same formula as the
+        main HS solver, with cap=1.97. This is critical for large
+        grids where ω=1.7 is too slow to converge.
     pin_active_set : bool
         If True (default), freeze the cavitation mask inside each
         inner sweep. If False, fall back to the original nonlinear
@@ -470,6 +473,11 @@ def solve_payvar_salant_cpu(
         if verbose:
             print("  [PS] warm start from g_init (HS warmup skipped)")
     elif hs_warmup_iter > 0:
+        # Auto-omega for HS warmup — same formula as the main HS solver
+        if hs_warmup_omega is None:
+            from reynolds_solver.utils import compute_auto_omega
+            hs_warmup_omega = compute_auto_omega(N_phi, N_Z, R, L, cap=1.97)
+
         F_hs = np.zeros((N_Z, N_phi), dtype=np.float64)
         for i in range(1, N_Z - 1):
             for j in range(1, N_phi - 1):
@@ -489,7 +497,17 @@ def solve_payvar_salant_cpu(
         if verbose:
             print(
                 f"  [PS] HS warmup done: iter={n_iter_total}, "
-                f"res={hs_res:.3e}, maxP={P_hs.max():.4e}"
+                f"res={hs_res:.3e}, maxP={P_hs.max():.4e}, "
+                f"ω_hs={hs_warmup_omega:.4f}"
+            )
+        if hs_res > hs_warmup_tol:
+            import warnings
+            warnings.warn(
+                f"PS HS warmup did not converge: res={hs_res:.2e} > "
+                f"tol={hs_warmup_tol:.2e} after {hs_warmup_iter} iters "
+                f"(omega={hs_warmup_omega:.4f}). Solution may be "
+                f"unreliable. Consider increasing hs_warmup_iter.",
+                stacklevel=2,
             )
 
         g = P_hs

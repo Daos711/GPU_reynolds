@@ -263,15 +263,26 @@ def solve_reynolds(
                 "closure='laminar'."
             )
 
-        from reynolds_solver.cavitation.payvar_salant import (
-            solve_payvar_salant_cpu,
-        )
-        P, theta, residual, n_iter = solve_payvar_salant_cpu(
-            H, d_phi, d_Z, R, L,
-            tol=tol,
-            max_iter=max_iter,
-            verbose=verbose,
-        )
+        try:
+            from reynolds_solver.cavitation.payvar_salant import (
+                solve_payvar_salant_gpu,
+            )
+            P, theta, residual, n_iter = solve_payvar_salant_gpu(
+                H, d_phi, d_Z, R, L,
+                tol=tol,
+                max_iter=max_iter,
+                verbose=verbose,
+            )
+        except (ImportError, ModuleNotFoundError):
+            from reynolds_solver.cavitation.payvar_salant import (
+                solve_payvar_salant_cpu,
+            )
+            P, theta, residual, n_iter = solve_payvar_salant_cpu(
+                H, d_phi, d_Z, R, L,
+                tol=tol,
+                max_iter=max_iter,
+                verbose=verbose,
+            )
         return P, theta, residual, n_iter
 
     else:

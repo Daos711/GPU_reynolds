@@ -68,9 +68,9 @@ def solve_payvar_salant_gpu(
     tol=1e-6,
     max_iter=50000,
     check_every=100,
-    hs_warmup_iter=2000,
+    hs_warmup_iter=5000,
     hs_warmup_tol=1e-7,
-    hs_warmup_omega=1.7,
+    hs_warmup_omega=None,
     pin_active_set=True,
     max_outer_active_set=10,
     cav_threshold=1e-10,
@@ -127,6 +127,11 @@ def solve_payvar_salant_gpu(
         if verbose:
             print("  [PS-GPU] warm start from g_init (HS warmup skipped)")
     else:
+        # Auto-omega for HS warmup — same formula as the main HS solver
+        if hs_warmup_omega is None:
+            from reynolds_solver.utils import compute_auto_omega
+            hs_warmup_omega = compute_auto_omega(N_phi, N_Z, R, L, cap=1.97)
+
         # HS warmup on GPU
         hs_kernel = get_rb_sor_kernel()
         hs_bc_kernel = get_apply_bc_kernel()
@@ -140,8 +145,12 @@ def solve_payvar_salant_gpu(
         P_hs_prev = cp.zeros_like(P_hs)
 
         if verbose:
-            print("  [PS-GPU] HS warmup starting...")
+            print(
+                f"  [PS-GPU] HS warmup starting "
+                f"(ω_hs={hs_warmup_omega:.4f})..."
+            )
 
+        hs_res = 1.0
         for k in range(hs_warmup_iter):
             for color in (0, 1):
                 hs_kernel(
@@ -168,7 +177,17 @@ def solve_payvar_salant_gpu(
         if verbose:
             print(
                 f"  [PS-GPU] HS warmup done: iter={n_iter_total}, "
-                f"maxP={float(cp.max(P_hs)):.4e}"
+                f"res={hs_res:.3e}, maxP={float(cp.max(P_hs)):.4e}, "
+                f"ω_hs={hs_warmup_omega:.4f}"
+            )
+        if hs_res > hs_warmup_tol:
+            import warnings
+            warnings.warn(
+                f"PS-GPU HS warmup did not converge: res={hs_res:.2e} > "
+                f"tol={hs_warmup_tol:.2e} after {hs_warmup_iter} iters "
+                f"(omega={hs_warmup_omega:.4f}). Solution may be "
+                f"unreliable. Consider increasing hs_warmup_iter.",
+                stacklevel=2,
             )
 
         g = P_hs
