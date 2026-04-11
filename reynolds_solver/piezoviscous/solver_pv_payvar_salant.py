@@ -121,6 +121,13 @@ def solve_payvar_salant_piezoviscous(
     )
     n_iter_total = n_iter
 
+    # Freeze the cavitation mask from the first (isoviscous) solve.
+    # PV only changes conductance (Poiseuille part), not the physical
+    # rupture boundary. If we let the active set re-derive freely on
+    # each PV iteration, "cavitation creep" diverges (positive feedback
+    # P↓ → cav expands → P↓ → ...).
+    cav_mask_fixed = (theta < 1.0 - 1e-8)
+
     mu_ratio = cp.ones((N_Z, N_phi), dtype=cp.float64)
     converged = False
     dP_rel = 1.0
@@ -151,15 +158,13 @@ def solve_payvar_salant_piezoviscous(
             A_pv, B_pv, C_pv, D_pv, E_base, mu_ratio, N_Z, N_phi,
         )
 
-        # g_init from previous solution (skip HS warmup)
-        g_init = np.where(P > 1e-12, P, theta - 1.0)
+        # Build g_init consistent with the FROZEN cav_mask: full-film
+        # cells always get g >= 0 so they stay full-film when PS
+        # re-derives cav_mask from g_init < threshold.
+        g_init = np.where(cav_mask_fixed, theta - 1.0, np.maximum(P, 0.0))
         g_init = np.clip(g_init, -1.0, None)
 
-        # Solve PS with modified coefficients. max_outer_active_set=1
-        # freezes the cav_mask derived from g_init — prevents the
-        # "cavitation creep" where the active set expands on each PV
-        # iteration (the positive feedback P↓ → cav↑ → P↓ diverges if
-        # the mask is free to drift between PV steps).
+        # Solve PS with modified coefficients and frozen active set.
         P_new, theta_new, res, n_inner = solve_payvar_salant_gpu(
             H, d_phi, d_Z, R, L,
             coefficients_ext=(A_pv, B_pv, C_pv, D_pv, E_pv),
