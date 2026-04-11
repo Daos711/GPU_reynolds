@@ -75,6 +75,7 @@ def solve_payvar_salant_gpu(
     max_outer_active_set=10,
     cav_threshold=1e-10,
     g_init=None,
+    coefficients_ext=None,
     verbose=False,
 ):
     """
@@ -85,6 +86,11 @@ def solve_payvar_salant_gpu(
 
     If ``g_init`` is supplied, the HS warmup is skipped and the initial
     active set is derived from ``g_init < 0`` (for ε-continuation).
+
+    If ``coefficients_ext`` is supplied as (A, B, C, D, E) cupy arrays,
+    they are used directly instead of building from H (for piezoviscous
+    outer loop where conductance is divided by face-averaged μ_ratio).
+    H is still needed for the Couette term inside the SOR kernel.
     """
     N_Z, N_phi = H.shape
 
@@ -97,8 +103,11 @@ def solve_payvar_salant_gpu(
     H[:, N_phi - 1] = H[:, 1]
     H_gpu = cp.asarray(H)
 
-    # Coefficients on GPU (average-of-cubes)
-    A, B, C, D, E = _build_coefficients_gpu(H_gpu, d_phi, d_Z, R, L)
+    # Coefficients on GPU
+    if coefficients_ext is not None:
+        A, B, C, D, E = coefficients_ext
+    else:
+        A, B, C, D, E = _build_coefficients_gpu(H_gpu, d_phi, d_Z, R, L)
 
     # Launch config (same 32×8 block as the HS solver)
     block = (32, 8, 1)

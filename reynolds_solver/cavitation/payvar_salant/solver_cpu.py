@@ -355,6 +355,7 @@ def solve_payvar_salant_cpu(
     max_outer_active_set=10,
     cav_threshold=1e-10,
     g_init=None,
+    coefficients_ext=None,
     verbose=False,
 ):
     """
@@ -457,7 +458,10 @@ def solve_payvar_salant_cpu(
     H[:, 0] = H[:, N_phi - 2]
     H[:, N_phi - 1] = H[:, 1]
 
-    A, B, C, D, E = _build_coefficients(H, d_phi, d_Z, R, L)
+    if coefficients_ext is not None:
+        A, B, C, D, E = coefficients_ext
+    else:
+        A, B, C, D, E = _build_coefficients(H, d_phi, d_Z, R, L)
 
     n_iter_total = 0
 

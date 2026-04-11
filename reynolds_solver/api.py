@@ -170,10 +170,6 @@ def solve_reynolds(
 
     # --- Piezoviscous path (overrides normal dispatch) ---
     if alpha_pv is not None:
-        if cavitation != "half_sommerfeld":
-            raise NotImplementedError(
-                "Piezoviscosity only supported with cavitation='half_sommerfeld'."
-            )
         if closure != "laminar":
             raise NotImplementedError(
                 "Piezoviscosity only supported with closure='laminar'."
@@ -181,6 +177,19 @@ def solve_reynolds(
         if p_scale is None:
             raise ValueError(
                 "p_scale is required when alpha_pv is set."
+            )
+
+        if cavitation == "payvar_salant":
+            from reynolds_solver.piezoviscous.solver_pv_payvar_salant import (
+                solve_payvar_salant_piezoviscous,
+            )
+            return solve_payvar_salant_piezoviscous(
+                H, d_phi, d_Z, R, L,
+                alpha_pv=alpha_pv, p_scale=p_scale,
+                p0_roelands=p0_roelands, z_roelands=z_roelands,
+                tol_outer=tol_outer, max_outer=max_outer_pv,
+                relax=relax_pv,
+                tol=tol, max_iter=max_iter, verbose=verbose,
             )
 
         if pv_method == "transformed":
