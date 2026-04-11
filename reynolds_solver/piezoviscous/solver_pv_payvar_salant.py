@@ -5,17 +5,20 @@ Wraps the Payvar-Salant mass-conserving JFO solver in the standard
 Roelands piezoviscosity outer loop:
 
     for each PV iteration:
-        μ̄(P) ← Roelands(P)               (with under-relaxation)
+        μ̄(P) ← Roelands(P)               (with under-relaxation on μ̄)
         A,B,C,D ← A_base/μ̄_face           (conductance ∝ 1/μ)
         P, θ ← PS_solve(H, A,B,C,D,E,     (Couette uses real H)
                          g_init=g_prev)
+        g ← relax_g·g_new + (1-relax_g)·g_old   (g-level relaxation)
 
 The conductance (Poiseuille part) is divided by face-averaged μ_ratio.
 The Couette term is NOT modified — viscosity does not enter Couette
 flow in the standard Newtonian Reynolds formulation.
 
 Between PV iterations the PS solver re-derives its active set from
-``g_init`` (previous solution) rather than re-running the HS warmup.
+g_init with full active-set loop (max_outer_active_set=10). The
+g-level relaxation prevents cavitation creep by blending the new
+solution with the old one in the unified variable space.
 """
 import numpy as np
 
@@ -32,6 +35,11 @@ from reynolds_solver.piezoviscous.solver_piezoviscous import (
     _apply_piezoviscosity,
 )
 
+# Seed for full-film cells in g_init: must be >> cav_threshold (1e-10)
+# so that PS classifies them as full-film unambiguously.
+_CAV_THRESHOLD = 1e-10
+_SEED = max(100 * _CAV_THRESHOLD, 1e-8)
+
 
 def solve_payvar_salant_piezoviscous(
     H, d_phi, d_Z, R, L,
@@ -40,7 +48,8 @@ def solve_payvar_salant_piezoviscous(
     z_roelands=0.6,
     tol_outer=1e-3,
     max_outer=30,
-    relax=0.5,
+    relax_mu=0.5,
+    relax_g=0.7,
     tol=1e-6,
     max_iter=50000,
     verbose=False,
@@ -59,10 +68,13 @@ def solve_payvar_salant_piezoviscous(
     p0_roelands, z_roelands : float — Roelands model parameters.
     tol_outer : float — PV outer loop convergence on max|ΔP|/max|P|.
     max_outer : int — max PV iterations.
-    relax : float — under-relaxation for μ̄ update (in log-space).
+    relax_mu : float — under-relaxation for μ̄ (log-space), default 0.5.
+    relax_g : float — under-relaxation for g (unified variable), default 0.7.
     tol : float — inner PS convergence tolerance.
     max_iter : int — inner PS max iterations.
     verbose : bool.
+    return_diagnostics : bool — if True, append a dict with n_outer,
+        converged, dP_rel_final, mu_max to the return tuple.
 
     Returns
     -------
@@ -70,9 +82,8 @@ def solve_payvar_salant_piezoviscous(
     theta : (N_Z, N_phi) float64
     residual : float — final inner PS residual.
     n_iter : int — total inner iterations across all PV steps.
+    [diag : dict] — only if return_diagnostics=True.
     """
-    import cupy as cp
-
     # --- Special case: no piezoviscosity ---
     if abs(alpha_pv) < 1e-30:
         try:
@@ -115,38 +126,39 @@ def solve_payvar_salant_piezoviscous(
     )
 
     # First solve without PV (μ̄ = 1)
-    P, theta, res, n_iter = solve_payvar_salant_gpu(
+    P_np, theta_np, res, n_iter = solve_payvar_salant_gpu(
         H, d_phi, d_Z, R, L,
         tol=tol, max_iter=max_iter, verbose=False,
     )
     n_iter_total = n_iter
 
-    # Freeze the cavitation mask from the first (isoviscous) solve.
-    # PV only changes conductance (Poiseuille part), not the physical
-    # rupture boundary. If we let the active set re-derive freely on
-    # each PV iteration, "cavitation creep" diverges (positive feedback
-    # P↓ → cav expands → P↓ → ...).
-    cav_mask_fixed = (theta < 1.0 - 1e-8)
-
+    # Move to GPU for all subsequent operations
+    P_g = cp.asarray(P_np)
+    theta_g = cp.asarray(theta_np)
     mu_ratio = cp.ones((N_Z, N_phi), dtype=cp.float64)
+
     converged = False
     dP_rel = 1.0
     outer = 0
 
     # PV outer loop
     for outer in range(1, max_outer + 1):
-        P_old = P.copy()
-
-        # μ̄ from current P
-        P_gpu = cp.asarray(P)
-        mu_ratio_new, n_clamped = _compute_mu_ratio_gpu(
-            P_gpu, alpha_pv, p_scale, p0_roelands, z_roelands,
+        # g_old from current state (all on GPU)
+        g_old = cp.where(
+            theta_g < 1.0 - 1e-8,
+            theta_g - 1.0,
+            cp.maximum(P_g, _SEED),
         )
+        g_old = cp.clip(g_old, -1.0, None)
 
-        # Under-relaxation in log-space
-        log_mu_old = cp.log(cp.clip(mu_ratio, 1e-30, None))
-        log_mu_new = cp.log(cp.clip(mu_ratio_new, 1e-30, None))
-        log_mu = (1.0 - relax) * log_mu_old + relax * log_mu_new
+        # μ̄ with log-space relaxation
+        mu_ratio_new, n_clamped = _compute_mu_ratio_gpu(
+            P_g, alpha_pv, p_scale, p0_roelands, z_roelands,
+        )
+        log_mu = (
+            (1.0 - relax_mu) * cp.log(cp.clip(mu_ratio, 1e-30, None))
+            + relax_mu * cp.log(cp.clip(mu_ratio_new, 1e-30, None))
+        )
         mu_ratio = cp.exp(log_mu)
 
         # Modify conductance coefficients
@@ -158,45 +170,69 @@ def solve_payvar_salant_piezoviscous(
             A_pv, B_pv, C_pv, D_pv, E_base, mu_ratio, N_Z, N_phi,
         )
 
-        # Build g_init consistent with the FROZEN cav_mask: full-film
-        # cells always get g >= 0 so they stay full-film when PS
-        # re-derives cav_mask from g_init < threshold.
-        g_init = np.where(cav_mask_fixed, theta - 1.0, np.maximum(P, 0.0))
-        g_init = np.clip(g_init, -1.0, None)
+        # g_init for PS (PS expects numpy for g_init)
+        g_init_np = cp.asnumpy(g_old)
 
-        # Solve PS with modified coefficients and frozen active set.
-        P_new, theta_new, res, n_inner = solve_payvar_salant_gpu(
+        # PS solve with full active-set loop
+        P_new_np, theta_new_np, res, n_inner = solve_payvar_salant_gpu(
             H, d_phi, d_Z, R, L,
             coefficients_ext=(A_pv, B_pv, C_pv, D_pv, E_pv),
-            g_init=g_init,
-            max_outer_active_set=1,
+            g_init=g_init_np,
+            max_outer_active_set=10,
             tol=tol,
             max_iter=max_iter,
             verbose=False,
         )
         n_iter_total += n_inner
 
-        # Convergence check
-        max_P = float(np.max(np.abs(P_new))) + 1e-30
-        dP_rel = float(np.max(np.abs(P_new - P_old))) / max_P
+        # g_new from PS result (on GPU)
+        P_new = cp.asarray(P_new_np)
+        theta_new = cp.asarray(theta_new_np)
+        g_new = cp.where(
+            theta_new < 1.0 - 1e-8,
+            theta_new - 1.0,
+            cp.maximum(P_new, _SEED),
+        )
+        g_new = cp.clip(g_new, -1.0, None)
+
+        # g-level relaxation
+        g = relax_g * g_new + (1.0 - relax_g) * g_old
+        g = cp.clip(g, -1.0, None)
+
+        # Recover consistent P, θ from relaxed g
+        P_g = cp.maximum(g, 0.0)
+        theta_g = cp.where(g >= 0.0, 1.0, 1.0 + g)
+        theta_g = cp.clip(theta_g, 0.0, 1.0)
+
+        # Convergence on relaxed state
+        P_old_from_g = cp.maximum(g_old, 0.0)
+        max_P = float(cp.max(cp.abs(P_g))) + 1e-30
+        dP_rel = float(cp.max(cp.abs(P_g - P_old_from_g))) / max_P
+        converged = dP_rel < tol_outer
 
         if verbose:
             mu_max = float(cp.max(mu_ratio))
-            cav_frac = float(np.mean(theta_new[1:-1, 1:-1] < 1.0 - 1e-6))
+            cav_frac = float(cp.mean(
+                (theta_g[1:-1, 1:-1] < 1.0 - 1e-6).astype(cp.float64)
+            ))
+            dg_rel = float(cp.max(cp.abs(g - g_old))) / (
+                float(cp.max(cp.abs(g))) + 1e-30
+            )
             print(
                 f"  pv+ps outer={outer}: dP_rel={dP_rel:.2e}, "
-                f"mu_max={mu_max:.3f}, cav={cav_frac:.3f}, "
-                f"inner={n_inner}"
+                f"dg_rel={dg_rel:.2e}, mu_max={mu_max:.3f}, "
+                f"cav={cav_frac:.3f}, inner={n_inner}"
                 + (f", CLAMP={n_clamped}" if n_clamped > 0 else "")
             )
-
-        P, theta = P_new, theta_new
-        converged = dP_rel < tol_outer
 
         if converged:
             if verbose:
                 print(f"  pv+ps CONVERGED at outer={outer}")
             break
+
+    # Transfer to host
+    P = cp.asnumpy(P_g)
+    theta = cp.asnumpy(theta_g)
 
     if return_diagnostics:
         diag = {

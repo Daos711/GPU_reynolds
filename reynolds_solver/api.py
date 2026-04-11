@@ -188,7 +188,7 @@ def solve_reynolds(
                 alpha_pv=alpha_pv, p_scale=p_scale,
                 p0_roelands=p0_roelands, z_roelands=z_roelands,
                 tol_outer=tol_outer, max_outer=max_outer_pv,
-                relax=relax_pv,
+                relax_mu=relax_pv,
                 tol=tol, max_iter=max_iter, verbose=verbose,
             )
 
