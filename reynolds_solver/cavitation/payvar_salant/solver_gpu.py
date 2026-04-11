@@ -105,7 +105,24 @@ def solve_payvar_salant_gpu(
 
     # Coefficients on GPU
     if coefficients_ext is not None:
+        if len(coefficients_ext) != 5:
+            raise ValueError(
+                "coefficients_ext must be tuple of 5 arrays (A,B,C,D,E)"
+            )
         A, B, C, D, E = coefficients_ext
+        for name, arr in [("A", A), ("B", B), ("C", C), ("D", D), ("E", E)]:
+            if not isinstance(arr, cp.ndarray):
+                raise TypeError(
+                    f"{name} in coefficients_ext must be cupy array"
+                )
+            if arr.shape != H_gpu.shape:
+                raise ValueError(
+                    f"{name} shape {arr.shape} != H shape {H_gpu.shape}"
+                )
+            if arr.dtype != cp.float64:
+                raise TypeError(
+                    f"{name} dtype {arr.dtype} != float64"
+                )
     else:
         A, B, C, D, E = _build_coefficients_gpu(H_gpu, d_phi, d_Z, R, L)
 

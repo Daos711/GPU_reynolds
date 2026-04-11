@@ -459,7 +459,24 @@ def solve_payvar_salant_cpu(
     H[:, N_phi - 1] = H[:, 1]
 
     if coefficients_ext is not None:
+        if len(coefficients_ext) != 5:
+            raise ValueError(
+                "coefficients_ext must be tuple of 5 arrays (A,B,C,D,E)"
+            )
         A, B, C, D, E = coefficients_ext
+        for name, arr in [("A", A), ("B", B), ("C", C), ("D", D), ("E", E)]:
+            if not isinstance(arr, np.ndarray):
+                raise TypeError(
+                    f"{name} in coefficients_ext must be numpy array"
+                )
+            if arr.shape != H.shape:
+                raise ValueError(
+                    f"{name} shape {arr.shape} != H shape {H.shape}"
+                )
+            if arr.dtype != np.float64:
+                raise TypeError(
+                    f"{name} dtype {arr.dtype} != float64"
+                )
     else:
         A, B, C, D, E = _build_coefficients(H, d_phi, d_Z, R, L)
 

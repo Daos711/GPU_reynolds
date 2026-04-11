@@ -19,6 +19,14 @@ Between PV iterations the PS solver re-derives its active set from
 """
 import numpy as np
 
+try:
+    import cupy as cp
+except ImportError:
+    raise ImportError(
+        "Piezoviscous + Payvar-Salant requires cupy. "
+        "Install cupy or use cavitation='half_sommerfeld' for CPU-only."
+    )
+
 from reynolds_solver.piezoviscous.solver_piezoviscous import (
     _compute_mu_ratio_gpu,
     _apply_piezoviscosity,
@@ -36,6 +44,7 @@ def solve_payvar_salant_piezoviscous(
     tol=1e-6,
     max_iter=50000,
     verbose=False,
+    return_diagnostics=False,
 ):
     """
     Piezoviscous Payvar-Salant solver (Roelands + mass-conserving JFO).
@@ -70,7 +79,7 @@ def solve_payvar_salant_piezoviscous(
             from reynolds_solver.cavitation.payvar_salant import (
                 solve_payvar_salant_gpu,
             )
-            return solve_payvar_salant_gpu(
+            result = solve_payvar_salant_gpu(
                 H, d_phi, d_Z, R, L, tol=tol, max_iter=max_iter,
                 verbose=verbose,
             )
@@ -78,10 +87,14 @@ def solve_payvar_salant_piezoviscous(
             from reynolds_solver.cavitation.payvar_salant import (
                 solve_payvar_salant_cpu,
             )
-            return solve_payvar_salant_cpu(
+            result = solve_payvar_salant_cpu(
                 H, d_phi, d_Z, R, L, tol=tol, max_iter=max_iter,
                 verbose=verbose,
             )
+        if return_diagnostics:
+            return result + ({"n_outer": 0, "converged": True,
+                              "dP_rel_final": 0.0, "mu_max": 1.0},)
+        return result
 
     from reynolds_solver.cavitation.payvar_salant.solver_gpu import (
         solve_payvar_salant_gpu,
@@ -109,6 +122,9 @@ def solve_payvar_salant_piezoviscous(
     n_iter_total = n_iter
 
     mu_ratio = cp.ones((N_Z, N_phi), dtype=cp.float64)
+    converged = False
+    dP_rel = 1.0
+    outer = 0
 
     # PV outer loop
     for outer in range(1, max_outer + 1):
@@ -165,10 +181,19 @@ def solve_payvar_salant_piezoviscous(
             )
 
         P, theta = P_new, theta_new
+        converged = dP_rel < tol_outer
 
-        if dP_rel < tol_outer:
+        if converged:
             if verbose:
                 print(f"  pv+ps CONVERGED at outer={outer}")
             break
 
+    if return_diagnostics:
+        diag = {
+            "n_outer": outer,
+            "converged": converged,
+            "dP_rel_final": dP_rel,
+            "mu_max": float(cp.max(mu_ratio)),
+        }
+        return P, theta, res, n_iter_total, diag
     return P, theta, res, n_iter_total
