@@ -191,11 +191,32 @@ def add_dynamic_rhs_gpu(F_full, d_phi, N_Z, N_phi, xprime, yprime, beta, phase_s
     F_full += dyn_term[cp.newaxis, :]
 
 
+def _update_patch(H, i_lo, i_hi, j_lo, j_hi,
+                  phi_local, Z_local, phi_c, Z_c,
+                  A, B, H_p, profile):
+    """Update H[i_lo:i_hi, j_lo:j_hi] from one dimple centred at (phi_c, Z_c)."""
+    Phi_loc, Z_loc = np.meshgrid(phi_local, Z_local)
+    delta_phi = np.arctan2(np.sin(Phi_loc - phi_c), np.cos(Phi_loc - phi_c))
+    expr = (delta_phi / B) ** 2 + ((Z_loc - Z_c) / A) ** 2
+    t = np.clip(1.0 - expr, 0.0, None)
+    if profile == "sqrt":
+        contrib = H_p * np.sqrt(t)
+    elif profile == "smoothcap":
+        contrib = H_p * t * t
+    else:
+        raise ValueError(f"Unknown profile: {profile}")
+    H[i_lo:i_hi, j_lo:j_hi] += contrib
+
+
 def create_H_with_ellipsoidal_depressions(H0, H_p, Phi_mesh, Z_mesh,
                                            phi_c_flat, Z_c_flat, A, B,
                                            profile="sqrt"):
     """
     Create gap field H with ellipsoidal surface depressions (CPU, numpy).
+
+    Uses sparse local update: each dimple only touches a small patch
+    (~6×6 nodes), so complexity is O(N_dimples × patch²) instead of
+    O(N_dimples × N_grid).
 
     Parameters
     ----------
@@ -210,17 +231,69 @@ def create_H_with_ellipsoidal_depressions(H0, H_p, Phi_mesh, Z_mesh,
     -------
     H : np.ndarray -- gap with depressions
     """
-    H = H0.copy()
-    for k in range(len(phi_c_flat)):
+    H = np.array(H0, dtype=np.float64, copy=True)
+    N_dimples = len(phi_c_flat)
+    if N_dimples == 0:
+        return H
+
+    N_Z, N_phi = H.shape
+
+    phi_1d = Phi_mesh[0, :]
+    Z_1d = Z_mesh[:, 0]
+    d_phi = phi_1d[1] - phi_1d[0]
+    d_Z = Z_1d[1] - Z_1d[0]
+
+    for k in range(N_dimples):
         phi_c = phi_c_flat[k]
         Z_c = Z_c_flat[k]
-        delta_phi = np.arctan2(np.sin(Phi_mesh - phi_c), np.cos(Phi_mesh - phi_c))
-        expr = (delta_phi / B) ** 2 + ((Z_mesh - Z_c) / A) ** 2
-        inside = expr <= 1
-        if profile == "sqrt":
-            H[inside] += H_p * np.sqrt(1 - expr[inside])
-        elif profile == "smoothcap":
-            H[inside] += H_p * (1 - expr[inside])**2
+
+        # Z patch (simple clamp)
+        i_lo = max(0, int((Z_c - A - Z_1d[0]) / d_Z) - 1)
+        i_hi = min(N_Z, int((Z_c + A - Z_1d[0]) / d_Z) + 2)
+        if i_lo >= i_hi:
+            continue
+
+        # φ patch (may wrap around 0/2π seam)
+        j_center = phi_c / d_phi
+        j_half = B / d_phi + 1
+        j_lo = int(j_center - j_half)
+        j_hi = int(j_center + j_half) + 1
+
+        Z_local = Z_1d[i_lo:i_hi]
+
+        if j_lo >= 0 and j_hi <= N_phi:
+            # Normal case: patch fits inside the array
+            phi_local = phi_1d[j_lo:j_hi]
+            _update_patch(H, i_lo, i_hi, j_lo, j_hi,
+                          phi_local, Z_local, phi_c, Z_c,
+                          A, B, H_p, profile)
         else:
-            raise ValueError(f"Unknown profile: {profile}")
+            # Wrap-around: split into two patches
+            if j_lo < 0:
+                # Piece 1: end of array
+                jj1_lo = j_lo % N_phi
+                phi1 = phi_1d[jj1_lo:]
+                _update_patch(H, i_lo, i_hi, jj1_lo, N_phi,
+                              phi1, Z_local, phi_c, Z_c,
+                              A, B, H_p, profile)
+                # Piece 2: beginning of array
+                if j_hi > 0:
+                    phi2 = phi_1d[:j_hi]
+                    _update_patch(H, i_lo, i_hi, 0, j_hi,
+                                  phi2, Z_local, phi_c, Z_c,
+                                  A, B, H_p, profile)
+            else:  # j_hi > N_phi
+                # Piece 1: end of array
+                phi1 = phi_1d[j_lo:]
+                _update_patch(H, i_lo, i_hi, j_lo, N_phi,
+                              phi1, Z_local, phi_c, Z_c,
+                              A, B, H_p, profile)
+                # Piece 2: beginning of array
+                jj2_hi = j_hi - N_phi
+                if jj2_hi > 0:
+                    phi2 = phi_1d[:jj2_hi]
+                    _update_patch(H, i_lo, i_hi, 0, jj2_hi,
+                                  phi2, Z_local, phi_c, Z_c,
+                                  A, B, H_p, profile)
+
     return H
