@@ -344,7 +344,7 @@ def _ps_pde_residual(g, H, A, B, C, D, E, d_phi, N_Z, N_phi):
 # ----------------------------------------------------------------------------
 def solve_payvar_salant_cpu(
     H, d_phi, d_Z, R, L,
-    omega=None,
+    omega=1.0,
     tol=1e-6,
     max_iter=50000,
     check_every=200,
@@ -456,11 +456,6 @@ def solve_payvar_salant_cpu(
     H = np.ascontiguousarray(H, dtype=np.float64).copy()
     H[:, 0] = H[:, N_phi - 2]
     H[:, N_phi - 1] = H[:, 1]
-
-    # Auto-omega for inner PS sweep
-    if omega is None:
-        from reynolds_solver.utils import compute_auto_omega
-        omega = compute_auto_omega(N_phi, N_Z, R, L)
 
     A, B, C, D, E = _build_coefficients(H, d_phi, d_Z, R, L)
 

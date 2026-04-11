@@ -59,7 +59,7 @@ def _build_coefficients_gpu(H_gpu, d_phi, d_Z, R, L):
 # -----------------------------------------------------------------------
 # GPU solver
 # -----------------------------------------------------------------------
-# Inner PS omega: None = auto via compute_auto_omega
+DEFAULT_PS_OMEGA = 1.0  # fixed for inner sweep (non-uniform diagonal)
 
 
 def solve_payvar_salant_gpu(
@@ -89,8 +89,7 @@ def solve_payvar_salant_gpu(
     N_Z, N_phi = H.shape
 
     if omega is None:
-        from reynolds_solver.utils import compute_auto_omega
-        omega = compute_auto_omega(N_phi, N_Z, R, L)
+        omega = DEFAULT_PS_OMEGA
 
     # Ghost-pack H on host, then upload
     H = np.ascontiguousarray(H, dtype=np.float64).copy()
