@@ -421,6 +421,133 @@ def test_gpu_vs_cpu():
 
 
 # -----------------------------------------------------------------------
+# Test 8: phi_bc='periodic' default matches no-kwarg call
+# -----------------------------------------------------------------------
+def test_phi_bc_periodic_default():
+    print("\n=== Test 8: phi_bc='periodic' default matches no-kwarg ===")
+    from reynolds_solver.cavitation.payvar_salant import solve_payvar_salant_cpu
+
+    R, L = 0.035, 0.056
+    N_phi, N_Z = 50, 30
+    H, d_phi, d_Z, _, _ = generate_test_case(N_phi, N_Z, epsilon=0.6)
+
+    P_a, th_a, _, _ = solve_payvar_salant_cpu(
+        H, d_phi, d_Z, R, L, tol=1e-7, max_iter=20000,
+    )
+    P_b, th_b, _, _ = solve_payvar_salant_cpu(
+        H, d_phi, d_Z, R, L, tol=1e-7, max_iter=20000,
+        phi_bc="periodic",
+    )
+
+    dP = float(np.max(np.abs(P_a - P_b)))
+    dth = float(np.max(np.abs(th_a - th_b)))
+    print(f"    max|ΔP|={dP:.2e}, max|Δθ|={dth:.2e}")
+
+    return run_test(
+        "phi_bc='periodic' default is bit-for-bit identical",
+        dP == 0.0 and dth == 0.0,
+        f"dP={dP:.2e}, dth={dth:.2e}",
+    )
+
+
+# -----------------------------------------------------------------------
+# Test 9: phi_bc='groove' smoke test (CPU)
+# -----------------------------------------------------------------------
+def test_phi_bc_groove_smoke_cpu():
+    print("\n=== Test 9: phi_bc='groove' smoke (CPU) ===")
+    from reynolds_solver.cavitation.payvar_salant import solve_payvar_salant_cpu
+
+    R, L = 0.035, 0.056
+    N_phi, N_Z = 50, 30
+    H, d_phi, d_Z, _, _ = generate_test_case(N_phi, N_Z, epsilon=0.6)
+
+    P_per, th_per, _, _ = solve_payvar_salant_cpu(
+        H, d_phi, d_Z, R, L, tol=1e-7, max_iter=20000,
+        phi_bc="periodic",
+    )
+    P_g, th_g, _, _ = solve_payvar_salant_cpu(
+        H, d_phi, d_Z, R, L, tol=1e-7, max_iter=20000,
+        phi_bc="groove",
+    )
+
+    # Boundary Dirichlet enforcement
+    P_boundary_max = max(float(np.max(np.abs(P_g[:, 0]))),
+                         float(np.max(np.abs(P_g[:, -1]))))
+    th_boundary_min = min(float(np.min(th_g[:, 0])),
+                          float(np.min(th_g[:, -1])))
+    th_boundary_max = max(float(np.max(th_g[:, 0])),
+                          float(np.max(th_g[:, -1])))
+
+    # Groove must differ from periodic (otherwise the BC has no effect)
+    differs = float(np.max(np.abs(P_g - P_per))) > 1e-4
+
+    print(f"    P at j=0, j=-1: max |P| = {P_boundary_max:.2e}")
+    print(f"    θ at j=0, j=-1: range [{th_boundary_min:.4f}, "
+          f"{th_boundary_max:.4f}]")
+    print(f"    max|P_groove - P_periodic| = "
+          f"{float(np.max(np.abs(P_g - P_per))):.4e}")
+    print(f"    cav_frac: periodic={float(np.mean(th_per[1:-1,1:-1]<1-1e-6)):.3f}, "
+          f"groove={float(np.mean(th_g[1:-1,1:-1]<1-1e-6)):.3f}")
+
+    p_ok = P_boundary_max < 1e-12
+    th_ok = (abs(th_boundary_min - 1.0) < 1e-12
+             and abs(th_boundary_max - 1.0) < 1e-12)
+
+    return run_test(
+        "phi_bc='groove': P=0 & θ=1 at seam, differs from periodic",
+        p_ok and th_ok and differs,
+        f"P_b={P_boundary_max:.2e}, θ_range=[{th_boundary_min:.4f}, "
+        f"{th_boundary_max:.4f}], differs={differs}",
+    )
+
+
+# -----------------------------------------------------------------------
+# Test 10: PV + phi_bc='groove' convergence
+# -----------------------------------------------------------------------
+def test_pv_groove_convergence():
+    print("\n=== Test 10: PV + phi_bc='groove' convergence ===")
+    try:
+        from reynolds_solver.piezoviscous.solver_pv_payvar_salant import (
+            solve_payvar_salant_piezoviscous,
+        )
+    except ImportError:
+        print("  [SKIP] cupy not available — PV+groove test skipped")
+        return run_test("PV+groove", True, "SKIPPED (no cupy)")
+
+    R, L = 0.035, 0.056
+    N_phi, N_Z = 100, 40
+    H, d_phi, d_Z, _, _ = generate_test_case(N_phi, N_Z, epsilon=0.6)
+
+    # Pump bearing parameters
+    c = 50e-6
+    eta = 0.022
+    omega_shaft = 2 * np.pi * 3000 / 60
+    p_scale = 6 * eta * omega_shaft * (R / c) ** 2
+
+    P, theta, res, n_iter = solve_payvar_salant_piezoviscous(
+        H, d_phi, d_Z, R, L,
+        alpha_pv=18e-9, p_scale=p_scale,
+        phi_bc="groove",
+        verbose=False,
+    )
+
+    P_boundary_max = max(float(np.max(np.abs(P[:, 0]))),
+                         float(np.max(np.abs(P[:, -1]))))
+    no_nan = np.all(np.isfinite(P)) and np.all(np.isfinite(theta))
+    p_ok = (P.min() >= -1e-12) and (P.max() > 1e-3)
+    th_ok = (theta.min() >= -1e-12) and (theta.max() <= 1.0 + 1e-12)
+
+    print(f"    n_iter={n_iter}, maxP={P.max():.4e}")
+    print(f"    P at j=0, j=-1: max |P| = {P_boundary_max:.2e}")
+
+    return run_test(
+        "PV+groove: converges, P=0 at seam, invariants hold",
+        no_nan and p_ok and th_ok and P_boundary_max < 1e-10,
+        f"maxP={P.max():.3e}, P_boundary={P_boundary_max:.2e}",
+    )
+
+
+# -----------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------
 def main():
@@ -437,6 +564,9 @@ def main():
         ("5", test_load_vs_hs_multiple_epsilon),
         ("6", test_api_smoke),
         ("7", test_gpu_vs_cpu),
+        ("8", test_phi_bc_periodic_default),
+        ("9", test_phi_bc_groove_smoke_cpu),
+        ("10", test_pv_groove_convergence),
     ]
 
     results = []

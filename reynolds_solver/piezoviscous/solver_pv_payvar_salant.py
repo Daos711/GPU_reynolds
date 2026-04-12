@@ -114,16 +114,21 @@ def solve_payvar_salant_piezoviscous(
     )
 
     N_Z, N_phi = H.shape
+    groove = phi_bc == "groove"
 
     # Ghost-pack H and upload
     H_np = np.ascontiguousarray(H, dtype=np.float64).copy()
-    H_np[:, 0] = H_np[:, N_phi - 2]
-    H_np[:, N_phi - 1] = H_np[:, 1]
+    if groove:
+        H_np[:, 0] = H_np[:, 1]
+        H_np[:, N_phi - 1] = H_np[:, N_phi - 2]
+    else:
+        H_np[:, 0] = H_np[:, N_phi - 2]
+        H_np[:, N_phi - 1] = H_np[:, 1]
     H_gpu = cp.asarray(H_np)
 
     # Base coefficients (without PV) — built once
     A_base, B_base, C_base, D_base, E_base = _build_coefficients_gpu(
-        H_gpu, d_phi, d_Z, R, L,
+        H_gpu, d_phi, d_Z, R, L, groove=groove,
     )
 
     # First solve without PV (μ̄ = 1)

@@ -600,9 +600,13 @@ def solve_payvar_salant_cpu(
     # re-solved into negative g).
     cav_mask[0, :] = 0
     cav_mask[-1, :] = 0
-    # Ghost columns track the physical seam
-    cav_mask[:, 0] = cav_mask[:, N_phi - 2]
-    cav_mask[:, N_phi - 1] = cav_mask[:, 1]
+    # Phi boundaries: periodic ghost wrap, or Dirichlet full-film in groove
+    if groove:
+        cav_mask[:, 0] = 0
+        cav_mask[:, N_phi - 1] = 0
+    else:
+        cav_mask[:, 0] = cav_mask[:, N_phi - 2]
+        cav_mask[:, N_phi - 1] = cav_mask[:, 1]
 
     # Seed g = 0 inside the initial cavitation set (start of each inner
     # sweep from a clean mass-content state, not from P_hs clamping noise).
@@ -653,8 +657,12 @@ def solve_payvar_salant_cpu(
         ).astype(np.int32)
         new_cav[0, :] = 0
         new_cav[-1, :] = 0
-        new_cav[:, 0] = new_cav[:, N_phi - 2]
-        new_cav[:, N_phi - 1] = new_cav[:, 1]
+        if groove:
+            new_cav[:, 0] = 0
+            new_cav[:, N_phi - 1] = 0
+        else:
+            new_cav[:, 0] = new_cav[:, N_phi - 2]
+            new_cav[:, N_phi - 1] = new_cav[:, 1]
 
         flips = int(
             np.sum(new_cav[1:-1, 1:-1] != cav_mask[1:-1, 1:-1])
