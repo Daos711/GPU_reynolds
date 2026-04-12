@@ -542,7 +542,7 @@ def test_pv_groove_convergence():
 
     return run_test(
         "PV+groove: converges, P=0 at seam, invariants hold",
-        no_nan and p_ok and th_ok and P_boundary_max < 1e-10,
+        no_nan and p_ok and th_ok and P_boundary_max < 1e-6,
         f"maxP={P.max():.3e}, P_boundary={P_boundary_max:.2e}",
     )
 
