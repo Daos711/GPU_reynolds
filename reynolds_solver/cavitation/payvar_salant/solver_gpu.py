@@ -18,17 +18,22 @@ import cupy as cp
 from reynolds_solver.cavitation.payvar_salant.kernels import (
     get_ps_rb_sor_kernel,
     get_apply_bc_ps_kernel,
+    get_hs_rb_sor_pv_kernel,
+    get_hs_apply_bc_pv_kernel,
 )
-from reynolds_solver.kernels import get_rb_sor_kernel, get_apply_bc_kernel
 
 
 # -----------------------------------------------------------------------
 # Coefficient build on GPU (average-of-cubes)
 # -----------------------------------------------------------------------
-def _build_coefficients_gpu(H_gpu, d_phi, d_Z, R, L):
+def _build_coefficients_gpu(H_gpu, d_phi, d_Z, R, L, groove=False):
     """
     Average-of-cubes conductance on GPU. Mirrors the CPU
     _build_coefficients from solver_cpu.py exactly.
+
+    groove=False: periodic wrap at the φ seam (default).
+    groove=True : Dirichlet at j=0 and j=N_phi-1 → zero the wrap slots
+        A[:, -1] and B[:, 0] (never read by the groove-mode stencil).
     """
     N_Z, N_phi = H_gpu.shape
     alpha_sq = (2.0 * R / L * d_phi / d_Z) ** 2
@@ -39,11 +44,17 @@ def _build_coefficients_gpu(H_gpu, d_phi, d_Z, R, L):
 
     A = cp.zeros((N_Z, N_phi), dtype=cp.float64)
     A[:, :-1] = Ah
-    A[:, -1] = Ah[:, 0]
+    if groove:
+        A[:, -1] = 0.0
+    else:
+        A[:, -1] = Ah[:, 0]
 
     B = cp.zeros((N_Z, N_phi), dtype=cp.float64)
     B[:, 1:] = Ah
-    B[:, 0] = Ah[:, -1]
+    if groove:
+        B[:, 0] = 0.0
+    else:
+        B[:, 0] = Ah[:, -1]
 
     # Z-direction face conductance
     H3_jph = 0.5 * (H3[:-1, :] + H3[1:, :])  # (N_Z - 1, N_phi)
@@ -76,6 +87,7 @@ def solve_payvar_salant_gpu(
     cav_threshold=1e-10,
     g_init=None,
     coefficients_ext=None,
+    phi_bc="periodic",
     verbose=False,
 ):
     """
@@ -91,7 +103,18 @@ def solve_payvar_salant_gpu(
     they are used directly instead of building from H (for piezoviscous
     outer loop where conductance is divided by face-averaged μ_ratio).
     H is still needed for the Couette term inside the SOR kernel.
+
+    ``phi_bc`` controls the boundary condition along φ:
+        "periodic" — default, wrap-around at φ=0/2π.
+        "groove"   — Dirichlet g=0 at j=0 and j=N_phi-1 (supply groove
+                     at θ=0 for journal bearings with an axial groove).
     """
+    if phi_bc not in ("periodic", "groove"):
+        raise ValueError(
+            f"phi_bc must be 'periodic' or 'groove', got {phi_bc!r}"
+        )
+    groove = 1 if phi_bc == "groove" else 0
+
     N_Z, N_phi = H.shape
 
     if omega is None:
@@ -99,8 +122,12 @@ def solve_payvar_salant_gpu(
 
     # Ghost-pack H on host, then upload
     H = np.ascontiguousarray(H, dtype=np.float64).copy()
-    H[:, 0] = H[:, N_phi - 2]
-    H[:, N_phi - 1] = H[:, 1]
+    if groove:
+        H[:, 0] = H[:, 1]
+        H[:, N_phi - 1] = H[:, N_phi - 2]
+    else:
+        H[:, 0] = H[:, N_phi - 2]
+        H[:, N_phi - 1] = H[:, 1]
     H_gpu = cp.asarray(H)
 
     # Coefficients on GPU
@@ -124,7 +151,9 @@ def solve_payvar_salant_gpu(
                     f"{name} dtype {arr.dtype} != float64"
                 )
     else:
-        A, B, C, D, E = _build_coefficients_gpu(H_gpu, d_phi, d_Z, R, L)
+        A, B, C, D, E = _build_coefficients_gpu(
+            H_gpu, d_phi, d_Z, R, L, groove=bool(groove),
+        )
 
     # Launch config (same 32×8 block as the HS solver)
     block = (32, 8, 1)
@@ -146,8 +175,12 @@ def solve_payvar_salant_gpu(
         g = cp.asarray(
             np.ascontiguousarray(g_init, dtype=np.float64)
         ).copy()
-        g[:, 0] = g[:, N_phi - 2]
-        g[:, N_phi - 1] = g[:, 1]
+        if groove:
+            g[:, 0] = 0.0
+            g[:, N_phi - 1] = 0.0
+        else:
+            g[:, 0] = g[:, N_phi - 2]
+            g[:, N_phi - 1] = g[:, 1]
         g[0, :] = 0.0
         g[-1, :] = 0.0
         if verbose:
@@ -158,14 +191,20 @@ def solve_payvar_salant_gpu(
             from reynolds_solver.utils import compute_auto_omega
             hs_warmup_omega = compute_auto_omega(N_phi, N_Z, R, L, cap=1.97)
 
-        # HS warmup on GPU
-        hs_kernel = get_rb_sor_kernel()
-        hs_bc_kernel = get_apply_bc_kernel()
+        # HS warmup on GPU (PS-local kernels with groove support)
+        hs_kernel = get_hs_rb_sor_pv_kernel()
+        hs_bc_kernel = get_hs_apply_bc_pv_kernel()
 
         F_hs = cp.zeros((N_Z, N_phi), dtype=cp.float64)
         F_hs[:, 1:] = d_phi * (H_gpu[:, 1:] - H_gpu[:, :-1])
-        F_hs[:, 0] = d_phi * (H_gpu[:, 0] - H_gpu[:, -1])
-        F_hs[:, 1] = d_phi * (H_gpu[:, 1] - H_gpu[:, N_phi - 2])
+        if groove:
+            # j=0 is a Dirichlet boundary; F_hs there is unused, keep 0
+            F_hs[:, 0] = 0.0
+            # j=1: jm=0 is the groove (no wrap to N_phi-2)
+            F_hs[:, 1] = d_phi * (H_gpu[:, 1] - H_gpu[:, 0])
+        else:
+            F_hs[:, 0] = d_phi * (H_gpu[:, 0] - H_gpu[:, -1])
+            F_hs[:, 1] = d_phi * (H_gpu[:, 1] - H_gpu[:, N_phi - 2])
 
         P_hs = cp.zeros((N_Z, N_phi), dtype=cp.float64)
         P_hs_prev = cp.zeros_like(P_hs)
@@ -173,7 +212,8 @@ def solve_payvar_salant_gpu(
         if verbose:
             print(
                 f"  [PS-GPU] HS warmup starting "
-                f"(ω_hs={hs_warmup_omega:.4f})..."
+                f"(ω_hs={hs_warmup_omega:.4f}, "
+                f"phi_bc={phi_bc})..."
             )
 
         hs_res = 1.0
@@ -185,11 +225,13 @@ def solve_payvar_salant_gpu(
                         P_hs, A, B, C, D, E, F_hs,
                         np.int32(N_Z), np.int32(N_phi),
                         np.float64(hs_warmup_omega), np.int32(color),
+                        np.int32(groove),
                     ),
                 )
             hs_bc_kernel(
                 bc_grid, bc_block,
-                (P_hs, np.int32(N_Z), np.int32(N_phi)),
+                (P_hs, np.int32(N_Z), np.int32(N_phi),
+                 np.int32(groove)),
             )
             n_iter_total += 1
 
@@ -224,8 +266,13 @@ def solve_payvar_salant_gpu(
     cav_mask = (g < cav_threshold).astype(cp.int32)
     cav_mask[0, :] = 0
     cav_mask[-1, :] = 0
-    cav_mask[:, 0] = cav_mask[:, N_phi - 2]
-    cav_mask[:, N_phi - 1] = cav_mask[:, 1]
+    if groove:
+        # Groove columns are Dirichlet full-film boundaries
+        cav_mask[:, 0] = 0
+        cav_mask[:, N_phi - 1] = 0
+    else:
+        cav_mask[:, 0] = cav_mask[:, N_phi - 2]
+        cav_mask[:, N_phi - 1] = cav_mask[:, 1]
 
     if pin_active_set:
         g[cav_mask.astype(bool)] = 0.0
@@ -266,7 +313,7 @@ def solve_payvar_salant_gpu(
                     g, H_gpu, A, B, C, D, E, cav_mask,
                     np.int32(N_Z), np.int32(N_phi),
                     np.float64(d_phi), np.float64(omega),
-                    np.int32(0), pinned_flag,
+                    np.int32(0), pinned_flag, np.int32(groove),
                 ),
             )
             # Black pass
@@ -276,13 +323,13 @@ def solve_payvar_salant_gpu(
                     g, H_gpu, A, B, C, D, E, cav_mask,
                     np.int32(N_Z), np.int32(N_phi),
                     np.float64(d_phi), np.float64(omega),
-                    np.int32(1), pinned_flag,
+                    np.int32(1), pinned_flag, np.int32(groove),
                 ),
             )
             # BC
             ps_bc_kernel(
                 bc_grid, bc_block,
-                (g, np.int32(N_Z), np.int32(N_phi)),
+                (g, np.int32(N_Z), np.int32(N_phi), np.int32(groove)),
             )
 
             inner_k = k + 1
@@ -311,8 +358,12 @@ def solve_payvar_salant_gpu(
         new_cav = (g < 0).astype(cp.int32)
         new_cav[0, :] = 0
         new_cav[-1, :] = 0
-        new_cav[:, 0] = new_cav[:, N_phi - 2]
-        new_cav[:, N_phi - 1] = new_cav[:, 1]
+        if groove:
+            new_cav[:, 0] = 0
+            new_cav[:, N_phi - 1] = 0
+        else:
+            new_cav[:, 0] = new_cav[:, N_phi - 2]
+            new_cav[:, N_phi - 1] = new_cav[:, 1]
 
         flips = int(cp.sum(new_cav[1:-1, 1:-1] != cav_mask[1:-1, 1:-1]))
         if verbose:

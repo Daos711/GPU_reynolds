@@ -79,6 +79,7 @@ def solve_reynolds(
     tol_outer: float = 1e-3,
     max_outer_pv: int = 20,
     relax_pv: float = 0.7,
+    phi_bc: str = "periodic",
 ) -> tuple:
     """
     Solve the Reynolds equation on GPU (Red-Black SOR).
@@ -189,7 +190,8 @@ def solve_reynolds(
                 p0_roelands=p0_roelands, z_roelands=z_roelands,
                 tol_outer=tol_outer, max_outer=max_outer_pv,
                 relax_mu=relax_pv,
-                tol=tol, max_iter=max_iter, verbose=verbose,
+                tol=tol, max_iter=max_iter,
+                phi_bc=phi_bc, verbose=verbose,
             )
 
         if pv_method == "transformed":
@@ -280,6 +282,7 @@ def solve_reynolds(
                 H, d_phi, d_Z, R, L,
                 tol=tol,
                 max_iter=max_iter,
+                phi_bc=phi_bc,
                 verbose=verbose,
             )
         except (ImportError, ModuleNotFoundError):
@@ -290,6 +293,7 @@ def solve_reynolds(
                 H, d_phi, d_Z, R, L,
                 tol=tol,
                 max_iter=max_iter,
+                phi_bc=phi_bc,
                 verbose=verbose,
             )
         return P, theta, residual, n_iter

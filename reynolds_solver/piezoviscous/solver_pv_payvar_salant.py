@@ -52,6 +52,7 @@ def solve_payvar_salant_piezoviscous(
     relax_g=0.7,
     tol=1e-6,
     max_iter=50000,
+    phi_bc="periodic",
     verbose=False,
     return_diagnostics=False,
 ):
@@ -92,7 +93,7 @@ def solve_payvar_salant_piezoviscous(
             )
             result = solve_payvar_salant_gpu(
                 H, d_phi, d_Z, R, L, tol=tol, max_iter=max_iter,
-                verbose=verbose,
+                phi_bc=phi_bc, verbose=verbose,
             )
         except (ImportError, ModuleNotFoundError):
             from reynolds_solver.cavitation.payvar_salant import (
@@ -100,7 +101,7 @@ def solve_payvar_salant_piezoviscous(
             )
             result = solve_payvar_salant_cpu(
                 H, d_phi, d_Z, R, L, tol=tol, max_iter=max_iter,
-                verbose=verbose,
+                phi_bc=phi_bc, verbose=verbose,
             )
         if return_diagnostics:
             return result + ({"n_outer": 0, "converged": True,
@@ -128,7 +129,7 @@ def solve_payvar_salant_piezoviscous(
     # First solve without PV (μ̄ = 1)
     P_np, theta_np, res, n_iter = solve_payvar_salant_gpu(
         H, d_phi, d_Z, R, L,
-        tol=tol, max_iter=max_iter, verbose=False,
+        tol=tol, max_iter=max_iter, phi_bc=phi_bc, verbose=False,
     )
     n_iter_total = n_iter
 
@@ -181,6 +182,7 @@ def solve_payvar_salant_piezoviscous(
             max_outer_active_set=10,
             tol=tol,
             max_iter=max_iter,
+            phi_bc=phi_bc,
             verbose=False,
         )
         n_iter_total += n_inner
