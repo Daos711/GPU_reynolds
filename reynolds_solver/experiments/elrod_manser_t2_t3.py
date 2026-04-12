@@ -51,13 +51,13 @@ def make_dimple_centers(N_phi_d, N_Z_d, phi_range, Z_range):
 def add_wedge_dimples(H, Phi, Z, phi_c_flat, Z_c_flat,
                       r_x, r_y_dimless, r_z, wedge_type):
     """
-    Add simplified wedge-shaped depressions to H.
+    Add Manser wedge-shaped depressions to H (Manser 2019 Table 2).
 
-    Footprint: |Δφ| ≤ r_x AND |ΔZ| ≤ r_z (elliptical fall-off in Z).
-    Depth profile along φ:
-        T2 (convergent): deep at the −φ (leading) edge, zero at the
-            +φ (trailing) edge. Linear ramp.
-        T3 (divergent):  zero at the −φ edge, deep at the +φ edge.
+    Footprint: rectangular |Δφ| ≤ r_x AND |ΔZ| ≤ r_z.
+    φ-profile: linear ramp, max depth Δh = 2·r_y at the deep edge:
+        T2 (convergent): Δh(-r_x) = 2·r_y, Δh(+r_x) = 0.
+        T3 (divergent):  Δh(-r_x) = 0,     Δh(+r_x) = 2·r_y.
+    Z-profile: flat within |ΔZ| ≤ r_z (no parabolic fall-off).
 
     The +φ direction is the shaft rotation direction, so −φ is the
     inlet (leading) edge and +φ is the outlet (trailing) edge of
@@ -71,21 +71,25 @@ def add_wedge_dimples(H, Phi, Z, phi_c_flat, Z_c_flat,
         z_c = Z_c_flat[k]
 
         delta_phi = np.arctan2(np.sin(Phi - phi_c), np.cos(Phi - phi_c))
-        inside_phi = np.abs(delta_phi) <= r_x
+        inside_phi = (np.abs(delta_phi) <= r_x).astype(float)
 
-        d_z_ratio = (Z - z_c) / r_z
-        z_factor = np.clip(1.0 - d_z_ratio * d_z_ratio, 0.0, 1.0)
+        # Rectangular (not parabolic) Z footprint — Manser Table 2.
+        inside_z = (np.abs(Z - z_c) <= r_z).astype(float)
 
+        # Linear φ-ramp between Δφ = -r_x and Δφ = +r_x.
+        # Max ramp = 2.0 so that max depth Δh = 2·r_y at the deep edge,
+        # matching Manser Table 2 (Δh(-r_x) = 2·r_y for T2; mirrored
+        # for T3).
         if wedge_type == "T2":
-            # 1 at delta_phi=-r_x, 0 at delta_phi=+r_x
-            ramp = np.clip(0.5 * (1.0 - delta_phi / r_x), 0.0, 1.0)
+            # ramp = 2 at delta_phi=-r_x, 0 at delta_phi=+r_x
+            ramp = np.clip(1.0 - delta_phi / r_x, 0.0, 2.0)
         elif wedge_type == "T3":
-            # 0 at delta_phi=-r_x, 1 at delta_phi=+r_x
-            ramp = np.clip(0.5 * (1.0 + delta_phi / r_x), 0.0, 1.0)
+            # ramp = 0 at delta_phi=-r_x, 2 at delta_phi=+r_x
+            ramp = np.clip(1.0 + delta_phi / r_x, 0.0, 2.0)
         else:
             raise ValueError(f"wedge_type must be T2 or T3, got {wedge_type}")
 
-        depth = r_y_dimless * ramp * z_factor * inside_phi.astype(float)
+        depth = r_y_dimless * ramp * inside_z * inside_phi
         H_new += depth
     return H_new
 
