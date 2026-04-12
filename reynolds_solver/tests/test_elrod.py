@@ -80,11 +80,15 @@ def test_smooth_bearing_pump():
     print(f"    Θ=[{th_min:.4f}, {th_max:.4f}], cav_frac={cav_frac:.3f}")
 
     p_ok = finite and p_min >= -1e-12 and p_max > 1e-3
-    th_ok = finite and th_min >= 0.0 and th_max <= 1.0 + 1e-12
+    # In compressible Elrod Θ > 1 is physical (liquid compressed).
+    # Lower bound: Θ > 0 (theta_min floor in solver). Upper bound:
+    # Θ should stay bounded (no runaway); ≤ 2 is a very loose guard
+    # for pump-like β̄ (expect Θ_max ≈ 1.1 in practice).
+    th_ok = finite and th_min >= 0.0 and th_max < 2.0
     cav_ok = 0.0 < cav_frac < 0.9
 
     return run_test(
-        "smooth ε=0.6: finite, P≥0, Θ∈[0,1], cav reasonable",
+        "smooth ε=0.6: finite, P≥0, Θ≥0, cav reasonable",
         p_ok and th_ok and cav_ok,
         f"p_max={p_max:.3e}, cav_frac={cav_frac:.3f}, n_iter={n}",
     )
