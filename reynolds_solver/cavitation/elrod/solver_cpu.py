@@ -279,8 +279,9 @@ def solve_elrod_compressible(
     Returns
     -------
     P : (N_Z, N_phi) — dimensionless pressure, = β̄·g·ln(Θ).
-    theta : (N_Z, N_phi) — fractional film content Θ (=1 in full film,
-        <1 in cavitation). Clipped to [theta_min, ∞).
+    theta : (N_Z, N_phi) — fractional film content Θ. In compressible
+        Elrod Θ>1 in the full-film lobe (liquid compressed) and Θ<1
+        in cavitation. Clipped to [theta_min, ∞) for numerical safety.
     residual : float — final max|ΔΘ|.
     n_iter : int — number of SOR sweeps performed.
     """
@@ -456,6 +457,9 @@ def solve_elrod_compressible(
     # P must be non-negative (full-film: Θ≥1 → ln Θ ≥ 0; cav: g=0 → P=0)
     P = np.where(P >= 0.0, P, 0.0)
 
-    theta_out = np.clip(Theta, theta_min, 1.0)
+    # Do NOT clip Θ above 1 — in compressible Elrod, full-film cells
+    # have Θ > 1 (liquid compressed). Clipping only the lower bound
+    # preserves the P = β̄·ln(Θ) identity in the returned arrays.
+    theta_out = np.clip(Theta, theta_min, None)
 
     return P, theta_out, residual, n_iter

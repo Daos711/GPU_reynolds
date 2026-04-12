@@ -11,9 +11,12 @@ scripts (scripts/validate_manser.py etc.).
 Tests
 -----
 1. Smooth bearing ε=0.6 at β̄=30 (pump-like): converges, P≥0,
-   θ∈[θ_min, 1], not collapsed (maxP > small).
+   θ∈[θ_min, ∞), not collapsed (maxP > small).
 2. Uniform gap ε=0: trivial state (Θ≡1, P≡0).
 3. phi_bc="groove" smoke test: P=0 and Θ=1 at the seam.
+4. P ↔ Θ consistency: full-film P matches β̄·ln(Θ) to numerical
+   tolerance, and Θ>1 region is non-empty (otherwise the returned
+   theta was clipped and the compressible information is lost).
 
 (A direct maxP comparison against the Payvar-Salant incompressible
 limit is not part of the smoke suite: Manser's normalisation adds a
@@ -156,6 +159,57 @@ def test_groove_smoke():
 
 
 # -----------------------------------------------------------------------
+# Test 4: P ↔ Θ consistency on full-film cells
+# -----------------------------------------------------------------------
+def test_p_theta_consistency():
+    print("\n=== Test 4: P ↔ Θ consistency (P = β̄·ln(Θ) in full film) ===")
+    from reynolds_solver.cavitation.elrod import solve_elrod_compressible
+
+    N_phi, N_Z = 100, 40
+    H, d_phi, d_Z, _, _ = generate_test_case(N_phi, N_Z, epsilon=0.6)
+    beta_bar = 30.0
+
+    P, theta, res, n = solve_elrod_compressible(
+        H, d_phi, d_Z, R, L,
+        beta_bar=beta_bar,
+        tol=1e-7, max_iter=200_000,
+    )
+
+    # Full-film stats
+    ff_mask = P > 1e-10
+    n_ff = int(ff_mask.sum())
+    th_gt_1 = int(np.sum(theta > 1.0 + 1e-10))
+    frac_compressed = th_gt_1 / theta.size
+
+    if n_ff == 0:
+        return run_test(
+            "P↔Θ: full-film cells exist",
+            False,
+            "no cells with P > 0 — solver collapsed",
+        )
+
+    P_check = beta_bar * np.log(theta[ff_mask])
+    max_err = float(np.max(np.abs(P[ff_mask] - P_check)))
+    mean_err = float(np.mean(np.abs(P[ff_mask] - P_check)))
+
+    print(f"    n_ff={n_ff} cells with P>0, Θ>1 in {th_gt_1} "
+          f"({100*frac_compressed:.1f}% of grid)")
+    print(f"    Θ range: [{theta.min():.4f}, {theta.max():.4f}]")
+    print(f"    max|P - β̄·ln(Θ)| = {max_err:.2e}, mean = {mean_err:.2e}")
+
+    # Consistency and compressibility are both required.
+    consistent = max_err < 1e-6
+    compressed = th_gt_1 > 0 and theta.max() > 1.0 + 1e-6
+
+    return run_test(
+        "P = β̄·ln(Θ) in full film and Θ>1 region is non-empty",
+        consistent and compressed,
+        f"max_err={max_err:.2e}, Θ_max={theta.max():.4f}, "
+        f"n(Θ>1)={th_gt_1}",
+    )
+
+
+# -----------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------
 def main():
@@ -167,6 +221,7 @@ def main():
         ("1", test_smooth_bearing_pump),
         ("2", test_uniform_gap),
         ("3", test_groove_smoke),
+        ("4", test_p_theta_consistency),
     ]
 
     results = []
