@@ -1114,8 +1114,10 @@ def solve_elrod_compressible(
     pt_inner_tol=1e-4,
     # theta_vk controls
     switch_backend="hard",    # "hard" or "fk_soft"
-    theta_vk_scheme="pseudo_transient",   # "pseudo_transient" | "gs_inline_legacy"
-    eta_schedule=None,                    # continuation schedule; default from driver
+    theta_vk_scheme="gs_symmetric_inline",   # "gs_symmetric_inline" (default) | "pseudo_transient" | "gs_inline_legacy"
+    eta_schedule=None,                        # pseudo_transient continuation
+    pair_damp=1.0,                            # symmetric_inline
+    stages=None,                              # symmetric_inline staged continuation
     gfactor=0.9,
     tol_g=1e-6,
     n_quiescent=3,
@@ -1206,6 +1208,8 @@ def solve_elrod_compressible(
             gfactor=0.9 if gfactor is None else gfactor,
             switch_backend=switch_backend,
             scheme=theta_vk_scheme,
+            pair_damp=pair_damp,
+            stages=stages,
             eta_schedule=eta_schedule,
             pt_dt=pt_dt,
             pt_max_time_steps=pt_max_time_steps,
@@ -1274,21 +1278,26 @@ def solve_elrod_compressible(
 
 
 @njit(cache=True)
-def _elrod_theta_vk_sweep_inline_legacy(
+def _elrod_theta_vk_sweep_inline(
     Theta, g_state, g_soft, H,
     A, B, C, D, E,
     d_phi, beta_bar, omega, gfactor,
     use_soft_backend,
     N_Z, N_phi, groove,
     state_eps, theta_min,
+    reverse_order,
 ):
     """
-    LEGACY inline sweep (kept for A/B diagnostics under
-    scheme="gs_inline_legacy"). The lagged + pseudo-transient sweep
-    `_elrod_theta_vk_sweep_pt_lagged` below is the current default.
+    Inline GS sweep of the faithful Θ-form Elrod system with in-place
+    g_state / g_soft updates (node-by-node). This is the low-level
+    kernel used by both the plain `gs_inline_legacy` driver and the
+    `gs_symmetric_inline` symmetric-pair driver.
 
-    One lexicographic GS sweep of the faithful Θ-form Elrod system
-    with in-place g_state / g_soft updates (node-by-node, same sweep).
+    `reverse_order`: if 0 → lexicographic forward (Z up, φ up); if 1 →
+    full lexicographic reverse (Z down, φ down). The reverse traversal
+    is NOT just a φ-flip — the outer Z loop also reverses. This
+    removes the directional bias of a single-direction sweep.
+
     Returns (max_delta_theta, max_delta_gsoft, n_state_flips).
     """
     max_dth = 0.0
@@ -1296,8 +1305,17 @@ def _elrod_theta_vk_sweep_inline_legacy(
     n_flips = 0
     six_dphi = 6.0 * d_phi
 
-    for i in range(1, N_Z - 1):
-        for j in range(1, N_phi - 1):
+    if reverse_order == 0:
+        i_start, i_stop, i_step = 1, N_Z - 1, 1
+        j_start, j_stop, j_step = 1, N_phi - 1, 1
+    else:
+        i_start, i_stop, i_step = N_Z - 2, 0, -1
+        j_start, j_stop, j_step = N_phi - 2, 0, -1
+
+    i = i_start
+    while (i_step > 0 and i < i_stop) or (i_step < 0 and i > i_stop):
+        j = j_start
+        while (j_step > 0 and j < j_stop) or (j_step < 0 and j > j_stop):
             if groove != 0:
                 jp = j + 1
                 jm = j - 1
@@ -1324,30 +1342,25 @@ def _elrod_theta_vk_sweep_inline_legacy(
             D_l = D[i, j]
             E_l = E[i, j]
 
-            # Pick g_phys per backend
             if use_soft_backend != 0:
                 g_phys = gsf_old
             else:
                 g_phys = gst_old
 
             diff = A_l * Tjp + B_l * Tjm + C_l * Tip + D_l * Tim
-            # Local update: β̄·g·E·Θ + 6dφ·h·Θ = β̄·g·diff + 6dφ·h_jm·Θ_jm
             num = beta_bar * g_phys * diff + six_dphi * h_jm * Theta_up
             den = beta_bar * g_phys * E_l + six_dphi * h_ij + 1e-30
             Theta_trial = num / den
 
-            # Determine target topology
             if Theta_trial >= 1.0 - state_eps:
                 state_target = 1
             else:
                 state_target = 0
 
-            # SOR relaxation
             Theta_relax = Theta_old + omega * (Theta_trial - Theta_old)
             if Theta_relax < theta_min:
                 Theta_relax = theta_min
 
-            # Topology-consistency clamp
             if state_target == 0 and Theta_relax >= 1.0:
                 Theta_relax = 1.0 - state_eps
             if state_target == 1 and omega < 1.0 and Theta_relax < 1.0:
@@ -1355,7 +1368,6 @@ def _elrod_theta_vk_sweep_inline_legacy(
 
             Theta[i, j] = Theta_relax
 
-            # Switch updates
             new_state = float(state_target)
             new_soft = gsf_old + gfactor * (new_state - gsf_old)
             if new_soft < 0.0:
@@ -1379,34 +1391,59 @@ def _elrod_theta_vk_sweep_inline_legacy(
             if dg > max_dg:
                 max_dg = dg
 
+            j += j_step
+        i += i_step
+
     # phi BC
     if groove != 0:
-        for i in range(N_Z):
-            Theta[i, 0] = 1.0
-            Theta[i, N_phi - 1] = 1.0
-            g_state[i, 0] = 1.0
-            g_state[i, N_phi - 1] = 1.0
-            g_soft[i, 0] = 1.0
-            g_soft[i, N_phi - 1] = 1.0
+        for ii in range(N_Z):
+            Theta[ii, 0] = 1.0
+            Theta[ii, N_phi - 1] = 1.0
+            g_state[ii, 0] = 1.0
+            g_state[ii, N_phi - 1] = 1.0
+            g_soft[ii, 0] = 1.0
+            g_soft[ii, N_phi - 1] = 1.0
     else:
-        for i in range(N_Z):
-            Theta[i, 0] = Theta[i, N_phi - 2]
-            Theta[i, N_phi - 1] = Theta[i, 1]
-            g_state[i, 0] = g_state[i, N_phi - 2]
-            g_state[i, N_phi - 1] = g_state[i, 1]
-            g_soft[i, 0] = g_soft[i, N_phi - 2]
-            g_soft[i, N_phi - 1] = g_soft[i, 1]
+        for ii in range(N_Z):
+            Theta[ii, 0] = Theta[ii, N_phi - 2]
+            Theta[ii, N_phi - 1] = Theta[ii, 1]
+            g_state[ii, 0] = g_state[ii, N_phi - 2]
+            g_state[ii, N_phi - 1] = g_state[ii, 1]
+            g_soft[ii, 0] = g_soft[ii, N_phi - 2]
+            g_soft[ii, N_phi - 1] = g_soft[ii, 1]
 
     # Z BC (flooded)
-    for j in range(N_phi):
-        Theta[0, j] = 1.0
-        Theta[N_Z - 1, j] = 1.0
-        g_state[0, j] = 1.0
-        g_state[N_Z - 1, j] = 1.0
-        g_soft[0, j] = 1.0
-        g_soft[N_Z - 1, j] = 1.0
+    for jj in range(N_phi):
+        Theta[0, jj] = 1.0
+        Theta[N_Z - 1, jj] = 1.0
+        g_state[0, jj] = 1.0
+        g_state[N_Z - 1, jj] = 1.0
+        g_soft[0, jj] = 1.0
+        g_soft[N_Z - 1, jj] = 1.0
 
     return max_dth, max_dg, n_flips
+
+
+# Backward-compat alias (used by existing "gs_inline_legacy" path)
+@njit(cache=True)
+def _elrod_theta_vk_sweep_inline_legacy(
+    Theta, g_state, g_soft, H,
+    A, B, C, D, E,
+    d_phi, beta_bar, omega, gfactor,
+    use_soft_backend,
+    N_Z, N_phi, groove,
+    state_eps, theta_min,
+):
+    """Forward-only inline sweep (pre-symmetric-pair baseline)."""
+    return _elrod_theta_vk_sweep_inline(
+        Theta, g_state, g_soft, H,
+        A, B, C, D, E,
+        d_phi, beta_bar, omega, gfactor,
+        use_soft_backend,
+        N_Z, N_phi, groove,
+        state_eps, theta_min,
+        0,   # reverse_order=False
+    )
 
 
 # -----------------------------------------------------------------------
@@ -1566,11 +1603,11 @@ def _solve_elrod_theta_vk(
     omega=1.0,
     gfactor=0.9,
     switch_backend="hard",
-    scheme="pseudo_transient",      # "pseudo_transient" (default) | "gs_inline_legacy"
-    # Pseudo-transient (outer/inner) controls. theta_vk-PT needs many
-    # outer steps for the interface integral to lock in (boundary
-    # cells flip indefinitely on a hard switch); 5000 is a safe cap
-    # — the soft-quiescent integral test exits much earlier.
+    scheme="gs_symmetric_inline",     # NEW DEFAULT
+    # gs_symmetric_inline controls
+    pair_damp=1.0,
+    stages=None,             # list of {"gfactor":..., "omega_theta":..., "pair_damp":...}
+    # Pseudo-transient (outer/inner) controls (scheme="pseudo_transient")
     pt_dt=0.1,
     pt_max_time_steps=5000,
     pt_max_inner=50,
@@ -1594,34 +1631,36 @@ def _solve_elrod_theta_vk(
     """
     Faithful Θ-form VK/FK solver. Single unknown Θ + (g_state, g_soft).
 
-    Two schemes:
-      scheme="pseudo_transient" (default): lagged g_phys + pseudo-time
-        anchor c_prev = Θ_prev·H; two-level iteration (outer refresh
-        of lag / anchor, inner Picard-like GS sweep at fixed lag).
-        Robust convergence on the hard backend (smooth groove ε=0.6
-        converges in ~10³ inner sweeps vs 10⁵-10⁶ for the legacy
-        path); η-continuation [0.0, 0.25, 0.5, 0.75, 1.0] is applied
-        to fk_soft to walk from the hard-like to full-soft stencil.
-        IMPORTANT KNOWN TRADE-OFF: on textured benchmarks (Manser
-        T2/T3) the PT scheme tends to settle on a SYMMETRIC attractor
-        — the strong T2 vs T3 asymmetry produced by
-        `gs_inline_legacy` is largely lost. Use the legacy scheme
-        explicitly for textured / micro-wedge studies (see
-        ТЗ §14 fall-back).
-      scheme="gs_inline_legacy": original sweep with in-place g
-        updates per node. Does NOT reach strict residual convergence
-        (residual plateaus ~0.5..0.6, interface flips indefinitely on
-        a small set of boundary cells), but the integral fields lock
-        in within ~10⁴ sweeps and the resulting solution preserves
-        the Manser T2/T3 asymmetry (T2/T3 ≈ 2.5..3.0 on coarse grid).
+    Three schemes:
+      scheme="gs_symmetric_inline" (NEW DEFAULT): one nonlinear
+        iteration = forward lexicographic inline sweep + reverse
+        lexicographic inline sweep, followed by a pair-level damping
+        Θ = Θ_prev + pair_damp · (Θ_new - Θ_prev) (same for g_soft).
+        Keeps the inline coefficient-chasing coupling per sweep but
+        removes the directional sweep-order bias that made the
+        pure-forward path (gs_inline_legacy) potentially
+        sweep-artifactual. Staged continuation by gfactor / omega /
+        pair_damp is supported (parameter `stages`).
+      scheme="gs_inline_legacy": original forward-only inline sweep.
+        Kept for A/B sweep-order diagnostics — if the asymmetry
+        seen on gs_inline_legacy flips under the symmetric scheme,
+        it was an artifact.
+      scheme="pseudo_transient": lagged g_phys + pseudo-time anchor
+        c_prev = Θ_prev·H. Robust on hard backend but tends to a
+        SYMMETRIC attractor on textured fk_soft (Manser asymmetry
+        lost — see previous ТЗ §14 fall-back).
 
-    Quiescent convergence rule (PT scheme):
-      strict: max_dth < tol_theta AND max_dg < tol_g AND n_flips == 0
-      soft:   ΔPmax/Pmax < 5e-5 AND Δcav < 1e-4 over last 20 outer
-              steps AND n_flips < 0.5 % of interior cells, only on
-              the final η stage and after pt_min_warmup outer steps.
-    Either trigger sustained for `n_quiescent` consecutive outer
-    checkpoints terminates the run.
+    Quiescent convergence rule (symmetric_inline):
+      strict: max_dth_pair < tol_theta AND max_dg_pair < tol_g AND
+              n_flips_pair == 0
+      soft:   ΔPmax/Pmax < 5e-5 AND Δcav < 1e-4 over last 20
+              checkpoints AND n_flips_pair < 0.5 % of interior
+              cells (only after pt_min_warmup pairs).
+    A history-based limit-cycle detector tracks the last 10
+    checkpoints of (Pmax, W, phi_rupt, fluid_area): a limit cycle
+    is reported if residuals are not falling AND any of these
+    integrals oscillates with finite amplitude above 1 % (P_max)
+    or 1° (phi_rupt).
     """
     if phi_bc not in ("periodic", "groove"):
         raise ValueError(
@@ -1632,10 +1671,13 @@ def _solve_elrod_theta_vk(
             f"switch_backend must be 'hard' or 'fk_soft', got "
             f"{switch_backend!r}"
         )
-    if scheme not in ("pseudo_transient", "gs_inline_legacy"):
+    if scheme not in (
+        "gs_symmetric_inline", "pseudo_transient",
+        "gs_inline_legacy", "gs_inline_reverse",
+    ):
         raise ValueError(
-            f"scheme must be 'pseudo_transient' or 'gs_inline_legacy', "
-            f"got {scheme!r}"
+            f"scheme must be 'gs_symmetric_inline', 'pseudo_transient', "
+            f"'gs_inline_legacy', or 'gs_inline_reverse', got {scheme!r}"
         )
     use_soft = 1 if switch_backend == "fk_soft" else 0
     groove = 1 if phi_bc == "groove" else 0
@@ -1742,21 +1784,237 @@ def _solve_elrod_theta_vk(
         )
 
     # -------------------------------------------------------------
-    # Legacy path: original inline sweep (kept for A/B diagnostics)
+    # NEW DEFAULT: symmetric inline pair + pair_damp + staged cont.
     # -------------------------------------------------------------
-    if scheme == "gs_inline_legacy":
+    if scheme == "gs_symmetric_inline":
+        # Default staged continuation schedule: starts from very
+        # damped FK state (small gfactor, ω<1, no pair_damp) and
+        # walks up toward fully inline coupling. Each stage starts
+        # from the solution of the previous stage.
+        if stages is None:
+            stages = [
+                {"gfactor": 0.3, "omega_theta": 0.5, "pair_damp": 1.0},
+                {"gfactor": 0.5, "omega_theta": 0.7, "pair_damp": 1.0},
+                {"gfactor": 0.7, "omega_theta": 0.7, "pair_damp": 0.7},
+                {"gfactor": 0.9, "omega_theta": 1.0, "pair_damp": 0.7},
+            ]
+
+        # History buffers for the limit-cycle detector
+        hist_res = []     # pair residual (max of forward/reverse)
+        hist_Pmax = []
+        hist_cav = []
+        hist_fluid = []
+        k_hist = 10
+
+        total_pairs = 0
+        max_dth_pair = 1.0
+        max_dg_pair = 1.0
+        n_flips_pair = 0
+        limit_cycle_detected = False
+
+        # Iterations budget is shared across stages by total pair count
+        pairs_per_stage = max(1, max_iter // len(stages))
+
+        for stage_idx, stage in enumerate(stages):
+            gf_stage = float(stage.get("gfactor", gfactor))
+            om_stage = float(stage.get("omega_theta", omega))
+            pd_stage = float(stage.get("pair_damp", pair_damp))
+
+            if verbose:
+                print(
+                    f"  [Elrod-Θ-VK sym] stage {stage_idx}: "
+                    f"gfactor={gf_stage}, omega_theta={om_stage}, "
+                    f"pair_damp={pd_stage}"
+                )
+
+            quiescent_streak = 0
+            for pair_step in range(pairs_per_stage):
+                Theta_prev = Theta.copy()
+                g_soft_prev = g_soft.copy()
+
+                # Forward sweep
+                res_f, dg_f, fl_f = _elrod_theta_vk_sweep_inline(
+                    Theta, g_state, g_soft, H,
+                    A, B, C, D, E,
+                    d_phi, beta_bar, om_stage, gf_stage,
+                    use_soft,
+                    N_Z, N_phi, groove,
+                    state_eps, theta_min,
+                    0,   # forward
+                )
+                # Reverse sweep
+                res_r, dg_r, fl_r = _elrod_theta_vk_sweep_inline(
+                    Theta, g_state, g_soft, H,
+                    A, B, C, D, E,
+                    d_phi, beta_bar, om_stage, gf_stage,
+                    use_soft,
+                    N_Z, N_phi, groove,
+                    state_eps, theta_min,
+                    1,   # reverse
+                )
+
+                # Pair-level damping on BOTH fields
+                if pd_stage != 1.0:
+                    Theta[:] = Theta_prev + pd_stage * (Theta - Theta_prev)
+                    np.maximum(Theta, theta_min, out=Theta)
+                    g_soft[:] = (
+                        g_soft_prev
+                        + pd_stage * (g_soft - g_soft_prev)
+                    )
+                    np.clip(g_soft, 0.0, 1.0, out=g_soft)
+                    g_state[:] = (g_soft >= 0.5).astype(np.float64)
+                    # Apply BC after damping
+                    if groove:
+                        Theta[:, 0] = 1.0; Theta[:, -1] = 1.0
+                        g_state[:, 0] = 1.0; g_state[:, -1] = 1.0
+                        g_soft[:, 0] = 1.0; g_soft[:, -1] = 1.0
+                    else:
+                        Theta[:, 0] = Theta[:, -2]
+                        Theta[:, -1] = Theta[:, 1]
+                        g_state[:, 0] = g_state[:, -2]
+                        g_state[:, -1] = g_state[:, 1]
+                        g_soft[:, 0] = g_soft[:, -2]
+                        g_soft[:, -1] = g_soft[:, 1]
+                    Theta[0, :] = 1.0; Theta[-1, :] = 1.0
+                    g_state[0, :] = 1.0; g_state[-1, :] = 1.0
+                    g_soft[0, :] = 1.0; g_soft[-1, :] = 1.0
+
+                # Pair-level residuals (true Δ from before both sweeps)
+                max_dth_pair = float(np.max(np.abs(Theta - Theta_prev)))
+                max_dg_pair = float(np.max(np.abs(g_soft - g_soft_prev)))
+                n_flips_pair = fl_f + fl_r
+                total_pairs += 1
+
+                # Integral diagnostics
+                Theta_for_p = np.where(
+                    g_state > 0.5, np.maximum(Theta, 1.0), 1.0,
+                )
+                P_now = beta_bar * g_state * np.log(Theta_for_p)
+                P_now = np.where(P_now >= 0.0, P_now, 0.0)
+                Pmax_now = float(P_now.max())
+                cav_now = float(np.mean(g_state[1:-1, 1:-1] < 0.5))
+                fluid_now = float(np.mean(g_state[1:-1, 1:-1] > 0.5))
+
+                hist_res.append(max_dth_pair)
+                hist_Pmax.append(Pmax_now)
+                hist_cav.append(cav_now)
+                hist_fluid.append(fluid_now)
+                if len(hist_res) > k_hist:
+                    hist_res.pop(0)
+                    hist_Pmax.pop(0)
+                    hist_cav.pop(0)
+                    hist_fluid.pop(0)
+
+                # Convergence check: strict OR soft
+                strict_ok = (
+                    max_dth_pair < tol_theta
+                    and max_dg_pair < tol_g
+                    and n_flips_pair == 0
+                )
+                soft_ok = False
+                pt_min_warmup = 30
+                if (
+                    stage_idx == len(stages) - 1
+                    and pair_step >= pt_min_warmup
+                    and len(hist_Pmax) >= k_hist
+                    and n_flips_pair > 0
+                ):
+                    Pmax_span = max(hist_Pmax) - min(hist_Pmax)
+                    cav_span = max(hist_cav) - min(hist_cav)
+                    rel_Pmax = Pmax_span / max(hist_Pmax[-1], 1e-30)
+                    max_flip_frac = 0.005 * max(
+                        (N_Z - 2) * (N_phi - 2), 1
+                    )
+                    soft_ok = (
+                        rel_Pmax < 5e-5
+                        and cav_span < 1e-4
+                        and n_flips_pair < max_flip_frac
+                    )
+
+                converged_now = strict_ok or soft_ok
+                if converged_now:
+                    quiescent_streak += 1
+                else:
+                    quiescent_streak = 0
+
+                # Limit-cycle detection (only after enough history)
+                if len(hist_res) == k_hist and pair_step > 50:
+                    # residual not falling: recent max not < 0.9 * oldest max
+                    res_falling = hist_res[-1] < 0.9 * max(
+                        hist_res[0], 1e-30
+                    )
+                    Pmax_osc = (
+                        (max(hist_Pmax) - min(hist_Pmax))
+                        / max(hist_Pmax[-1], 1e-30)
+                        > 1e-2
+                    )
+                    if (not res_falling) and Pmax_osc:
+                        limit_cycle_detected = True
+
+                if verbose and pair_step % max(1, check_every // 2) == 0:
+                    print(
+                        f"    stage={stage_idx} pair={pair_step:5d} "
+                        f"ΔΘ={max_dth_pair:.2e} Δg={max_dg_pair:.2e} "
+                        f"flips={n_flips_pair:4d} "
+                        f"Pmax={Pmax_now:.3e} cav={cav_now:.3f} "
+                        f"fluid={fluid_now:.3f} "
+                        f"quies={quiescent_streak} "
+                        f"limit_cycle={limit_cycle_detected}"
+                    )
+
+                if quiescent_streak >= n_quiescent:
+                    if verbose:
+                        print(
+                            f"  [Elrod-Θ-VK sym] stage {stage_idx} "
+                            f"CONVERGED at pair={pair_step}"
+                        )
+                    break
+
+                if total_pairs * 2 >= max_iter:
+                    break
+            # end stage pair loop
+
+            if total_pairs * 2 >= max_iter:
+                break
+        # end stages
+
+        # Pressure recovery from HARD topology
+        g_hard = g_state
+        Theta_for_p = np.where(
+            g_hard > 0.5, np.maximum(Theta, 1.0), 1.0,
+        )
+        P = beta_bar * g_hard * np.log(Theta_for_p)
+        P = np.where(P >= 0.0, P, 0.0)
+        theta_out = np.clip(Theta, theta_min, None)
+
+        if verbose and limit_cycle_detected:
+            print(
+                f"  [Elrod-Θ-VK sym] WARNING: limit-cycle detected "
+                f"(residual stalled, integrals oscillating)."
+            )
+
+        # Return: (P, theta, residual, n_sweeps). Total inner sweeps
+        # = 2 · total_pairs (forward + reverse per pair).
+        return P, theta_out, max_dth_pair, 2 * total_pairs
+
+    # -------------------------------------------------------------
+    # Legacy paths: forward-only and reverse-only inline (diagnostics)
+    # -------------------------------------------------------------
+    if scheme in ("gs_inline_legacy", "gs_inline_reverse"):
+        reverse_flag = 1 if scheme == "gs_inline_reverse" else 0
         quiescent_streak = 0
         max_dth = 1.0
         max_dg = 1.0
         n_iter = 0
         for k in range(max_iter):
-            max_dth, max_dg, n_flips = _elrod_theta_vk_sweep_inline_legacy(
+            max_dth, max_dg, n_flips = _elrod_theta_vk_sweep_inline(
                 Theta, g_state, g_soft, H,
                 A, B, C, D, E,
                 d_phi, beta_bar, omega, gfactor,
                 use_soft,
                 N_Z, N_phi, groove,
                 state_eps, theta_min,
+                reverse_flag,
             )
             n_iter += 1
             if k > 5 and k % check_every == 0:

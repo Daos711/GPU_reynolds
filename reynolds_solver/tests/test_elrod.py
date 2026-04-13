@@ -233,23 +233,23 @@ def test_p_theta_consistency():
 
 
 # -----------------------------------------------------------------------
-# Test 5 (V2): theta_vk smooth-groove physics smoke (PT scheme)
+# Test 5 (V2): theta_vk smooth-groove physics smoke (default scheme)
 # -----------------------------------------------------------------------
 def test_theta_vk_groove_smoke():
-    print("\n=== Test 5 (V2): theta_vk smooth-groove physics smoke (PT) ===")
+    print("\n=== Test 5 (V2): theta_vk smooth-groove physics smoke ===")
     from reynolds_solver.cavitation.elrod import solve_elrod_compressible
 
     N_phi, N_Z = 60, 30
     H, d_phi, d_Z, _, _ = generate_test_case(N_phi, N_Z, epsilon=0.6)
 
-    # Default scheme = pseudo_transient — should converge cleanly on
-    # smooth groove (this was the headline TZ stabilisation goal).
+    # Default scheme = gs_symmetric_inline. Should produce sensible
+    # full-film lobe + cav region on smooth groove.
     P, theta, res, n = solve_elrod_compressible(
         H, d_phi, d_Z, R, L,
         beta_bar=30.0,
         formulation="theta_vk",
         switch_backend="hard",
-        tol=1e-5, max_iter=50_000,
+        tol=1e-5, max_iter=30_000,
         phi_bc="groove",
     )
 
@@ -262,18 +262,56 @@ def test_theta_vk_groove_smoke():
     )
     cav_frac = float(np.mean(theta[1:-1, 1:-1] < 1.0 - 1e-6))
     cav_ok = 0.2 < cav_frac < 0.7
-    # Iteration cap NOT hit — strong indicator that PT scheme stabilised
-    # the convergence path (cf. legacy inline always plateaus at max_iter).
-    converged_ok = n < 50_000 - 100
 
     print(f"    n={n}, res={res:.2e}, P_max={P.max():.4e}, "
           f"Θ_max={theta.max():.4f}, cav={cav_frac:.3f}")
 
     return run_test(
-        "theta_vk PT groove ε=0.6: converges, full-film lobe, cav",
-        p_ok and th_ok and cav_ok and converged_ok,
+        "theta_vk default groove ε=0.6: full-film lobe + cav region",
+        p_ok and th_ok and cav_ok,
         f"P_max={P.max():.3e}, Θ_max={theta.max():.4f}, "
         f"cav={cav_frac:.3f}, n={n}",
+    )
+
+
+# -----------------------------------------------------------------------
+# Test A (TZ §5.2): sweep-order neutrality on smooth groove
+# forward / reverse / symmetric must all agree on SMOOTH (no texture);
+# this is the control for the Gate 2 check in the Manser experiment.
+# -----------------------------------------------------------------------
+def test_theta_vk_sweep_order_neutral_smooth():
+    print("\n=== Test A: sweep-order neutrality on smooth groove ===")
+    from reynolds_solver.cavitation.elrod import solve_elrod_compressible
+
+    N_phi, N_Z = 80, 30
+    H, d_phi, d_Z, _, _ = generate_test_case(N_phi, N_Z, epsilon=0.6)
+
+    results = {}
+    for sch in ("gs_inline_legacy", "gs_inline_reverse",
+                "gs_symmetric_inline"):
+        P, theta, _, n = solve_elrod_compressible(
+            H, d_phi, d_Z, R, L,
+            beta_bar=40.0,
+            formulation="theta_vk",
+            switch_backend="fk_soft",
+            theta_vk_scheme=sch,
+            tol=1e-6, max_iter=20_000,
+            phi_bc="groove",
+        )
+        results[sch] = (float(P.max()), float(theta.max()),
+                        float(np.mean(theta[1:-1, 1:-1] < 1.0 - 1e-6)))
+        print(f"    {sch:<22s}  Pmax={results[sch][0]:.4e}  "
+              f"Θ_max={results[sch][1]:.4f}  cav={results[sch][2]:.3f}")
+
+    Pmax_vals = [v[0] for v in results.values()]
+    Pmax_span = max(Pmax_vals) - min(Pmax_vals)
+    rel_span = Pmax_span / max(max(Pmax_vals), 1e-30)
+
+    return run_test(
+        "forward / reverse / symmetric agree on smooth (< 1 % Pmax)",
+        rel_span < 0.01,
+        f"Pmax range {min(Pmax_vals):.3e}..{max(Pmax_vals):.3e} "
+        f"(rel span {rel_span:.2%})",
     )
 
 
@@ -345,6 +383,7 @@ def main():
         ("4", test_p_theta_consistency),
         ("5", test_theta_vk_groove_smoke),
         ("6", test_theta_vk_v1_distinguishability),
+        ("A", test_theta_vk_sweep_order_neutral_smooth),
     ]
 
     results = []

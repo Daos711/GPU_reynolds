@@ -31,15 +31,21 @@ Run:
 Configurable via environment variables for a quick smoke run:
     ELROD_MANSER_NPHI=200 ELROD_MANSER_NZ=60 python -m ...
 
-Engines compared (default: 4 combinations covering both schemes):
+Engines compared (default: sweep-order gate panel):
     ELROD_MANSER_FORMULATIONS=
         "ptheta:hard,
-         theta_vk:hard:pseudo_transient,
-         theta_vk:fk_soft:gs_inline_legacy,
-         theta_vk:fk_soft:pseudo_transient"
+         theta_vk:fk_soft:gs_inline_legacy,     # forward-only inline
+         theta_vk:fk_soft:gs_inline_reverse,    # reverse-only inline
+         theta_vk:fk_soft:gs_symmetric_inline,  # forward+reverse pair
+         theta_vk:fk_soft:pseudo_transient"      # lagged + PT
 
 Format: "<engine>:<backend>[:<scheme>]" comma-separated. `scheme` is
-ignored for ptheta and defaults to "pseudo_transient" for theta_vk.
+ignored for ptheta; for theta_vk the default is "gs_symmetric_inline".
+
+This panel is the sweep-order gate (TZ §6 Gate 2): if forward and
+reverse give very different W on T2/T3, but smooth is unaffected,
+then the forward-only asymmetry is a sweep-order artifact rather
+than real physics.
 
 Optional pre-checks (TZ §2 / §8):
     ELROD_MANSER_DEPTH={ry|2ry}     # depth scaling, default 2ry (Table 2)
@@ -211,16 +217,16 @@ def main():
     N_Z = int(os.environ.get("ELROD_MANSER_NZ", 121))
     max_iter = int(os.environ.get("ELROD_MANSER_MAXITER", 500_000))
 
-    # Engine selectors. Default: cover the three regimes that matter:
-    #   ptheta:hard                 — incompressible-like baseline
-    #   theta_vk:hard:pseudo_transient — stabilised Θ-form, hard switch
-    #   theta_vk:fk_soft:gs_inline_legacy — Manser asymmetry path
-    # Format: "<engine>:<backend>[:<scheme>]" comma-separated.
+    # Engine selectors. Default set is the sweep-order gate panel:
+    # forward-only, reverse-only, symmetric pair, PT. Runs all on
+    # fk_soft so that Gate 2 (sweep-order neutrality of the Manser
+    # asymmetry) is visible in one call.
     formulations = os.environ.get(
         "ELROD_MANSER_FORMULATIONS",
         "ptheta:hard,"
-        "theta_vk:hard:pseudo_transient,"
         "theta_vk:fk_soft:gs_inline_legacy,"
+        "theta_vk:fk_soft:gs_inline_reverse,"
+        "theta_vk:fk_soft:gs_symmetric_inline,"
         "theta_vk:fk_soft:pseudo_transient",
     ).split(",")
     formulations = [s.strip() for s in formulations if s.strip()]
@@ -419,7 +425,7 @@ def main():
     print("=" * 78)
     print("  FINAL SUMMARY: Manser T2/T3 across engines/backends")
     print("=" * 78)
-    print(f"  {'engine/backend/scheme':<38s}  {'gain_T2':>8s}  "
+    print(f"  {'engine/backend/scheme':<42s}  {'gain_T2':>8s}  "
           f"{'gain_T3':>8s}  {'T2/T3':>8s}")
     for (form, bck, sch), (W_s, W_t2, W_t3) in results.items():
         g2 = W_t2 / (W_s + 1e-30)
@@ -429,9 +435,94 @@ def main():
             label = f"{form}/{bck}"
         else:
             label = f"{form}/{bck}/{sch}"
-        print(f"  {label:<38s}  {g2:8.3f}  {g3:8.3f}  {rt:8.3f}")
-    print(f"  {'Manser reference':<38s}  {1.43:8.3f}  {0.41:8.3f}  "
+        print(f"  {label:<42s}  {g2:8.3f}  {g3:8.3f}  {rt:8.3f}")
+    print(f"  {'Manser reference':<42s}  {1.43:8.3f}  {0.41:8.3f}  "
           f"{3.44:8.3f}")
+
+    # TZ §6 Gate 2 — sweep-order neutrality analysis
+    fwd = results.get(("theta_vk", "fk_soft", "gs_inline_legacy"))
+    rev = results.get(("theta_vk", "fk_soft", "gs_inline_reverse"))
+    sym = results.get(("theta_vk", "fk_soft", "gs_symmetric_inline"))
+    if fwd and rev:
+        print()
+        print("=" * 78)
+        print("  GATE 2: sweep-order neutrality (TZ §6)")
+        print("=" * 78)
+
+        def rel(a, b):
+            return abs(a - b) / max(abs(a), abs(b), 1e-30)
+
+        for tag, idx in [("Smooth", 0), ("T2", 1), ("T3", 2)]:
+            Wf = fwd[idx]
+            Wr = rev[idx]
+            print(f"  {tag:>6s}: forward W={Wf:.4e}  reverse W={Wr:.4e}  "
+                  f"rel|Δ|={rel(Wf, Wr):.2%}")
+
+        # Also compare the T2/T3 RATIO between sweep directions — the
+        # ratio can be more robust than absolute W.
+        r_fwd = fwd[1] / max(fwd[2], 1e-30)
+        r_rev = rev[1] / max(rev[2], 1e-30)
+        print(
+            f"\n  T2/T3 ratio  forward={r_fwd:.3f}  reverse={r_rev:.3f}  "
+            f"rel|Δ|={rel(r_fwd, r_rev):.2%}"
+        )
+
+        # Gate decision
+        rel_T2 = rel(fwd[1], rev[1])
+        rel_T3 = rel(fwd[2], rev[2])
+        rel_Sm = rel(fwd[0], rev[0])
+        rel_ratio = rel(r_fwd, r_rev)
+        print()
+        if rel_Sm > 0.01:
+            print("  ✗ FAIL: smooth itself is sweep-order-dependent "
+                  "(solver bug).")
+        elif rel_T2 > 0.05 or rel_T3 > 0.05:
+            if rel_ratio < 0.05:
+                print(
+                    f"  ◐ PARTIAL: textured W varies by "
+                    f"{max(rel_T2, rel_T3):.1%} between sweep directions, "
+                    f"BUT T2/T3 ratio is sweep-stable "
+                    f"({rel_ratio:.2%} diff)."
+                )
+                print(
+                    "       → the solver has multiple attractors for "
+                    "textured fk_soft; the asymmetry *ratio* is "
+                    "physically real, but absolute W is not"
+                )
+                print(
+                    "         sweep-neutrally determined — a nonlinear "
+                    "stabilisation (Anderson / Newton / line search) "
+                    "is needed to pin down absolute W."
+                )
+            else:
+                print(
+                    f"  ✗ FAIL Gate 2: textured W and T2/T3 ratio vary "
+                    f"by {max(rel_T2, rel_T3, rel_ratio):.1%} between "
+                    "forward and reverse sweeps."
+                )
+                print(
+                    "       The forward-only asymmetry is at least "
+                    "partly a sweep-order artifact."
+                )
+        else:
+            print("  ✓ Gate 2 PASS: forward ≈ reverse on all cases "
+                  "(< 5 %).")
+
+        if sym:
+            sym_cav_t2 = sym[1] / max(sym[0], 1e-30)
+            sym_cav_t3 = sym[2] / max(sym[0], 1e-30)
+            if sym[1] < 0.01 * sym[0] and sym[2] < 0.01 * sym[0]:
+                print(
+                    "  ✗ FAIL: gs_symmetric_inline collapses textured "
+                    "cases to near-zero load (cav → ~1, all-cav "
+                    "attractor). The symmetric pair picks a THIRD "
+                    "attractor (fully flooded by cavitation) that is "
+                    "different from either forward-only or reverse-only."
+                )
+            else:
+                print("  symmetric-inline textured: gain_T2="
+                      f"{sym_cav_t2:.3f}, gain_T3={sym_cav_t3:.3f}, "
+                      f"T2/T3={sym[1] / max(sym[2], 1e-30):.3f}")
     print("=" * 78)
 
 
