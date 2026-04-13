@@ -1100,6 +1100,8 @@ def solve_elrod_compressible(
     hs_warmup_iter=50_000,
     hs_warmup_tol=1e-5,
     hs_warmup_omega=None,
+    # Engine selector + per-engine controls
+    formulation="ptheta",     # "ptheta" (default) or "theta_vk"
     scheme="pseudo_transient",
     max_picard=50,
     tol_picard=1e-6,
@@ -1107,8 +1109,12 @@ def solve_elrod_compressible(
     pt_max_time_steps=200,
     pt_max_inner=50,
     pt_inner_tol=1e-4,
+    # theta_vk controls
+    switch_backend="hard",    # "hard" or "fk_soft"
+    gfactor=0.9,
+    tol_g=1e-6,
+    n_quiescent=3,
     # Deprecated kwargs, accepted but unused (for backward compat)
-    gfactor=None,
     pin_active_set=None,
     max_outer_active_set=None,
     cav_threshold=None,
@@ -1180,6 +1186,35 @@ def solve_elrod_compressible(
             f"scheme must be 'pseudo_transient' or 'gs', got {scheme!r}"
         )
 
+    if formulation not in ("ptheta", "theta_vk"):
+        raise ValueError(
+            f"formulation must be 'ptheta' or 'theta_vk', got "
+            f"{formulation!r}"
+        )
+
+    # Dispatch to faithful Θ-form VK/FK engine (alongside default P-Θ)
+    if formulation == "theta_vk":
+        return _solve_elrod_theta_vk(
+            H, d_phi, d_Z, R, L,
+            beta_bar=beta_bar,
+            omega=omega_p,                # single ω in Θ-form
+            gfactor=0.9 if gfactor is None else gfactor,
+            switch_backend=switch_backend,
+            tol_theta=tol,
+            tol_g=tol_g,
+            max_iter=max_iter,
+            check_every=check_every,
+            n_quiescent=n_quiescent,
+            phi_bc=phi_bc,
+            theta_min=theta_min,
+            P_init=P_init,
+            Theta_init=Theta_init,
+            hs_warmup_iter=hs_warmup_iter,
+            hs_warmup_tol=hs_warmup_tol,
+            hs_warmup_omega=hs_warmup_omega,
+            verbose=verbose,
+        )
+
     p_state_eps = 1e-12
     theta_state_eps = 1e-12
 
@@ -1205,3 +1240,352 @@ def solve_elrod_compressible(
         Theta_init=Theta_init,
         verbose=verbose,
     )
+
+
+# ============================================================================
+# Faithful Θ-form Vijayaraghavan-Keith / Fesanghary-Khonsari solver
+# (additional engine, NOT the public default).
+#
+# Single unknown: Θ. State arrays:
+#   Theta    — main variable
+#   g_state  — hard switch (strictly 0/1) — physical topology
+#   g_soft   — soft FK switch (in [0, 1]) — numerical stabilizer
+#
+# Stencil weight `g_phys` is taken from g_state (switch_backend="hard")
+# or g_soft (switch_backend="fk_soft"). Coefficients are bare h³ face
+# averages (no K = ρ·h³); compressibility enters only through the
+# final P = β̄·g·ln(Θ) recovery.
+#
+# Local equation (Manser-style):
+#   β̄·g_phys·(A·Θ_jp + B·Θ_jm + C·Θ_ip + D·Θ_im - E·Θ_ij)
+#       = 6·d_phi·(h_ij·Θ_ij - h_jm·Θ_jm)
+# ============================================================================
+
+
+@njit(cache=True)
+def _elrod_theta_vk_sweep(
+    Theta, g_state, g_soft, H,
+    A, B, C, D, E,
+    d_phi, beta_bar, omega, gfactor,
+    use_soft_backend,
+    N_Z, N_phi, groove,
+    state_eps, theta_min,
+):
+    """
+    One lexicographic GS sweep of the faithful Θ-form Elrod system.
+
+    Returns (max_delta_theta, max_delta_gsoft, n_state_flips).
+    """
+    max_dth = 0.0
+    max_dg = 0.0
+    n_flips = 0
+    six_dphi = 6.0 * d_phi
+
+    for i in range(1, N_Z - 1):
+        for j in range(1, N_phi - 1):
+            if groove != 0:
+                jp = j + 1
+                jm = j - 1
+            else:
+                jp = j + 1 if j + 1 < N_phi - 1 else 1
+                jm = j - 1 if j - 1 >= 1 else N_phi - 2
+
+            Theta_old = Theta[i, j]
+            gst_old = g_state[i, j]
+            gsf_old = g_soft[i, j]
+
+            Tjp = Theta[i, jp]
+            Tjm = Theta[i, jm]
+            Tip = Theta[i + 1, j]
+            Tim = Theta[i - 1, j]
+            Theta_up = Tjm
+
+            h_ij = H[i, j]
+            h_jm = H[i, jm]
+
+            A_l = A[i, j]
+            B_l = B[i, j]
+            C_l = C[i, j]
+            D_l = D[i, j]
+            E_l = E[i, j]
+
+            # Pick g_phys per backend
+            if use_soft_backend != 0:
+                g_phys = gsf_old
+            else:
+                g_phys = gst_old
+
+            diff = A_l * Tjp + B_l * Tjm + C_l * Tip + D_l * Tim
+            # Local update: β̄·g·E·Θ + 6dφ·h·Θ = β̄·g·diff + 6dφ·h_jm·Θ_jm
+            num = beta_bar * g_phys * diff + six_dphi * h_jm * Theta_up
+            den = beta_bar * g_phys * E_l + six_dphi * h_ij + 1e-30
+            Theta_trial = num / den
+
+            # Determine target topology
+            if Theta_trial >= 1.0 - state_eps:
+                state_target = 1
+            else:
+                state_target = 0
+
+            # SOR relaxation
+            Theta_relax = Theta_old + omega * (Theta_trial - Theta_old)
+            if Theta_relax < theta_min:
+                Theta_relax = theta_min
+
+            # Topology-consistency clamp
+            if state_target == 0 and Theta_relax >= 1.0:
+                Theta_relax = 1.0 - state_eps
+            if state_target == 1 and omega < 1.0 and Theta_relax < 1.0:
+                Theta_relax = 1.0
+
+            Theta[i, j] = Theta_relax
+
+            # Switch updates
+            new_state = float(state_target)
+            new_soft = gsf_old + gfactor * (new_state - gsf_old)
+            if new_soft < 0.0:
+                new_soft = 0.0
+            if new_soft > 1.0:
+                new_soft = 1.0
+
+            if (gst_old > 0.5) != (state_target == 1):
+                n_flips += 1
+            g_state[i, j] = new_state
+            g_soft[i, j] = new_soft
+
+            dth = Theta_relax - Theta_old
+            if dth < 0.0:
+                dth = -dth
+            if dth > max_dth:
+                max_dth = dth
+            dg = new_soft - gsf_old
+            if dg < 0.0:
+                dg = -dg
+            if dg > max_dg:
+                max_dg = dg
+
+    # phi BC
+    if groove != 0:
+        for i in range(N_Z):
+            Theta[i, 0] = 1.0
+            Theta[i, N_phi - 1] = 1.0
+            g_state[i, 0] = 1.0
+            g_state[i, N_phi - 1] = 1.0
+            g_soft[i, 0] = 1.0
+            g_soft[i, N_phi - 1] = 1.0
+    else:
+        for i in range(N_Z):
+            Theta[i, 0] = Theta[i, N_phi - 2]
+            Theta[i, N_phi - 1] = Theta[i, 1]
+            g_state[i, 0] = g_state[i, N_phi - 2]
+            g_state[i, N_phi - 1] = g_state[i, 1]
+            g_soft[i, 0] = g_soft[i, N_phi - 2]
+            g_soft[i, N_phi - 1] = g_soft[i, 1]
+
+    # Z BC (flooded)
+    for j in range(N_phi):
+        Theta[0, j] = 1.0
+        Theta[N_Z - 1, j] = 1.0
+        g_state[0, j] = 1.0
+        g_state[N_Z - 1, j] = 1.0
+        g_soft[0, j] = 1.0
+        g_soft[N_Z - 1, j] = 1.0
+
+    return max_dth, max_dg, n_flips
+
+
+def _solve_elrod_theta_vk(
+    H, d_phi, d_Z, R, L,
+    beta_bar,
+    omega=1.0,
+    gfactor=0.9,
+    switch_backend="hard",
+    tol_theta=1e-6,
+    tol_g=1e-6,
+    max_iter=200_000,
+    check_every=200,
+    n_quiescent=3,
+    phi_bc="groove",
+    theta_min=1e-8,
+    P_init=None,
+    Theta_init=None,
+    hs_warmup_iter=50_000,
+    hs_warmup_tol=1e-5,
+    hs_warmup_omega=None,
+    verbose=False,
+):
+    """
+    Faithful Θ-form VK/FK solver. Single unknown Θ + (g_state, g_soft).
+    Bare h³ coefficients (no K = ρ·h³, no Picard outer loop).
+
+    Convergence: requires max_delta_theta < tol_theta AND
+    max_delta_gsoft < tol_g AND n_state_flips == 0 for `n_quiescent`
+    consecutive sample points (every `check_every` sweeps).
+    """
+    if phi_bc not in ("periodic", "groove"):
+        raise ValueError(
+            f"phi_bc must be 'periodic' or 'groove', got {phi_bc!r}"
+        )
+    if switch_backend not in ("hard", "fk_soft"):
+        raise ValueError(
+            f"switch_backend must be 'hard' or 'fk_soft', got "
+            f"{switch_backend!r}"
+        )
+    use_soft = 1 if switch_backend == "fk_soft" else 0
+    groove = 1 if phi_bc == "groove" else 0
+    state_eps = 1e-12
+    p_state_eps = 1e-12
+
+    N_Z, N_phi = H.shape
+
+    # Ghost-pack H
+    H = np.ascontiguousarray(H, dtype=np.float64).copy()
+    if groove:
+        H[:, 0] = H[:, 1]
+        H[:, N_phi - 1] = H[:, N_phi - 2]
+    else:
+        H[:, 0] = H[:, N_phi - 2]
+        H[:, N_phi - 1] = H[:, 1]
+
+    # Bare h³ coefficients (Θ-form uses these directly, weighted by g_phys
+    # inside the sweep)
+    A, B, C, D, E = _build_coefficients(
+        H, d_phi, d_Z, R, L, groove=bool(groove),
+    )
+
+    # Seed (P, Θ, g_state, g_soft) per ТЗ §4.9
+    if P_init is not None:
+        P_seed = np.where(P_init > 0.0, P_init, 0.0)
+        Theta = np.where(
+            P_seed > p_state_eps,
+            np.exp(np.clip(P_seed, 0.0, None) / beta_bar),
+            1.0,
+        )
+        g_state = (P_seed > p_state_eps).astype(np.float64)
+    elif Theta_init is not None:
+        Theta = np.ascontiguousarray(Theta_init, dtype=np.float64).copy()
+        Theta = np.clip(Theta, theta_min, None)
+        g_state = (Theta >= 1.0 - state_eps).astype(np.float64)
+    elif hs_warmup_iter > 0:
+        if hs_warmup_omega is None:
+            from reynolds_solver.utils import compute_auto_omega
+            hs_warmup_omega = compute_auto_omega(
+                N_phi, N_Z, R, L, cap=1.97,
+            )
+        F_hs = np.zeros((N_Z, N_phi), dtype=np.float64)
+        for i in range(1, N_Z - 1):
+            for j in range(1, N_phi - 1):
+                if groove:
+                    jm = j - 1
+                else:
+                    jm = j - 1 if j - 1 >= 1 else N_phi - 2
+                F_hs[i, j] = d_phi * (H[i, j] - H[i, jm])
+        P_hs = np.zeros((N_Z, N_phi), dtype=np.float64)
+        for k in range(hs_warmup_iter):
+            hs_res = _hs_sor_sweep(
+                P_hs, A, B, C, D, E, F_hs,
+                hs_warmup_omega, N_Z, N_phi, groove,
+            )
+            if hs_res < hs_warmup_tol and k > 5:
+                break
+        P_seed = np.where(P_hs > 0.0, P_hs, 0.0)
+        Theta = np.where(
+            P_seed > p_state_eps,
+            np.exp(P_seed / beta_bar),
+            1.0,
+        )
+        g_state = (P_seed > p_state_eps).astype(np.float64)
+        if verbose:
+            print(
+                f"  [Elrod-Θ-VK] HS seed: maxP_hs={P_seed.max():.4e}, "
+                f"ω_hs={hs_warmup_omega:.4f}"
+            )
+    else:
+        Theta = np.ones((N_Z, N_phi), dtype=np.float64)
+        g_state = np.ones((N_Z, N_phi), dtype=np.float64)
+
+    g_soft = g_state.copy()
+
+    # Apply BC to initial state
+    if groove:
+        Theta[:, 0] = 1.0
+        Theta[:, -1] = 1.0
+        g_state[:, 0] = 1.0
+        g_state[:, -1] = 1.0
+        g_soft[:, 0] = 1.0
+        g_soft[:, -1] = 1.0
+    else:
+        Theta[:, 0] = Theta[:, -2]
+        Theta[:, -1] = Theta[:, 1]
+        g_state[:, 0] = g_state[:, -2]
+        g_state[:, -1] = g_state[:, 1]
+        g_soft[:, 0] = g_soft[:, -2]
+        g_soft[:, -1] = g_soft[:, 1]
+    Theta[0, :] = 1.0
+    Theta[-1, :] = 1.0
+    g_state[0, :] = 1.0
+    g_state[-1, :] = 1.0
+    g_soft[0, :] = 1.0
+    g_soft[-1, :] = 1.0
+
+    if verbose:
+        print(
+            f"  [Elrod-Θ-VK] N_Z={N_Z}, N_phi={N_phi}, "
+            f"β̄={beta_bar:.3e}, ω={omega}, gfactor={gfactor}, "
+            f"backend={switch_backend}, phi_bc={phi_bc}"
+        )
+
+    quiescent_streak = 0
+    max_dth = 1.0
+    max_dg = 1.0
+    n_iter = 0
+    for k in range(max_iter):
+        max_dth, max_dg, n_flips = _elrod_theta_vk_sweep(
+            Theta, g_state, g_soft, H,
+            A, B, C, D, E,
+            d_phi, beta_bar, omega, gfactor,
+            use_soft,
+            N_Z, N_phi, groove,
+            state_eps, theta_min,
+        )
+        n_iter += 1
+
+        if k > 5 and k % check_every == 0:
+            converged_now = (
+                max_dth < tol_theta and max_dg < tol_g and n_flips == 0
+            )
+            if converged_now:
+                quiescent_streak += 1
+            else:
+                quiescent_streak = 0
+
+            if verbose:
+                cav_frac = float(np.mean(g_state[1:-1, 1:-1] < 0.5))
+                print(
+                    f"    iter={k}: ΔΘ={max_dth:.3e}, "
+                    f"Δg={max_dg:.3e}, "
+                    f"Θ=[{Theta.min():.4f}, {Theta.max():.4f}], "
+                    f"g_soft=[{g_soft.min():.3f}, {g_soft.max():.3f}], "
+                    f"cav={cav_frac:.3f}, flips={n_flips}, "
+                    f"quiescent={quiescent_streak}"
+                )
+
+            if quiescent_streak >= n_quiescent:
+                if verbose:
+                    print(
+                        f"  [Elrod-Θ-VK] CONVERGED at iter={k} "
+                        f"(quiescent {quiescent_streak} samples)"
+                    )
+                break
+
+    # Pressure recovery from HARD topology
+    g_hard = g_state
+    Theta_for_p = np.where(
+        g_hard > 0.5, np.maximum(Theta, 1.0), 1.0,
+    )
+    P = beta_bar * g_hard * np.log(Theta_for_p)
+    P = np.where(P >= 0.0, P, 0.0)
+
+    theta_out = np.clip(Theta, theta_min, None)
+
+    return P, theta_out, max_dth, n_iter
