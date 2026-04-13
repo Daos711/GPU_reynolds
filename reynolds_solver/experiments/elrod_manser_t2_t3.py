@@ -329,7 +329,7 @@ def main():
     seed_cache = {}    # id(H) -> (P_seed, Theta_seed)
     if use_ptheta_seed:
         for tag, H in [("Smooth", H_s), ("T2", H_t2), ("T3", H_t3)]:
-            P_p, theta_p, _, _ = run_case(
+            _, P_p, theta_p = run_case(
                 f"[seed] ptheta {tag}", H, Phi_m, Z_m,
                 phi_1d, z_1d, d_phi, d_Z, R, L, beta_bar,
                 formulation="ptheta", switch_backend="hard",
