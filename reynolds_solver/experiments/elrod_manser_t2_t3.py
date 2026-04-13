@@ -217,17 +217,18 @@ def main():
     N_Z = int(os.environ.get("ELROD_MANSER_NZ", 121))
     max_iter = int(os.environ.get("ELROD_MANSER_MAXITER", 500_000))
 
-    # Engine selectors. Default set is the sweep-order gate panel:
-    # forward-only, reverse-only, symmetric pair, PT. Runs all on
-    # fk_soft so that Gate 2 (sweep-order neutrality of the Manser
-    # asymmetry) is visible in one call.
+    # Engine selectors. Default set is the Phase A stabilisation panel:
+    # plain FP, safeguarded under-relaxation, Anderson (experimental).
+    # All three wrap the SAME forward-inline kernel (gs_inline_legacy)
+    # as a fixed-point map F(x) and apply different outer nonlinear
+    # solvers on top of it.
     formulations = os.environ.get(
         "ELROD_MANSER_FORMULATIONS",
         "ptheta:hard,"
         "theta_vk:fk_soft:gs_inline_legacy,"
-        "theta_vk:fk_soft:gs_inline_reverse,"
-        "theta_vk:fk_soft:gs_symmetric_inline,"
-        "theta_vk:fk_soft:pseudo_transient",
+        "theta_vk:fk_soft:fp_plain,"
+        "theta_vk:fk_soft:fp_underrelaxed,"
+        "theta_vk:fk_soft:fp_anderson",
     ).split(",")
     formulations = [s.strip() for s in formulations if s.strip()]
 
@@ -523,6 +524,92 @@ def main():
                 print("  symmetric-inline textured: gain_T2="
                       f"{sym_cav_t2:.3f}, gain_T3={sym_cav_t3:.3f}, "
                       f"T2/T3={sym[1] / max(sym[2], 1e-30):.3f}")
+
+    # -----------------------------------------------------------------
+    # Phase B — real GEOMETRIC mirror test (ТЗ §9.1). Use the best
+    # converged fp_* scheme from Phase A (prefer fp_plain) and run:
+    #   (a) original T2 / T3 geometries (already in `results`)
+    #   (b) φ-reflected T2 / T3 geometries (H[:, ::-1])
+    # Acceptance: T2(original) ≈ T3(mirrored), T3(original) ≈ T2(mirrored).
+    # -----------------------------------------------------------------
+    mirror_best_spec = None
+    for spec in ("theta_vk:fk_soft:fp_plain",
+                 "theta_vk:fk_soft:fp_underrelaxed",
+                 "theta_vk:fk_soft:gs_inline_legacy"):
+        parts = spec.split(":")
+        key = tuple(parts) if len(parts) == 3 else (parts[0], parts[1],
+                                                    "pseudo_transient")
+        if key in results:
+            mirror_best_spec = (spec, key)
+            break
+
+    if mirror_best_spec is not None:
+        spec, key = mirror_best_spec
+        formulation, backend, scheme = key
+        print()
+        print("=" * 78)
+        print(f"  PHASE B: real geometric mirror (ТЗ §9.1) using {spec}")
+        print("=" * 78)
+        H_t2_mirror = H_t2[:, ::-1].copy()
+        H_t3_mirror = H_t3[:, ::-1].copy()
+
+        W_t2m, _, _ = run_case(
+            f"T2 (φ-reflected) [{spec}]", H_t2_mirror,
+            Phi_m, Z_m, phi_1d, z_1d, d_phi, d_Z, R, L, beta_bar,
+            formulation=formulation, switch_backend=backend,
+            theta_vk_scheme=scheme,
+            max_iter=max_iter,
+        )
+        W_t3m, _, _ = run_case(
+            f"T3 (φ-reflected) [{spec}]", H_t3_mirror,
+            Phi_m, Z_m, phi_1d, z_1d, d_phi, d_Z, R, L, beta_bar,
+            formulation=formulation, switch_backend=backend,
+            theta_vk_scheme=scheme,
+            max_iter=max_iter,
+        )
+
+        W_s_ref, W_t2_ref, W_t3_ref = results[key]
+
+        def rel2(a, b):
+            return abs(a - b) / max(abs(a), abs(b), 1e-30)
+
+        err_t2_vs_t3m = rel2(W_t2_ref, W_t3m)
+        err_t3_vs_t2m = rel2(W_t3_ref, W_t2m)
+
+        print()
+        print(f"  Original T2 W      = {W_t2_ref:.4e}")
+        print(f"  Mirrored T3 W      = {W_t3m:.4e}  "
+              f"rel|Δ|={err_t2_vs_t3m:.2%}")
+        print(f"  Original T3 W      = {W_t3_ref:.4e}")
+        print(f"  Mirrored T2 W      = {W_t2m:.4e}  "
+              f"rel|Δ|={err_t3_vs_t2m:.2%}")
+
+        # Compare ratios too (more robust than absolute W)
+        r_orig = W_t2_ref / max(W_t3_ref, 1e-30)
+        r_mir = W_t2m / max(W_t3m, 1e-30)
+        print(
+            f"\n  T2/T3 ratio  original={r_orig:.3f}  "
+            f"mirror-swapped={1.0 / r_mir:.3f}  "
+            f"rel|Δ|={rel2(r_orig, 1.0 / max(r_mir, 1e-30)):.2%}"
+        )
+
+        if err_t2_vs_t3m < 0.05 and err_t3_vs_t2m < 0.05:
+            print(
+                "\n  ✓ MIRROR PASS: geometric mirror swaps T2 and T3 "
+                "within 5 %. Asymmetry is genuinely handed by the "
+                "wedge orientation, not by a solver sign-bug."
+            )
+        elif err_t2_vs_t3m < 0.20 and err_t3_vs_t2m < 0.20:
+            print(
+                "\n  ◐ MIRROR PARTIAL: ordering swaps qualitatively "
+                "but absolute W off by 5–20 %."
+            )
+        else:
+            print(
+                "\n  ✗ MIRROR FAIL: geometric mirror does NOT swap "
+                "T2 and T3. The asymmetry may have a solver origin "
+                "rather than a geometric one."
+            )
     print("=" * 78)
 
 

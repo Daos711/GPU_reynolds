@@ -369,6 +369,68 @@ def test_theta_vk_v1_distinguishability():
 
 
 # -----------------------------------------------------------------------
+# Test B (TZ §9.1): geometric mirror — φ-reflected wedge swaps load
+# between T2 and T3 within a few percent.
+# -----------------------------------------------------------------------
+def test_theta_vk_geometric_mirror():
+    print("\n=== Test B: geometric mirror on T2 ↔ T3 wedge ===")
+    from reynolds_solver.cavitation.elrod import solve_elrod_compressible
+
+    N_phi, N_Z = 120, 40
+    phi = np.linspace(0, 2 * np.pi, N_phi)
+    Z = np.linspace(-1, 1, N_Z)
+    Phi, Zg = np.meshgrid(phi, Z)
+    H0 = 1.0 + 0.6 * np.cos(Phi)
+    d_phi = phi[1] - phi[0]
+    d_Z = Z[1] - Z[0]
+
+    # Single convergent wedge at phi=pi-0.4, z centered
+    phi_c = np.pi - 0.4
+    r_x = 0.2
+    r_z = 0.5
+    delta_phi = np.arctan2(np.sin(Phi - phi_c), np.cos(Phi - phi_c))
+    inside = (np.abs(delta_phi) <= r_x).astype(float)
+    inside_z = (np.abs(Zg) <= r_z).astype(float)
+    ramp_T2 = np.clip(1.0 - delta_phi / r_x, 0.0, 2.0)
+    ramp_T3 = np.clip(1.0 + delta_phi / r_x, 0.0, 2.0)
+    H_T2 = H0 + 0.3 * ramp_T2 * inside * inside_z
+    H_T3 = H0 + 0.3 * ramp_T3 * inside * inside_z
+
+    common = dict(
+        d_phi=d_phi, d_Z=d_Z, R=R, L=L,
+        beta_bar=40.0,
+        formulation="theta_vk",
+        switch_backend="fk_soft",
+        theta_vk_scheme="fp_plain",
+        omega=1.0, tol=1e-5, max_iter=8_000,
+        phi_bc="groove",
+    )
+    P_T2, _, _, _ = solve_elrod_compressible(H_T2, **common)
+    P_T3, _, _, _ = solve_elrod_compressible(H_T3, **common)
+    # φ-reflect T2 → should match T3 physics
+    H_T2_mir = H_T2[:, ::-1].copy()
+    P_T2_mir, _, _, _ = solve_elrod_compressible(H_T2_mir, **common)
+
+    # Compare integrals: P_T2_mir should have similar max pressure to
+    # P_T3 (up to solver noise). Use Pmax as a simple signature.
+    Pm_T2 = float(P_T2.max())
+    Pm_T3 = float(P_T3.max())
+    Pm_T2_mir = float(P_T2_mir.max())
+
+    rel = abs(Pm_T2_mir - Pm_T3) / max(Pm_T3, 1e-30)
+    print(f"    Pmax(T2)       = {Pm_T2:.4e}")
+    print(f"    Pmax(T3)       = {Pm_T3:.4e}")
+    print(f"    Pmax(T2_mir)   = {Pm_T2_mir:.4e}  (should ≈ Pmax(T3))")
+    print(f"    rel|Pmax(T2_mir) - Pmax(T3)| / Pmax(T3) = {rel:.2%}")
+
+    return run_test(
+        "geometric mirror swaps T2↔T3 within 5 % (V1 mirror, TZ §9.1)",
+        rel < 0.05,
+        f"rel diff = {rel:.2%}",
+    )
+
+
+# -----------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------
 def main():
@@ -384,6 +446,7 @@ def main():
         ("5", test_theta_vk_groove_smoke),
         ("6", test_theta_vk_v1_distinguishability),
         ("A", test_theta_vk_sweep_order_neutral_smooth),
+        ("B", test_theta_vk_geometric_mirror),
     ]
 
     results = []

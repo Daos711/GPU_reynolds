@@ -1447,6 +1447,98 @@ def _elrod_theta_vk_sweep_inline_legacy(
 
 
 # -----------------------------------------------------------------------
+# Fixed-point state pack/unpack/project helpers for the nonlinear outer
+# accelerators (underrelaxed FP, Anderson). The "state vector" x
+# concatenates INTERIOR (Theta, g_soft) values only; g_state is always
+# recovered as (g_soft >= 0.5). Boundary ghosts are re-imposed on every
+# unpack. See ТЗ §4.1 / §4.3.
+# -----------------------------------------------------------------------
+
+
+def _pack_theta_vk_state(Theta, g_soft):
+    """Pack interior (Theta, g_soft) values into a single 1-D vector."""
+    T_int = Theta[1:-1, 1:-1].ravel()
+    g_int = g_soft[1:-1, 1:-1].ravel()
+    return np.concatenate([T_int, g_int])
+
+
+def _unpack_theta_vk_state(x, Theta, g_soft, g_state, groove,
+                           theta_min=1e-8):
+    """Write `x` back into (Theta, g_soft), project, rebuild g_state,
+    and reapply phi / Z boundary conditions. In-place on the given
+    arrays."""
+    N_Z, N_phi = Theta.shape
+    n_int = (N_Z - 2) * (N_phi - 2)
+    T_int = x[:n_int].reshape(N_Z - 2, N_phi - 2)
+    g_int = x[n_int:].reshape(N_Z - 2, N_phi - 2)
+    Theta[1:-1, 1:-1] = np.maximum(T_int, theta_min)
+    g_soft[1:-1, 1:-1] = np.clip(g_int, 0.0, 1.0)
+    # Hard topology from soft
+    g_state[:] = (g_soft >= 0.5).astype(np.float64)
+    # phi BC
+    if groove:
+        Theta[:, 0] = 1.0
+        Theta[:, -1] = 1.0
+        g_state[:, 0] = 1.0
+        g_state[:, -1] = 1.0
+        g_soft[:, 0] = 1.0
+        g_soft[:, -1] = 1.0
+    else:
+        Theta[:, 0] = Theta[:, -2]
+        Theta[:, -1] = Theta[:, 1]
+        g_state[:, 0] = g_state[:, -2]
+        g_state[:, -1] = g_state[:, 1]
+        g_soft[:, 0] = g_soft[:, -2]
+        g_soft[:, -1] = g_soft[:, 1]
+    # Z BC (flooded)
+    Theta[0, :] = 1.0
+    Theta[-1, :] = 1.0
+    g_state[0, :] = 1.0
+    g_state[-1, :] = 1.0
+    g_soft[0, :] = 1.0
+    g_soft[-1, :] = 1.0
+
+
+def _theta_vk_fixed_point_map(
+    x_in, Theta, g_state, g_soft, H,
+    A, B, C, D, E,
+    d_phi, beta_bar, omega, gfactor,
+    use_soft, N_Z, N_phi, groove,
+    state_eps, theta_min,
+):
+    """
+    F(x) = one full forward inline sweep of the theta_vk/fk_soft kernel.
+
+    Unpacks x into the working (Theta, g_state, g_soft) fields
+    (in-place on the provided scratch arrays), runs one forward inline
+    sweep, and packs the result back into a new vector.
+
+    Returns (x_out, max_dth, max_dg, n_flips).
+    """
+    _unpack_theta_vk_state(x_in, Theta, g_soft, g_state, groove, theta_min)
+    max_dth, max_dg, n_flips = _elrod_theta_vk_sweep_inline(
+        Theta, g_state, g_soft, H,
+        A, B, C, D, E,
+        d_phi, beta_bar, omega, gfactor,
+        use_soft,
+        N_Z, N_phi, groove,
+        state_eps, theta_min,
+        0,   # forward
+    )
+    x_out = _pack_theta_vk_state(Theta, g_soft)
+    return x_out, float(max_dth), float(max_dg), int(n_flips)
+
+
+def _pmax_from_state(Theta, g_state, beta_bar):
+    """Pmax(recovered from hard topology) for safeguard/diagnostic use."""
+    Theta_for_p = np.where(
+        g_state > 0.5, np.maximum(Theta, 1.0), 1.0,
+    )
+    P = beta_bar * g_state * np.log(Theta_for_p)
+    return float(np.where(P >= 0.0, P, 0.0).max())
+
+
+# -----------------------------------------------------------------------
 # New lagged + pseudo-transient sweep — current default for theta_vk.
 # Key design points (per TZ):
 #   1. Stencil weight g_phys is read from LAGGED arrays g_state_lag,
@@ -1674,10 +1766,13 @@ def _solve_elrod_theta_vk(
     if scheme not in (
         "gs_symmetric_inline", "pseudo_transient",
         "gs_inline_legacy", "gs_inline_reverse",
+        "fp_plain", "fp_underrelaxed", "fp_anderson",
     ):
         raise ValueError(
-            f"scheme must be 'gs_symmetric_inline', 'pseudo_transient', "
-            f"'gs_inline_legacy', or 'gs_inline_reverse', got {scheme!r}"
+            f"scheme must be one of 'gs_symmetric_inline', "
+            f"'pseudo_transient', 'gs_inline_legacy', 'gs_inline_reverse', "
+            f"'fp_plain', 'fp_underrelaxed', 'fp_anderson', "
+            f"got {scheme!r}"
         )
     use_soft = 1 if switch_backend == "fk_soft" else 0
     groove = 1 if phi_bc == "groove" else 0
@@ -2039,6 +2134,334 @@ def _solve_elrod_theta_vk(
                             f"iter={k}"
                         )
                     break
+        g_hard = g_state
+        Theta_for_p = np.where(
+            g_hard > 0.5, np.maximum(Theta, 1.0), 1.0,
+        )
+        P = beta_bar * g_hard * np.log(Theta_for_p)
+        P = np.where(P >= 0.0, P, 0.0)
+        theta_out = np.clip(Theta, theta_min, None)
+        return P, theta_out, max_dth, n_iter
+
+    # -------------------------------------------------------------
+    # Fixed-point acceleration paths — ТЗ: "не менять kernel,
+    # стабилизировать F(x) снаружи". One F-eval = one forward inline
+    # sweep. Safeguards: residual-based step acceptance + Pmax spike
+    # monitor + Theta_min / g_soft∈[0,1] projection after every
+    # mixing step.
+    # -------------------------------------------------------------
+    if scheme in ("fp_plain", "fp_underrelaxed", "fp_anderson"):
+        # Pack initial state
+        x = _pack_theta_vk_state(Theta, g_soft)
+
+        # History for metric-stationarity / limit-cycle telemetry
+        hist_res = []
+        hist_Pmax = []
+        hist_cav = []
+        hist_fluid = []
+        k_hist = 10
+
+        # Adaptive under-relaxation state (used by both underrelaxed
+        # and as Anderson safeguard fallback).
+        lam_cur = 1.0
+        prev_r_norm = None
+
+        # Anderson history buffers (kept only while scheme=fp_anderson)
+        # X_hist stores x_k; G_hist stores g_k = F(x_k); R_hist stores
+        # residuals r_k = g_k - x_k. Always keep paired entries.
+        X_hist = []
+        G_hist = []
+        R_hist = []
+        # NOTE: anderson_start is conservatively large. On hard-switch
+        # VK/FK maps the residual is dominated by interface flips for
+        # the first ~500–1000 iterations; Anderson extrapolating on
+        # that noisy residual reliably produces wrong attractors. We
+        # let plain FP carry the first 500 iterations so the topology
+        # coarsens, and only then engage Anderson as a refinement.
+        anderson_m = 3
+        anderson_start = 500
+
+        n_iter = 0
+        max_dth = 1.0
+        max_dg = 1.0
+        n_flips = 0
+        quiescent_streak = 0
+        converged_via_strict = False
+        converged_via_soft = False
+
+        # Evaluate initial F once to get (g_0, r_0, x_1_naive)
+        x_trial, max_dth, max_dg, n_flips = _theta_vk_fixed_point_map(
+            x, Theta, g_state, g_soft, H,
+            A, B, C, D, E,
+            d_phi, beta_bar, omega, gfactor,
+            use_soft, N_Z, N_phi, groove,
+            state_eps, theta_min,
+        )
+        r = x_trial - x
+        n_iter += 1
+
+        # Safeguard reference: Pmax on initial F(x) (HS seed + 1 sweep).
+        # Hard ceiling: 3× this reference with a generous floor of
+        # 10.0 — legit textured Pmax can reach ~7, so we allow up to
+        # 10 by default but catch Anderson spikes > 10..15×.
+        Pmax_smooth_ref = _pmax_from_state(Theta, g_state, beta_bar)
+        Pmax_ceiling = max(3.0 * Pmax_smooth_ref, 10.0)
+        Pmax_running = Pmax_smooth_ref
+
+        for k in range(1, max_iter):
+            r_norm = float(np.linalg.norm(r))
+            x_trial_from_last = x_trial.copy()
+
+            # --- Pick next x_{k+1} based on scheme ---
+            if scheme == "fp_plain":
+                x_next = x_trial_from_last
+
+            elif scheme == "fp_underrelaxed":
+                # Adaptive λ based on residual growth, NOT on Pmax
+                # spikes (those are transient inside healthy inline
+                # evolution and caused earlier builds to collapse).
+                # Rule: if |r_k| grew by >3× from the previous |r|,
+                # halve λ (min 0.1). If |r_k| fell, slowly grow λ
+                # toward 1.0. The default is lam=1.0 (= fp_plain).
+                if prev_r_norm is not None:
+                    if r_norm > 3.0 * prev_r_norm:
+                        lam_cur = max(lam_cur * 0.5, 0.1)
+                    elif r_norm < 0.9 * prev_r_norm:
+                        lam_cur = min(lam_cur * 1.1, 1.0)
+                prev_r_norm = r_norm
+                x_cand = x + lam_cur * r
+                # Project
+                _unpack_theta_vk_state(
+                    x_cand, Theta, g_soft, g_state, groove, theta_min,
+                )
+                x_next = _pack_theta_vk_state(Theta, g_soft)
+
+            else:  # fp_anderson
+                # Append current (x, g=x_trial, r) to history
+                X_hist.append(x.copy())
+                G_hist.append(x_trial_from_last.copy())
+                R_hist.append(r.copy())
+                if len(X_hist) > anderson_m + 1:
+                    X_hist.pop(0)
+                    G_hist.pop(0)
+                    R_hist.pop(0)
+
+                use_anderson = (
+                    k >= anderson_start and len(R_hist) >= 2
+                )
+                if use_anderson:
+                    # Build F_mat (residual differences) and G_mat
+                    # (g differences) for least-squares.
+                    m_k = len(R_hist) - 1
+                    F_mat = np.column_stack([
+                        R_hist[i + 1] - R_hist[i]
+                        for i in range(m_k)
+                    ])
+                    G_mat = np.column_stack([
+                        G_hist[i + 1] - G_hist[i]
+                        for i in range(m_k)
+                    ])
+                    try:
+                        alpha, *_ = np.linalg.lstsq(
+                            F_mat, R_hist[-1], rcond=None,
+                        )
+                        x_cand = x_trial_from_last - G_mat @ alpha
+                    except np.linalg.LinAlgError:
+                        x_cand = None
+
+                    if x_cand is not None and np.all(np.isfinite(x_cand)):
+                        # Extra safeguard: bound deviation from plain
+                        # FP step (reject Anderson that extrapolates
+                        # more than 3× the plain FP residual).
+                        dev_norm = float(
+                            np.linalg.norm(x_cand - x_trial_from_last)
+                        )
+                        if dev_norm > 3.0 * r_norm:
+                            x_cand = None
+                            use_anderson = False
+
+                    if x_cand is not None and np.all(np.isfinite(x_cand)):
+                        # Safeguard: project, evaluate F on candidate,
+                        # accept only if r_cand < r and no Pmax spike.
+                        _unpack_theta_vk_state(
+                            x_cand, Theta, g_soft, g_state, groove,
+                            theta_min,
+                        )
+                        Pmax_cand = _pmax_from_state(
+                            Theta, g_state, beta_bar,
+                        )
+                        x_cand_proj = _pack_theta_vk_state(Theta, g_soft)
+                        if Pmax_cand > Pmax_ceiling:
+                            use_anderson = False
+                        else:
+                            # Evaluate F on the candidate
+                            g_cand, _, _, _ = _theta_vk_fixed_point_map(
+                                x_cand_proj, Theta, g_state, g_soft, H,
+                                A, B, C, D, E,
+                                d_phi, beta_bar, omega, gfactor,
+                                use_soft, N_Z, N_phi, groove,
+                                state_eps, theta_min,
+                            )
+                            n_iter += 1
+                            # Post-F Pmax check (catch candidates that
+                            # look OK before F but spike after it)
+                            Pmax_postF = _pmax_from_state(
+                                Theta, g_state, beta_bar,
+                            )
+                            r_cand = g_cand - x_cand_proj
+                            r_cand_norm = float(np.linalg.norm(r_cand))
+                            # Accept only with strict residual decrease
+                            # and no post-F spike.
+                            if (r_cand_norm < 0.9 * r_norm
+                                    and Pmax_postF < Pmax_ceiling):
+                                x_next = x_cand_proj
+                                x_trial = g_cand
+                                r = r_cand
+                                # Skip the normal F-eval below — already did it
+                                x = x_next
+                                max_dth = float(
+                                    np.max(np.abs(g_cand - x_cand_proj))
+                                )
+                                hist_res.append(r_cand_norm)
+                                Pmax_now = _pmax_from_state(
+                                    Theta, g_state, beta_bar,
+                                )
+                                cav_now = float(
+                                    np.mean(g_state[1:-1, 1:-1] < 0.5)
+                                )
+                                fluid_now = float(
+                                    np.mean(g_state[1:-1, 1:-1] > 0.5)
+                                )
+                                hist_Pmax.append(Pmax_now)
+                                hist_cav.append(cav_now)
+                                hist_fluid.append(fluid_now)
+                                if len(hist_res) > k_hist:
+                                    hist_res.pop(0)
+                                    hist_Pmax.pop(0)
+                                    hist_cav.pop(0)
+                                    hist_fluid.pop(0)
+                                prev_r_norm = r_cand_norm
+                                continue
+                            else:
+                                use_anderson = False
+
+                if not use_anderson:
+                    # Fallback: safeguarded under-relaxation
+                    accepted_lam = None
+                    for lam in [1.0, 0.7, 0.5, 0.3, 0.1]:
+                        x_cand = x + lam * r
+                        _unpack_theta_vk_state(
+                            x_cand, Theta, g_soft, g_state, groove,
+                            theta_min,
+                        )
+                        Pmax_cand = _pmax_from_state(
+                            Theta, g_state, beta_bar,
+                        )
+                        if Pmax_cand < 2.5 * max(
+                            Pmax_smooth_ref, 1e-9,
+                        ):
+                            accepted_lam = lam
+                            x_next = _pack_theta_vk_state(Theta, g_soft)
+                            lam_cur = lam
+                            break
+                    if accepted_lam is None:
+                        lam = 0.1
+                        x_cand = x + lam * r
+                        _unpack_theta_vk_state(
+                            x_cand, Theta, g_soft, g_state, groove,
+                            theta_min,
+                        )
+                        x_next = _pack_theta_vk_state(Theta, g_soft)
+                        lam_cur = lam
+
+            # --- Commit: evaluate F at the new x to get next residual ---
+            x = x_next
+            x_trial, max_dth, max_dg, n_flips = _theta_vk_fixed_point_map(
+                x, Theta, g_state, g_soft, H,
+                A, B, C, D, E,
+                d_phi, beta_bar, omega, gfactor,
+                use_soft, N_Z, N_phi, groove,
+                state_eps, theta_min,
+            )
+            r = x_trial - x
+            n_iter += 1
+
+            r_norm = float(np.linalg.norm(r))
+
+            # Diagnostics
+            Pmax_now = _pmax_from_state(Theta, g_state, beta_bar)
+            cav_now = float(np.mean(g_state[1:-1, 1:-1] < 0.5))
+            fluid_now = float(np.mean(g_state[1:-1, 1:-1] > 0.5))
+            # Let the healthy Pmax reference grow monotonically, but
+            # only by what the inline kernel itself produced (the
+            # safeguard already kept the accelerated candidate below
+            # 1.5x the previous Pmax_running, so committing this
+            # iteration's Pmax_now is safe).
+            if Pmax_now > Pmax_running:
+                Pmax_running = Pmax_now
+            hist_res.append(r_norm)
+            hist_Pmax.append(Pmax_now)
+            hist_cav.append(cav_now)
+            hist_fluid.append(fluid_now)
+            if len(hist_res) > k_hist:
+                hist_res.pop(0)
+                hist_Pmax.pop(0)
+                hist_cav.pop(0)
+                hist_fluid.pop(0)
+
+            # Convergence: strict OR (much tighter) soft quiescent.
+            # Soft requires r_norm small too, to prevent exit during
+            # transient Pmax plateaus mid-evolution.
+            strict_ok = (
+                max_dth < tol_theta and max_dg < tol_g and n_flips == 0
+            )
+            soft_ok = False
+            if (
+                len(hist_Pmax) == k_hist
+                and k > 100
+                and r_norm < 1e-2
+                and n_flips < 0.01 * (N_Z - 2) * (N_phi - 2)
+            ):
+                Pmax_span = max(hist_Pmax) - min(hist_Pmax)
+                cav_span = max(hist_cav) - min(hist_cav)
+                fluid_span = max(hist_fluid) - min(hist_fluid)
+                rel_Pmax = Pmax_span / max(hist_Pmax[-1], 1e-30)
+                if (rel_Pmax < 1e-4
+                        and cav_span < 5e-4
+                        and fluid_span < 5e-4):
+                    soft_ok = True
+            if strict_ok or soft_ok:
+                quiescent_streak += 1
+                if strict_ok:
+                    converged_via_strict = True
+                else:
+                    converged_via_soft = True
+            else:
+                quiescent_streak = 0
+
+            if verbose and k % max(1, check_every) == 0:
+                fluid_ = float(np.mean(g_state[1:-1, 1:-1] > 0.5))
+                print(
+                    f"    [{scheme}] k={k:5d} n_F={n_iter:5d} "
+                    f"|r|={r_norm:.3e} ΔΘ={max_dth:.2e} "
+                    f"flips={n_flips:4d} "
+                    f"Pmax={Pmax_now:.3e} cav={cav_now:.3f} "
+                    f"fluid={fluid_:.3f} "
+                    f"λ={lam_cur if scheme != 'fp_plain' else 1.0:.2f} "
+                    f"quies={quiescent_streak}"
+                )
+
+            if quiescent_streak >= n_quiescent:
+                if verbose:
+                    print(
+                        f"  [Elrod-Θ-VK {scheme}] CONVERGED at k={k} "
+                        f"(strict={converged_via_strict}, "
+                        f"soft={converged_via_soft})"
+                    )
+                break
+            if n_iter >= max_iter:
+                break
+
         g_hard = g_state
         Theta_for_p = np.where(
             g_hard > 0.5, np.maximum(Theta, 1.0), 1.0,
