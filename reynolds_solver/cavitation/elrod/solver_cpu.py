@@ -99,24 +99,39 @@ def _build_coefficients(H, d_phi, d_Z, R, L, groove=False):
 @njit(cache=True)
 def _elrod_sor_sweep(
     Theta, g, H, A, B, C, D, E,
-    cav_mask, pinned,
     d_phi, beta_bar, omega, gfactor,
     theta_min, N_Z, N_phi, groove,
 ):
     """
-    One lexicographic SOR sweep of the compressible Elrod equation.
+    One lexicographic SOR sweep of the compressible Elrod equation
+    with NONLINEAR dynamic dispatch (no pinned active set).
 
-    pinned=0: nonlinear dispatch (try full-film, else cavitation).
-    pinned=1: frozen active set from cav_mask (full-film cells always
-        use the elliptic diagonal and clamp Θ ≥ 1; cavitation cells
-        always use the pure upwind transport and clamp Θ ∈ [θ_min, 1)).
-        Prevents the cavitation zone from creeping into the full-film
-        lobe via the positive feedback P↓→cav↑→P↓.
+    Per node:
+      1. Compute a full-film trial. Diffusive flux face conductances
+         are weighted by the NEIGHBOUR's g value (NOT min(g_self,
+         g_neighbour) — that would block reformation in the current
+         cavitated cell). The current cell is treated as locally
+         active in the trial.
+      2. If Θ_ff ≥ 1, accept full-film: Θ_new = Θ_ff, g_target = 1.
+      3. Else fall back to the cavitation transport branch
+         Θ_cav = h_jm·Θ_jm / h_ij. If Θ_cav < 1, accept cavitation.
+         If Θ_cav ≥ 1, REFORMATION: snap back to full-film
+         (Θ_new = 1, g_target = 1).
+      4. SOR relaxation, then a single guard against SOR overshooting
+         a cavitated cell back into the full-film region.
+      5. Soft FK switch update on g.
 
-    Returns max|ΔΘ| over interior nodes.
+    Returns (max|ΔΘ|, n_state_flips). State flips are counted by
+    HARD classification of (Θ_old vs 1) → (g_target):
+        was full-film  Θ_old >= 1-eps  → flip if g_target == 0
+        was cavitated  Θ_old <  1-eps  → flip if g_target == 1
+    Counting flips on hard state (not on soft g) keeps the metric
+    meaningful while gfactor < 1 keeps g intermediate.
     """
     max_delta = 0.0
+    n_flips = 0
     six_dphi = 6.0 * d_phi
+    state_eps = 1e-12
 
     for i in range(1, N_Z - 1):
         for j in range(1, N_phi - 1):
@@ -141,61 +156,72 @@ def _elrod_sor_sweep(
             B_l = B[i, j]
             C_l = C[i, j]
             D_l = D[i, j]
-            E_l = E[i, j]
 
-            diff = A_l * Tjp + B_l * Tjm + C_l * Tip + D_l * Tim
+            # Face g-weights from the NEIGHBOUR (HARD 0/1 from the
+            # current Θ). Current cell is treated as locally active
+            # in the trial — using min(g_self, g_nb) would zero all
+            # faces and trap the cell in cavitation forever (no
+            # reformation pathway). Hard-state instead of the soft
+            # FK g avoids the slow drift toward trivial collapse
+            # that intermediate g values cause when neighbours
+            # straddle the rupture boundary.
+            gf_jp = 1.0 if Tjp >= 1.0 - state_eps else 0.0
+            gf_jm = 1.0 if Tjm >= 1.0 - state_eps else 0.0
+            gf_ip = 1.0 if Tip >= 1.0 - state_eps else 0.0
+            gf_im = 1.0 if Tim >= 1.0 - state_eps else 0.0
 
-            if pinned != 0:
-                if cav_mask[i, j] != 0:
-                    # Cavitation (pinned)
-                    if h_ij > 1e-30:
-                        Theta_new = h_jm * Tjm / h_ij
-                    else:
-                        Theta_new = theta_min
-                    if Theta_new >= 1.0:
-                        Theta_new = 1.0 - 1e-12
-                    g_target = 0.0
-                else:
-                    # Full-film (pinned)
-                    num_full = beta_bar * diff + six_dphi * h_jm * Tjm
-                    den_full = beta_bar * E_l + six_dphi * h_ij
-                    Theta_new = num_full / (den_full + 1e-30)
-                    if Theta_new < 1.0:
-                        Theta_new = 1.0
-                    g_target = 1.0
+            diff = (gf_jp * A_l * Tjp + gf_jm * B_l * Tjm
+                    + gf_ip * C_l * Tip + gf_im * D_l * Tim)
+            E_eff = (gf_jp * A_l + gf_jm * B_l
+                     + gf_ip * C_l + gf_im * D_l)
+
+            # Full-film trial
+            Theta_ff = (
+                (beta_bar * diff + six_dphi * h_jm * Tjm)
+                / (beta_bar * E_eff + six_dphi * h_ij + 1e-30)
+            )
+
+            if Theta_ff >= 1.0:
+                Theta_candidate = Theta_ff
+                g_target = 1.0
             else:
-                # Nonlinear dispatch
-                num_full = beta_bar * diff + six_dphi * h_jm * Tjm
-                den_full = beta_bar * E_l + six_dphi * h_ij
-                Theta_try_full = num_full / (den_full + 1e-30)
-
-                if Theta_try_full >= 1.0:
-                    Theta_new = Theta_try_full
-                    g_target = 1.0
+                # Cavitation transport branch
+                if h_ij > 1e-30:
+                    Theta_cav = h_jm * Tjm / h_ij
                 else:
-                    if h_ij > 1e-30:
-                        Theta_new = h_jm * Tjm / h_ij
-                    else:
-                        Theta_new = theta_min
-                    if Theta_new >= 1.0:
-                        Theta_new = 1.0 - 1e-12
-                    g_target = 0.0
+                    Theta_cav = theta_min
 
-            if Theta_new < theta_min:
-                Theta_new = theta_min
+                if Theta_cav < 1.0:
+                    if Theta_cav < theta_min:
+                        Theta_cav = theta_min
+                    Theta_candidate = Theta_cav
+                    g_target = 0.0
+                else:
+                    # REFORMATION: cavitation transport says Θ ≥ 1 →
+                    # snap back to full-film locally.
+                    Theta_candidate = 1.0
+                    g_target = 1.0
 
             # SOR relaxation
-            Theta_relax = Theta_old + omega * (Theta_new - Theta_old)
+            Theta_relax = Theta_old + omega * (Theta_candidate - Theta_old)
             if Theta_relax < theta_min:
                 Theta_relax = theta_min
+            # Single guard: if cavitation branch was selected, do not
+            # let SOR overshoot back above 1 (would cause flip-flop on
+            # the next sweep). Do NOT clamp when g_target == 1 — that
+            # would block legitimate Θ > 1 in full-film.
             if g_target == 0.0 and Theta_relax >= 1.0:
                 Theta_relax = 1.0 - 1e-12
-            if pinned != 0 and cav_mask[i, j] == 0 and Theta_relax < 1.0:
-                Theta_relax = 1.0
 
             Theta[i, j] = Theta_relax
 
-            # Fesanghary-Khonsari soft switch update
+            # Hard-state flip count
+            was_full = Theta_old >= 1.0 - state_eps
+            now_full = g_target > 0.5
+            if was_full != now_full:
+                n_flips += 1
+
+            # Soft Fesanghary-Khonsari switch update
             g[i, j] = g[i, j] + gfactor * (g_target - g[i, j])
 
             delta = Theta_relax - Theta_old
@@ -225,7 +251,7 @@ def _elrod_sor_sweep(
         g[0, j] = 1.0
         g[N_Z - 1, j] = 1.0
 
-    return max_delta
+    return max_delta, n_flips
 
 
 # ----------------------------------------------------------------------------
@@ -239,12 +265,15 @@ def solve_elrod_compressible(
     max_iter=500_000,
     check_every=200,
     phi_bc="periodic",
-    gfactor=1.0,
+    gfactor=0.9,
     theta_min=1e-8,
     Theta_init=None,
     hs_warmup_iter=50_000,
     hs_warmup_tol=1e-5,
     hs_warmup_omega=None,
+    # Deprecated, kept for backward compat: the dynamic-dispatch
+    # sweep no longer uses an outer active-set loop or a frozen
+    # cav_mask. These kwargs are accepted as no-ops.
     pin_active_set=True,
     max_outer_active_set=10,
     cav_threshold=1e-10,
@@ -306,14 +335,22 @@ def solve_elrod_compressible(
         H, d_phi, d_Z, R, L, groove=bool(groove),
     )
 
-    # --- HS warmup to seed Θ ---
+    # Note: pin_active_set / max_outer_active_set / cav_threshold are
+    # accepted only for backward compatibility — the dynamic-dispatch
+    # sweep below does NOT use a frozen active set or an outer loop.
+    # The single inner loop solves the nonlinear system to convergence
+    # via the Fesanghary-Khonsari soft switch.
+    _ = pin_active_set
+    _ = max_outer_active_set
+    _ = cav_threshold
+
+    # --- HS warmup to seed Θ and g ---
     # Without a good initial guess the Elrod SOR drops into the
     # trivial "Θ·h = const, P = 0" fixed point that also exists in
     # the discrete system. HS gives a full-film pressure lobe in the
     # converging region (P_hs > 0) and zero in the diverging region
-    # (P_hs clamped to 0). Setting Θ_init = exp(P_hs / β̄) seeds the
-    # compressed full-film lobe; the cavitated side starts at Θ = 1
-    # and quickly drifts below 1 under the first few Elrod sweeps.
+    # (P_hs clamped to 0). Seed Θ = exp(P_hs / β̄) and g = (P_hs > eps).
+    P_hs = None
     if Theta_init is None and hs_warmup_iter > 0:
         if hs_warmup_omega is None:
             from reynolds_solver.utils import compute_auto_omega
@@ -351,7 +388,13 @@ def solve_elrod_compressible(
     else:
         Theta = np.ones((N_Z, N_phi), dtype=np.float64)
 
-    g = np.ones((N_Z, N_phi), dtype=np.float64)  # start full-film
+    # --- Initial g from HS pressure (preferred) or from Theta state ---
+    hs_p_eps = 1e-14
+    state_eps = 1e-12
+    if P_hs is not None:
+        g = (P_hs > hs_p_eps).astype(np.float64)
+    else:
+        g = (Theta > 1.0 + state_eps).astype(np.float64)
 
     # Enforce boundary conditions on initial state
     if groove:
@@ -369,85 +412,44 @@ def solve_elrod_compressible(
     g[0, :] = 1.0
     g[-1, :] = 1.0
 
-    # Initial cav mask (from HS warmup: cells with P_hs < eps)
-    # Full-film cells have Θ_init > 1, cavitation cells have Θ_init = 1.
-    # We classify cav cells as those where Θ_init ≈ 1 AND the local
-    # Couette driver pushes Θ below 1 in the first sweep. Simpler:
-    # use the HS pressure threshold directly.
-    cav_mask = (Theta <= 1.0 + cav_threshold).astype(np.int32)
-    cav_mask[0, :] = 0
-    cav_mask[-1, :] = 0
-    if groove:
-        cav_mask[:, 0] = 0
-        cav_mask[:, -1] = 0
-    else:
-        cav_mask[:, 0] = cav_mask[:, -2]
-        cav_mask[:, -1] = cav_mask[:, 1]
-
-    # Seed Θ = 1 in the cavitation set (so the first sweep starts clean)
-    if pin_active_set:
-        for i in range(N_Z):
-            for j in range(N_phi):
-                if cav_mask[i, j] != 0:
-                    Theta[i, j] = 1.0 - 1e-12
-                    g[i, j] = 0.0
-
-    pinned_flag = 1 if pin_active_set else 0
-    n_outer_loop = max_outer_active_set if pin_active_set else 1
-
     if verbose:
-        cav0 = int(cav_mask[1:-1, 1:-1].sum())
+        cav0 = int(np.sum(g[1:-1, 1:-1] < 0.5))
         tot0 = (N_Z - 2) * (N_phi - 2)
         print(
             f"  [Elrod] N_Z={N_Z}, N_phi={N_phi}, β̄={beta_bar:.3e}, "
-            f"ω={omega}, phi_bc={phi_bc}, pinned={pinned_flag}, "
-            f"initial cav={cav0}/{tot0}"
+            f"ω={omega}, gfactor={gfactor}, phi_bc={phi_bc}, "
+            f"initial cav (from g)={cav0}/{tot0}"
         )
 
     residual = 1.0
     n_iter = 0
-    for outer in range(n_outer_loop):
-        inner_k = 0
-        for k in range(max_iter):
-            residual = _elrod_sor_sweep(
-                Theta, g, H, A, B, C, D, E,
-                cav_mask, pinned_flag,
-                d_phi, beta_bar, omega, gfactor,
-                theta_min, N_Z, N_phi, groove,
-            )
-            n_iter += 1
-            inner_k = k + 1
-            if residual < tol and k > 5:
-                break
+    flips_total_recent = 0
+    for k in range(max_iter):
+        residual, n_flips = _elrod_sor_sweep(
+            Theta, g, H, A, B, C, D, E,
+            d_phi, beta_bar, omega, gfactor,
+            theta_min, N_Z, N_phi, groove,
+        )
+        n_iter += 1
+        flips_total_recent += n_flips
 
-            if verbose and k % check_every == 0 and k > 0:
-                cav_frac = float(np.mean(Theta[1:-1, 1:-1] < 1.0 - 1e-6))
+        if residual < tol and k > 5:
+            if verbose:
                 print(
-                    f"    outer={outer} inner={k}: maxΔΘ={residual:.3e}, "
-                    f"Θ=[{Theta.min():.4f}, {Theta.max():.4f}], "
-                    f"cav={cav_frac:.3f}"
+                    f"  [Elrod] CONVERGED at iter={k}, "
+                    f"res={residual:.3e}"
                 )
-
-        if not pin_active_set:
             break
 
-        # Active-set update
-        new_cav = (Theta < 1.0 - 1e-8).astype(np.int32)
-        new_cav[0, :] = 0
-        new_cav[-1, :] = 0
-        if groove:
-            new_cav[:, 0] = 0
-            new_cav[:, -1] = 0
-        else:
-            new_cav[:, 0] = new_cav[:, -2]
-            new_cav[:, -1] = new_cav[:, 1]
-
-        flips = int(np.sum(new_cav[1:-1, 1:-1] != cav_mask[1:-1, 1:-1]))
-        if verbose:
-            print(f"  [Elrod] outer={outer}: inner_k={inner_k}, flips={flips}")
-        if flips == 0:
-            break
-        cav_mask = new_cav
+        if verbose and k % check_every == 0 and k > 0:
+            cav_frac = float(np.mean(Theta[1:-1, 1:-1] < 1.0 - 1e-6))
+            print(
+                f"    inner={k}: maxΔΘ={residual:.3e}, "
+                f"Θ=[{Theta.min():.4f}, {Theta.max():.4f}], "
+                f"cav={cav_frac:.3f}, "
+                f"flips(last {check_every})={flips_total_recent}"
+            )
+            flips_total_recent = 0
 
     # Recover pressure. Use hard g (round to 0/1) to avoid soft-switch
     # smearing in the final P field.
