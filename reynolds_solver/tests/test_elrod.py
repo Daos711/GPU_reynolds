@@ -233,6 +233,105 @@ def test_p_theta_consistency():
 
 
 # -----------------------------------------------------------------------
+# Test 5 (V2): theta_vk smooth-groove physics smoke
+# -----------------------------------------------------------------------
+def test_theta_vk_groove_smoke():
+    print("\n=== Test 5 (V2): theta_vk smooth-groove physics smoke ===")
+    from reynolds_solver.cavitation.elrod import solve_elrod_compressible
+
+    N_phi, N_Z = 60, 30
+    H, d_phi, d_Z, _, _ = generate_test_case(N_phi, N_Z, epsilon=0.6)
+
+    P, theta, res, n = solve_elrod_compressible(
+        H, d_phi, d_Z, R, L,
+        beta_bar=30.0,
+        formulation="theta_vk",
+        switch_backend="hard",
+        tol=1e-6, max_iter=20_000,
+        phi_bc="groove",
+    )
+
+    finite = np.all(np.isfinite(P)) and np.all(np.isfinite(theta))
+    p_ok = finite and P.max() > 1.0 and P.min() >= -1e-12
+    th_ok = (
+        finite and theta.max() > 1.01 and theta.min() >= 0.0
+        and abs(theta[0, 0] - 1.0) < 1e-10
+        and abs(theta[0, -1] - 1.0) < 1e-10
+    )
+    cav_frac = float(np.mean(theta[1:-1, 1:-1] < 1.0 - 1e-6))
+    cav_ok = 0.2 < cav_frac < 0.7
+
+    print(f"    n={n}, res={res:.2e}, P_max={P.max():.4e}, "
+          f"Θ_max={theta.max():.4f}, cav={cav_frac:.3f}")
+
+    return run_test(
+        "theta_vk groove ε=0.6: full-film lobe + cav region",
+        p_ok and th_ok and cav_ok,
+        f"P_max={P.max():.3e}, Θ_max={theta.max():.4f}, "
+        f"cav={cav_frac:.3f}",
+    )
+
+
+# -----------------------------------------------------------------------
+# Test 6 (V1): theta_vk hard vs fk_soft must differ on textured case
+# -----------------------------------------------------------------------
+def test_theta_vk_v1_distinguishability():
+    print("\n=== Test 6 (V1): theta_vk hard vs fk_soft on textured case ===")
+    from reynolds_solver.cavitation.elrod import solve_elrod_compressible
+
+    # Build a single-dimple "wedge near rupture" case: smooth bearing
+    # ε=0.6 with one convergent triangular depression placed shortly
+    # before the smooth-bearing rupture line. This is enough to push
+    # the local Θ field into the regime where the FK soft switch
+    # starts to differ from the hard switch.
+    N_phi, N_Z = 80, 30
+    phi = np.linspace(0, 2 * np.pi, N_phi)
+    Z = np.linspace(-1, 1, N_Z)
+    Phi, Zg = np.meshgrid(phi, Z)
+    H = 1.0 + 0.6 * np.cos(Phi)
+    # Place wedge shortly before φ=π (rupture region): linear φ-ramp
+    phi_c = np.pi - 0.3
+    r_x = 0.25
+    r_z = 0.4
+    delta_phi = np.arctan2(np.sin(Phi - phi_c), np.cos(Phi - phi_c))
+    inside_phi = (np.abs(delta_phi) <= r_x).astype(float)
+    inside_z = (np.abs(Zg) <= r_z).astype(float)
+    ramp = np.clip(1.0 - delta_phi / r_x, 0.0, 2.0)
+    H = H + 0.3 * ramp * inside_phi * inside_z
+    d_phi = phi[1] - phi[0]
+    d_Z = Z[1] - Z[0]
+
+    common = dict(
+        d_phi=d_phi, d_Z=d_Z, R=R, L=L,
+        beta_bar=40.0,
+        formulation="theta_vk",
+        omega=1.0, tol=1e-6, max_iter=20_000,
+        phi_bc="groove",
+    )
+    P_h, th_h, _, _ = solve_elrod_compressible(H, switch_backend="hard", **common)
+    P_s, th_s, _, _ = solve_elrod_compressible(H, switch_backend="fk_soft", **common)
+
+    diff_P_max = float(np.max(np.abs(P_h - P_s)))
+    diff_th_max = float(np.max(np.abs(th_h - th_s)))
+    rel_diff_P = diff_P_max / max(P_h.max(), 1e-30)
+
+    print(f"    P_max(hard)={P_h.max():.3e}, P_max(soft)={P_s.max():.3e}")
+    print(f"    max|ΔP| = {diff_P_max:.3e}  (rel = {rel_diff_P:.3%})")
+    print(f"    max|ΔΘ| = {diff_th_max:.3e}")
+
+    # ТЗ V1 acceptance: at least one textured case must show non-trivial
+    # difference between hard and fk_soft. We require ≥1 % relative
+    # difference in P_max OR ≥1 e-3 absolute on Θ.
+    distinguishable = rel_diff_P > 0.01 or diff_th_max > 1e-3
+
+    return run_test(
+        "theta_vk hard ≠ fk_soft on textured (V1)",
+        distinguishable,
+        f"rel|ΔP|={rel_diff_P:.3%}, max|ΔΘ|={diff_th_max:.3e}",
+    )
+
+
+# -----------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------
 def main():
@@ -245,6 +344,8 @@ def main():
         ("2", test_uniform_gap),
         ("3", test_groove_smoke),
         ("4", test_p_theta_consistency),
+        ("5", test_theta_vk_groove_smoke),
+        ("6", test_theta_vk_v1_distinguishability),
     ]
 
     results = []
