@@ -31,13 +31,26 @@ Run:
 Configurable via environment variables for a quick smoke run:
     ELROD_MANSER_NPHI=200 ELROD_MANSER_NZ=60 python -m ...
 
-Engines compared (default: all three):
-    ELROD_MANSER_FORMULATIONS="ptheta:hard,theta_vk:hard,theta_vk:fk_soft"
+Engines compared (default: 4 combinations covering both schemes):
+    ELROD_MANSER_FORMULATIONS=
+        "ptheta:hard,
+         theta_vk:hard:pseudo_transient,
+         theta_vk:fk_soft:gs_inline_legacy,
+         theta_vk:fk_soft:pseudo_transient"
 
-Optional pre-checks (TZ §2):
+Format: "<engine>:<backend>[:<scheme>]" comma-separated. `scheme` is
+ignored for ptheta and defaults to "pseudo_transient" for theta_vk.
+
+Optional pre-checks (TZ §2 / §8):
     ELROD_MANSER_DEPTH={ry|2ry}     # depth scaling, default 2ry (Table 2)
     ELROD_MANSER_MIRROR=1           # sign-sanity / mirror test
     ELROD_MANSER_MAXITER=N          # iter cap per case
+    ELROD_MANSER_PTHETA_SEED=1      # seed theta_vk runs with the
+                                    # ptheta solution (TZ §8); WARNING:
+                                    # this preserves ptheta's symmetric
+                                    # topology and DESTROYS the Manser
+                                    # T2/T3 asymmetry — useful only as
+                                    # robustness diagnostic.
 """
 import os
 import numpy as np
@@ -126,6 +139,8 @@ def compute_load(P, Phi_m, phi_1D, Z):
 def run_case(name, H, phi_m, z_m, phi_1d, z_1d, d_phi, d_Z,
              R, L, beta_bar,
              formulation="ptheta", switch_backend="hard",
+             theta_vk_scheme="pseudo_transient",
+             P_init=None, Theta_init=None,
              max_iter=500_000, tol=1e-6):
     from reynolds_solver.cavitation.elrod import solve_elrod_compressible
 
@@ -138,6 +153,9 @@ def run_case(name, H, phi_m, z_m, phi_1d, z_1d, d_phi, d_Z,
         phi_bc="groove",
         formulation=formulation,
         switch_backend=switch_backend,
+        theta_vk_scheme=theta_vk_scheme,
+        P_init=P_init,
+        Theta_init=Theta_init,
     )
     W, Wx, Wy = compute_load(P, phi_m, phi_1d, z_1d)
     cav = float(np.mean(theta[1:-1, 1:-1] < 1.0 - 1e-6))
@@ -152,7 +170,7 @@ def run_case(name, H, phi_m, z_m, phi_1d, z_1d, d_phi, d_Z,
             rupt = float(phi_1d[j])
             break
     print(
-        f"  {name:<22s}  "
+        f"  {name:<32s}  "
         f"W={W:.4e}  Pmax={P.max():.4e}  "
         f"Θ_max={theta.max():.4f}  Θ_min={theta.min():.4f}  "
         f"cav={cav:.3f}  φ(Pmax)={np.degrees(phi_pmax):6.1f}°  "
@@ -193,14 +211,27 @@ def main():
     N_Z = int(os.environ.get("ELROD_MANSER_NZ", 121))
     max_iter = int(os.environ.get("ELROD_MANSER_MAXITER", 500_000))
 
-    # Engine selectors. Default: run all three combinations so the
-    # report covers the headline result (theta_vk fk_soft reproduces
-    # Manser asymmetry while ptheta does not).
+    # Engine selectors. Default: cover the three regimes that matter:
+    #   ptheta:hard                 — incompressible-like baseline
+    #   theta_vk:hard:pseudo_transient — stabilised Θ-form, hard switch
+    #   theta_vk:fk_soft:gs_inline_legacy — Manser asymmetry path
+    # Format: "<engine>:<backend>[:<scheme>]" comma-separated.
     formulations = os.environ.get(
         "ELROD_MANSER_FORMULATIONS",
-        "ptheta:hard,theta_vk:hard,theta_vk:fk_soft",
+        "ptheta:hard,"
+        "theta_vk:hard:pseudo_transient,"
+        "theta_vk:fk_soft:gs_inline_legacy,"
+        "theta_vk:fk_soft:pseudo_transient",
     ).split(",")
     formulations = [s.strip() for s in formulations if s.strip()]
+
+    # ptheta-seed continuation chain (TZ §8). When enabled, theta_vk
+    # cases are seeded with the converged P/Θ from the corresponding
+    # ptheta/hard run on the same H. NOTE: this preserves ptheta's
+    # SYMMETRIC topology and therefore destroys the Manser T2/T3
+    # asymmetry — keep it OFF when validating asymmetry; turn it ON
+    # to test how robust theta_vk is to a "good" hot start.
+    use_ptheta_seed = os.environ.get("ELROD_MANSER_PTHETA_SEED", "0") == "1"
 
     # Pre-check 2.2: depth scaling. "ry" means dimple depth = r_y/C,
     # "2ry" means depth = 2·r_y/C (matches Manser Table 2 ramp). The
@@ -292,68 +323,114 @@ def main():
         # Reflect H_t2 in φ: H_mirror[i, j] = H_t2[i, N_phi-1-j]
         H_t2_mirror = H_t2[:, ::-1].copy()
 
-    results = {}    # (formulation, backend) -> (W_s, W_t2, W_t3)
+    results = {}    # (formulation, backend, scheme) -> (W_s, W_t2, W_t3)
+
+    # Optional ptheta seed cache (one P-init per H)
+    seed_cache = {}    # id(H) -> (P_seed, Theta_seed)
+    if use_ptheta_seed:
+        for tag, H in [("Smooth", H_s), ("T2", H_t2), ("T3", H_t3)]:
+            P_p, theta_p, _, _ = run_case(
+                f"[seed] ptheta {tag}", H, Phi_m, Z_m,
+                phi_1d, z_1d, d_phi, d_Z, R, L, beta_bar,
+                formulation="ptheta", switch_backend="hard",
+                max_iter=max_iter,
+            )
+            seed_cache[id(H)] = (P_p, theta_p)
+        print()
 
     for spec in formulations:
-        if ":" in spec:
-            formulation, backend = spec.split(":", 1)
+        parts = [p.strip() for p in spec.split(":")]
+        if len(parts) == 1:
+            formulation, backend, scheme = parts[0], "hard", "pseudo_transient"
+        elif len(parts) == 2:
+            formulation, backend = parts
+            scheme = "pseudo_transient"
+        elif len(parts) == 3:
+            formulation, backend, scheme = parts
         else:
-            formulation, backend = spec, "hard"
+            raise ValueError(f"bad spec {spec!r}")
+
+        # Seed only theta_vk cases (ptheta has its own seed path)
+        seed_for = (
+            (lambda H: seed_cache.get(id(H), (None, None)))
+            if use_ptheta_seed and formulation == "theta_vk"
+            else (lambda H: (None, None))
+        )
 
         print()
         print("=" * 78)
-        print(f"  ENGINE: formulation={formulation!r}, "
-              f"switch_backend={backend!r}")
+        tag = f"{formulation}/{backend}"
+        if formulation == "theta_vk":
+            tag += f"/{scheme}"
+        print(
+            f"  ENGINE: formulation={formulation!r}, "
+            f"switch_backend={backend!r}, scheme={scheme!r}"
+            + (", ptheta-seeded" if use_ptheta_seed and formulation == "theta_vk" else "")
+        )
         print("=" * 78)
-        print(f"  {'case':<22s}  {'W':>10s}  {'Pmax':>10s}  "
+        print(f"  {'case':<32s}  {'W':>10s}  {'Pmax':>10s}  "
               f"{'Θ_max':>7s}  {'Θ_min':>7s}  {'cav':>6s}  "
               f"{'φ(Pmax)':>8s}  {'φ_rupt':>8s}  {'n':>6s}  {'res':>7s}")
 
+        P_init_s, T_init_s = seed_for(H_s)
         W_s, _, _ = run_case(
-            f"Smooth [{formulation}/{backend}]", H_s, Phi_m, Z_m,
+            f"Smooth [{tag}]", H_s, Phi_m, Z_m,
             phi_1d, z_1d, d_phi, d_Z, R, L, beta_bar,
             formulation=formulation, switch_backend=backend,
+            theta_vk_scheme=scheme,
+            P_init=P_init_s, Theta_init=T_init_s,
             max_iter=max_iter,
         )
+        P_init_t2, T_init_t2 = seed_for(H_t2)
         W_t2, _, _ = run_case(
-            f"T2 full [{formulation}/{backend}]", H_t2, Phi_m, Z_m,
+            f"T2 full [{tag}]", H_t2, Phi_m, Z_m,
             phi_1d, z_1d, d_phi, d_Z, R, L, beta_bar,
             formulation=formulation, switch_backend=backend,
+            theta_vk_scheme=scheme,
+            P_init=P_init_t2, Theta_init=T_init_t2,
             max_iter=max_iter,
         )
+        P_init_t3, T_init_t3 = seed_for(H_t3)
         W_t3, _, _ = run_case(
-            f"T3 full [{formulation}/{backend}]", H_t3, Phi_m, Z_m,
+            f"T3 full [{tag}]", H_t3, Phi_m, Z_m,
             phi_1d, z_1d, d_phi, d_Z, R, L, beta_bar,
             formulation=formulation, switch_backend=backend,
+            theta_vk_scheme=scheme,
+            P_init=P_init_t3, Theta_init=T_init_t3,
             max_iter=max_iter,
         )
         if do_mirror:
             W_t2m, _, _ = run_case(
-                f"T2_mirror [{formulation}/{backend}]", H_t2_mirror,
+                f"T2_mirror [{tag}]", H_t2_mirror,
                 Phi_m, Z_m, phi_1d, z_1d, d_phi, d_Z, R, L, beta_bar,
                 formulation=formulation, switch_backend=backend,
+                theta_vk_scheme=scheme,
                 max_iter=max_iter,
             )
             mirror_err = abs(W_t2m - W_t3) / max(W_t3, 1e-30)
             print(f"  → mirror sanity: |W(T2_mirror) - W(T3)| / W(T3) "
                   f"= {mirror_err:.3%}")
 
-        report_t2_t3(f"{formulation} / {backend}", W_s, W_t2, W_t3)
-        results[(formulation, backend)] = (W_s, W_t2, W_t3)
+        report_t2_t3(tag, W_s, W_t2, W_t3)
+        results[(formulation, backend, scheme)] = (W_s, W_t2, W_t3)
 
     # Final cross-engine summary
     print()
     print("=" * 78)
     print("  FINAL SUMMARY: Manser T2/T3 across engines/backends")
     print("=" * 78)
-    print(f"  {'engine/backend':<22s}  {'gain_T2':>8s}  {'gain_T3':>8s}  "
-          f"{'T2/T3':>8s}")
-    for (form, bck), (W_s, W_t2, W_t3) in results.items():
+    print(f"  {'engine/backend/scheme':<38s}  {'gain_T2':>8s}  "
+          f"{'gain_T3':>8s}  {'T2/T3':>8s}")
+    for (form, bck, sch), (W_s, W_t2, W_t3) in results.items():
         g2 = W_t2 / (W_s + 1e-30)
         g3 = W_t3 / (W_s + 1e-30)
         rt = g2 / (g3 + 1e-30)
-        print(f"  {form+'/'+bck:<22s}  {g2:8.3f}  {g3:8.3f}  {rt:8.3f}")
-    print(f"  {'Manser reference':<22s}  {1.43:8.3f}  {0.41:8.3f}  "
+        if form == "ptheta":
+            label = f"{form}/{bck}"
+        else:
+            label = f"{form}/{bck}/{sch}"
+        print(f"  {label:<38s}  {g2:8.3f}  {g3:8.3f}  {rt:8.3f}")
+    print(f"  {'Manser reference':<38s}  {1.43:8.3f}  {0.41:8.3f}  "
           f"{3.44:8.3f}")
     print("=" * 78)
 

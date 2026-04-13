@@ -1106,11 +1106,16 @@ def solve_elrod_compressible(
     max_picard=50,
     tol_picard=1e-6,
     pt_dt=0.1,
-    pt_max_time_steps=200,
+    # NOTE: 5000 outer steps is a safe ceiling — theta_vk needs a long
+    # tail to lock the interface integral; ptheta exits early via its
+    # Picard tol so the larger cap is harmless.
+    pt_max_time_steps=5000,
     pt_max_inner=50,
     pt_inner_tol=1e-4,
     # theta_vk controls
     switch_backend="hard",    # "hard" or "fk_soft"
+    theta_vk_scheme="pseudo_transient",   # "pseudo_transient" | "gs_inline_legacy"
+    eta_schedule=None,                    # continuation schedule; default from driver
     gfactor=0.9,
     tol_g=1e-6,
     n_quiescent=3,
@@ -1200,6 +1205,12 @@ def solve_elrod_compressible(
             omega=omega_p,                # single ω in Θ-form
             gfactor=0.9 if gfactor is None else gfactor,
             switch_backend=switch_backend,
+            scheme=theta_vk_scheme,
+            eta_schedule=eta_schedule,
+            pt_dt=pt_dt,
+            pt_max_time_steps=pt_max_time_steps,
+            pt_max_inner=pt_max_inner,
+            pt_inner_tol=pt_inner_tol,
             tol_theta=tol,
             tol_g=tol_g,
             max_iter=max_iter,
@@ -1263,7 +1274,7 @@ def solve_elrod_compressible(
 
 
 @njit(cache=True)
-def _elrod_theta_vk_sweep(
+def _elrod_theta_vk_sweep_inline_legacy(
     Theta, g_state, g_soft, H,
     A, B, C, D, E,
     d_phi, beta_bar, omega, gfactor,
@@ -1272,8 +1283,12 @@ def _elrod_theta_vk_sweep(
     state_eps, theta_min,
 ):
     """
-    One lexicographic GS sweep of the faithful Θ-form Elrod system.
+    LEGACY inline sweep (kept for A/B diagnostics under
+    scheme="gs_inline_legacy"). The lagged + pseudo-transient sweep
+    `_elrod_theta_vk_sweep_pt_lagged` below is the current default.
 
+    One lexicographic GS sweep of the faithful Θ-form Elrod system
+    with in-place g_state / g_soft updates (node-by-node, same sweep).
     Returns (max_delta_theta, max_delta_gsoft, n_state_flips).
     """
     max_dth = 0.0
@@ -1394,12 +1409,174 @@ def _elrod_theta_vk_sweep(
     return max_dth, max_dg, n_flips
 
 
+# -----------------------------------------------------------------------
+# New lagged + pseudo-transient sweep — current default for theta_vk.
+# Key design points (per TZ):
+#   1. Stencil weight g_phys is read from LAGGED arrays g_state_lag,
+#      g_soft_lag (plus eta-blend); it is NOT updated in-place in this
+#      sweep. All new topology decisions are written to the separate
+#      array g_state_target.
+#   2. A pseudo-transient term pt_beta * (h·Θ - c_prev) is added to
+#      the local equation, where c_prev = Θ_prev · H is the "mass"
+#      anchor from the outer step. This damps limit cycles on the
+#      hard / soft switch interface.
+# -----------------------------------------------------------------------
+
+
+@njit(cache=True)
+def _elrod_theta_vk_sweep_pt_lagged(
+    Theta, g_state_lag, g_soft_lag, g_state_target,
+    c_prev, H,
+    A, B, C, D, E,
+    d_phi, beta_bar, omega_theta,
+    eta,            # continuation parameter: g_phys = (1-eta)*g_hard + eta*g_soft
+    pt_beta,        # pseudo-transient β = 1 / Δτ
+    N_Z, N_phi, groove,
+    state_eps, theta_min,
+):
+    """
+    Lagged + pseudo-transient sweep of the Θ-form VK/FK Elrod system.
+
+    Stencil uses only lagged g fields. Topology targets are written
+    to the separate `g_state_target` array. The caller is responsible
+    for applying gfactor relaxation to g_soft AFTER this sweep/block.
+
+    Local equation (see TZ §5.3):
+        pt_beta·(h·Θ - c_prev)
+        + β̄·g_phys·(E·Θ - [A·Θ_jp + B·Θ_jm + C·Θ_ip + D·Θ_im])
+        = 6·d_phi·(h_ij·Θ_ij - h_jm·Θ_up)
+
+    Returns (max_delta_theta, n_state_flips).
+
+    `n_state_flips` counts nodes whose target topology differs from
+    g_state_lag (the lag at the start of this outer step), which is
+    the quantity that matters for the outer quiescent test.
+    """
+    max_dth = 0.0
+    n_flips = 0
+    six_dphi = 6.0 * d_phi
+    one_minus_eta = 1.0 - eta
+
+    for i in range(1, N_Z - 1):
+        for j in range(1, N_phi - 1):
+            if groove != 0:
+                jp = j + 1
+                jm = j - 1
+            else:
+                jp = j + 1 if j + 1 < N_phi - 1 else 1
+                jm = j - 1 if j - 1 >= 1 else N_phi - 2
+
+            Theta_old = Theta[i, j]
+
+            Tjp = Theta[i, jp]
+            Tjm = Theta[i, jm]
+            Tip = Theta[i + 1, j]
+            Tim = Theta[i - 1, j]
+            Theta_up = Tjm
+
+            h_ij = H[i, j]
+            h_jm = H[i, jm]
+
+            A_l = A[i, j]
+            B_l = B[i, j]
+            C_l = C[i, j]
+            D_l = D[i, j]
+            E_l = E[i, j]
+
+            # Lagged g_phys: blend hard and soft lag by eta
+            g_phys = one_minus_eta * g_state_lag[i, j] + eta * g_soft_lag[i, j]
+
+            diff = A_l * Tjp + B_l * Tjm + C_l * Tip + D_l * Tim
+
+            # Local equation (see docstring). Collect terms on Θ_ij on
+            # the LHS and everything else on the RHS.
+            #   LHS coeff: β̄·g·E + 6dφ·h_ij + pt_beta·h_ij
+            #   RHS     : β̄·g·diff + 6dφ·h_jm·Θ_up + pt_beta·c_prev
+            num = (
+                beta_bar * g_phys * diff
+                + six_dphi * h_jm * Theta_up
+                + pt_beta * c_prev[i, j]
+            )
+            den = (
+                beta_bar * g_phys * E_l
+                + six_dphi * h_ij
+                + pt_beta * h_ij
+                + 1e-30
+            )
+            Theta_trial = num / den
+
+            # Topology target (HARD decision from the trial value)
+            if Theta_trial >= 1.0 - state_eps:
+                state_target = 1
+            else:
+                state_target = 0
+
+            # SOR relaxation
+            Theta_relax = Theta_old + omega_theta * (Theta_trial - Theta_old)
+            if Theta_relax < theta_min:
+                Theta_relax = theta_min
+
+            # Topology-consistency clamp
+            if state_target == 0 and Theta_relax >= 1.0:
+                Theta_relax = 1.0 - state_eps
+            if state_target == 1 and Theta_relax < 1.0:
+                Theta_relax = 1.0
+
+            Theta[i, j] = Theta_relax
+
+            # Write target topology; do NOT touch g_state/g_soft here
+            new_target = float(state_target)
+            if (g_state_lag[i, j] > 0.5) != (state_target == 1):
+                n_flips += 1
+            g_state_target[i, j] = new_target
+
+            dth = Theta_relax - Theta_old
+            if dth < 0.0:
+                dth = -dth
+            if dth > max_dth:
+                max_dth = dth
+
+    # phi BC on Theta and g_state_target (so caller's outer step sees BC-clean fields)
+    if groove != 0:
+        for i in range(N_Z):
+            Theta[i, 0] = 1.0
+            Theta[i, N_phi - 1] = 1.0
+            g_state_target[i, 0] = 1.0
+            g_state_target[i, N_phi - 1] = 1.0
+    else:
+        for i in range(N_Z):
+            Theta[i, 0] = Theta[i, N_phi - 2]
+            Theta[i, N_phi - 1] = Theta[i, 1]
+            g_state_target[i, 0] = g_state_target[i, N_phi - 2]
+            g_state_target[i, N_phi - 1] = g_state_target[i, 1]
+
+    # Z BC (flooded)
+    for j in range(N_phi):
+        Theta[0, j] = 1.0
+        Theta[N_Z - 1, j] = 1.0
+        g_state_target[0, j] = 1.0
+        g_state_target[N_Z - 1, j] = 1.0
+
+    return max_dth, n_flips
+
+
 def _solve_elrod_theta_vk(
     H, d_phi, d_Z, R, L,
     beta_bar,
     omega=1.0,
     gfactor=0.9,
     switch_backend="hard",
+    scheme="pseudo_transient",      # "pseudo_transient" (default) | "gs_inline_legacy"
+    # Pseudo-transient (outer/inner) controls. theta_vk-PT needs many
+    # outer steps for the interface integral to lock in (boundary
+    # cells flip indefinitely on a hard switch); 5000 is a safe cap
+    # — the soft-quiescent integral test exits much earlier.
+    pt_dt=0.1,
+    pt_max_time_steps=5000,
+    pt_max_inner=50,
+    pt_inner_tol=1e-4,
+    # Eta continuation schedule (only used for fk_soft, scheme="pseudo_transient")
+    eta_schedule=None,
     tol_theta=1e-6,
     tol_g=1e-6,
     max_iter=200_000,
@@ -1416,11 +1593,35 @@ def _solve_elrod_theta_vk(
 ):
     """
     Faithful Θ-form VK/FK solver. Single unknown Θ + (g_state, g_soft).
-    Bare h³ coefficients (no K = ρ·h³, no Picard outer loop).
 
-    Convergence: requires max_delta_theta < tol_theta AND
-    max_delta_gsoft < tol_g AND n_state_flips == 0 for `n_quiescent`
-    consecutive sample points (every `check_every` sweeps).
+    Two schemes:
+      scheme="pseudo_transient" (default): lagged g_phys + pseudo-time
+        anchor c_prev = Θ_prev·H; two-level iteration (outer refresh
+        of lag / anchor, inner Picard-like GS sweep at fixed lag).
+        Robust convergence on the hard backend (smooth groove ε=0.6
+        converges in ~10³ inner sweeps vs 10⁵-10⁶ for the legacy
+        path); η-continuation [0.0, 0.25, 0.5, 0.75, 1.0] is applied
+        to fk_soft to walk from the hard-like to full-soft stencil.
+        IMPORTANT KNOWN TRADE-OFF: on textured benchmarks (Manser
+        T2/T3) the PT scheme tends to settle on a SYMMETRIC attractor
+        — the strong T2 vs T3 asymmetry produced by
+        `gs_inline_legacy` is largely lost. Use the legacy scheme
+        explicitly for textured / micro-wedge studies (see
+        ТЗ §14 fall-back).
+      scheme="gs_inline_legacy": original sweep with in-place g
+        updates per node. Does NOT reach strict residual convergence
+        (residual plateaus ~0.5..0.6, interface flips indefinitely on
+        a small set of boundary cells), but the integral fields lock
+        in within ~10⁴ sweeps and the resulting solution preserves
+        the Manser T2/T3 asymmetry (T2/T3 ≈ 2.5..3.0 on coarse grid).
+
+    Quiescent convergence rule (PT scheme):
+      strict: max_dth < tol_theta AND max_dg < tol_g AND n_flips == 0
+      soft:   ΔPmax/Pmax < 5e-5 AND Δcav < 1e-4 over last 20 outer
+              steps AND n_flips < 0.5 % of interior cells, only on
+              the final η stage and after pt_min_warmup outer steps.
+    Either trigger sustained for `n_quiescent` consecutive outer
+    checkpoints terminates the run.
     """
     if phi_bc not in ("periodic", "groove"):
         raise ValueError(
@@ -1430,6 +1631,11 @@ def _solve_elrod_theta_vk(
         raise ValueError(
             f"switch_backend must be 'hard' or 'fk_soft', got "
             f"{switch_backend!r}"
+        )
+    if scheme not in ("pseudo_transient", "gs_inline_legacy"):
+        raise ValueError(
+            f"scheme must be 'pseudo_transient' or 'gs_inline_legacy', "
+            f"got {scheme!r}"
         )
     use_soft = 1 if switch_backend == "fk_soft" else 0
     groove = 1 if phi_bc == "groove" else 0
@@ -1532,51 +1738,255 @@ def _solve_elrod_theta_vk(
         print(
             f"  [Elrod-Θ-VK] N_Z={N_Z}, N_phi={N_phi}, "
             f"β̄={beta_bar:.3e}, ω={omega}, gfactor={gfactor}, "
-            f"backend={switch_backend}, phi_bc={phi_bc}"
+            f"backend={switch_backend}, scheme={scheme}, phi_bc={phi_bc}"
         )
 
-    quiescent_streak = 0
-    max_dth = 1.0
-    max_dg = 1.0
-    n_iter = 0
-    for k in range(max_iter):
-        max_dth, max_dg, n_flips = _elrod_theta_vk_sweep(
-            Theta, g_state, g_soft, H,
-            A, B, C, D, E,
-            d_phi, beta_bar, omega, gfactor,
-            use_soft,
-            N_Z, N_phi, groove,
-            state_eps, theta_min,
-        )
-        n_iter += 1
-
-        if k > 5 and k % check_every == 0:
-            converged_now = (
-                max_dth < tol_theta and max_dg < tol_g and n_flips == 0
+    # -------------------------------------------------------------
+    # Legacy path: original inline sweep (kept for A/B diagnostics)
+    # -------------------------------------------------------------
+    if scheme == "gs_inline_legacy":
+        quiescent_streak = 0
+        max_dth = 1.0
+        max_dg = 1.0
+        n_iter = 0
+        for k in range(max_iter):
+            max_dth, max_dg, n_flips = _elrod_theta_vk_sweep_inline_legacy(
+                Theta, g_state, g_soft, H,
+                A, B, C, D, E,
+                d_phi, beta_bar, omega, gfactor,
+                use_soft,
+                N_Z, N_phi, groove,
+                state_eps, theta_min,
             )
+            n_iter += 1
+            if k > 5 and k % check_every == 0:
+                converged_now = (
+                    max_dth < tol_theta and max_dg < tol_g and n_flips == 0
+                )
+                if converged_now:
+                    quiescent_streak += 1
+                else:
+                    quiescent_streak = 0
+                if verbose:
+                    cav_frac = float(np.mean(g_state[1:-1, 1:-1] < 0.5))
+                    print(
+                        f"    iter={k}: ΔΘ={max_dth:.3e}, "
+                        f"Δg={max_dg:.3e}, cav={cav_frac:.3f}, "
+                        f"flips={n_flips}, quiescent={quiescent_streak}"
+                    )
+                if quiescent_streak >= n_quiescent:
+                    if verbose:
+                        print(
+                            f"  [Elrod-Θ-VK legacy] CONVERGED at "
+                            f"iter={k}"
+                        )
+                    break
+        g_hard = g_state
+        Theta_for_p = np.where(
+            g_hard > 0.5, np.maximum(Theta, 1.0), 1.0,
+        )
+        P = beta_bar * g_hard * np.log(Theta_for_p)
+        P = np.where(P >= 0.0, P, 0.0)
+        theta_out = np.clip(Theta, theta_min, None)
+        return P, theta_out, max_dth, n_iter
+
+    # -------------------------------------------------------------
+    # Default path: lagged + pseudo-transient, two-level loop
+    # -------------------------------------------------------------
+
+    # η-continuation schedule
+    if eta_schedule is None:
+        if use_soft == 1:
+            eta_schedule = [0.0, 0.25, 0.5, 0.75, 1.0]
+        else:
+            eta_schedule = [0.0]   # pure hard stencil
+    eta_schedule = [float(x) for x in eta_schedule]
+
+    pt_beta_val = 1.0 / max(pt_dt, 1e-30)
+
+    g_state_target = np.zeros_like(g_state)
+    max_dth_outer = 1.0
+    max_dg_outer = 1.0
+    n_flips_outer = 1
+    total_pt_steps = 0
+    total_inner_sweeps = 0
+
+    # Track last 3 checkpoints of integral metrics for drift diagnostic
+    hist_Pmax = []
+    hist_cav = []
+
+    last_k_inner = 0
+
+    for eta in eta_schedule:
+        if verbose:
+            print(
+                f"  [Elrod-Θ-VK] continuation stage: η={eta:.3f} "
+                f"(pt_dt={pt_dt}, max_pt_steps={pt_max_time_steps}, "
+                f"max_inner={pt_max_inner})"
+            )
+        quiescent_streak = 0
+
+        for pt_step in range(pt_max_time_steps):
+            # Outer: refresh lag and pseudo-time anchor
+            Theta_prev = Theta.copy()
+            c_prev = Theta_prev * H
+            g_state_lag = g_state.copy()
+            g_soft_lag = g_soft.copy()
+            g_state_target[:] = g_state_lag    # initial target = current
+
+            # Inner: Picard-like sweep to pt_inner_tol at fixed lag
+            inner_max_dth = 1.0
+            inner_n_flips = 0
+            inner_iter = 0
+            for inner in range(pt_max_inner):
+                inner_max_dth, inner_n_flips = (
+                    _elrod_theta_vk_sweep_pt_lagged(
+                        Theta, g_state_lag, g_soft_lag,
+                        g_state_target, c_prev, H,
+                        A, B, C, D, E,
+                        d_phi, beta_bar, omega,
+                        eta, pt_beta_val,
+                        N_Z, N_phi, groove,
+                        state_eps, theta_min,
+                    )
+                )
+                inner_iter += 1
+                total_inner_sweeps += 1
+                if inner_max_dth < pt_inner_tol:
+                    break
+
+            # Switch update (after inner block)
+            g_state_new = g_state_target.copy()
+            g_soft_new = g_soft_lag + gfactor * (g_state_new - g_soft_lag)
+            g_soft_new = np.clip(g_soft_new, 0.0, 1.0)
+
+            # Outer residuals
+            max_dg_outer = float(np.max(np.abs(g_soft_new - g_soft_lag)))
+            max_dth_outer = float(np.max(np.abs(Theta - Theta_prev)))
+            n_flips_outer = int(
+                np.sum(np.abs(g_state_new - g_state_lag) > 0.5)
+            )
+
+            g_state[:] = g_state_new
+            g_soft[:] = g_soft_new
+
+            # BC on committed state
+            if groove:
+                Theta[:, 0] = 1.0
+                Theta[:, -1] = 1.0
+                g_state[:, 0] = 1.0
+                g_state[:, -1] = 1.0
+                g_soft[:, 0] = 1.0
+                g_soft[:, -1] = 1.0
+            else:
+                Theta[:, 0] = Theta[:, -2]
+                Theta[:, -1] = Theta[:, 1]
+                g_state[:, 0] = g_state[:, -2]
+                g_state[:, -1] = g_state[:, 1]
+                g_soft[:, 0] = g_soft[:, -2]
+                g_soft[:, -1] = g_soft[:, 1]
+            Theta[0, :] = 1.0
+            Theta[-1, :] = 1.0
+            g_state[0, :] = 1.0
+            g_state[-1, :] = 1.0
+            g_soft[0, :] = 1.0
+            g_soft[-1, :] = 1.0
+
+            total_pt_steps += 1
+
+            # Quiescent check: strict (ΔΘ < tol AND Δg < tol AND no flips)
+            strict_ok = (
+                max_dth_outer < tol_theta
+                and max_dg_outer < tol_g
+                and n_flips_outer == 0
+            )
+
+            # Integral-stability fallback: when the interface oscillates
+            # on a small boundary set, strict quiescent is unreachable,
+            # but integral metrics lock in. Only consider this route if:
+            #   - we are on the final η stage (past any continuation)
+            #   - at least pt_min_warmup outer steps have passed
+            #   - the interface is actually still oscillating
+            #     (n_flips_outer > 0). If no flips, strict_ok will catch
+            #     convergence naturally and we should NOT shortcut.
+            #   - last 3 P_max / cav values vary by < 5·10⁻⁵ / 1·10⁻⁴
+            #     (relative/absolute)
+            #   - flips count is small (< 0.5 % of interior cells)
+            soft_ok = False
+            pt_min_warmup = 30
+            is_last_eta = abs(eta - eta_schedule[-1]) < 1e-12
+            # Track a larger history window (last 20 checkpoints) so an
+            # interface-oscillating state with stable integrals is
+            # caught even though max_dth_outer plateaus above tol_theta.
+            if (
+                is_last_eta
+                and pt_step >= pt_min_warmup
+                and n_flips_outer > 0
+                and len(hist_Pmax) >= 20
+            ):
+                Pmax_span = max(hist_Pmax[-20:]) - min(hist_Pmax[-20:])
+                cav_span = max(hist_cav[-20:]) - min(hist_cav[-20:])
+                rel_Pmax = Pmax_span / max(hist_Pmax[-1], 1e-30)
+                max_flip_frac = 0.005 * max((N_Z - 2) * (N_phi - 2), 1)
+                soft_ok = (
+                    rel_Pmax < 5e-5
+                    and cav_span < 1e-4
+                    and n_flips_outer < max_flip_frac
+                )
+
+            converged_now = strict_ok or soft_ok
             if converged_now:
                 quiescent_streak += 1
             else:
                 quiescent_streak = 0
 
-            if verbose:
-                cav_frac = float(np.mean(g_state[1:-1, 1:-1] < 0.5))
+            # Integral diagnostics
+            g_hard_now = g_state
+            Theta_for_p_now = np.where(
+                g_hard_now > 0.5, np.maximum(Theta, 1.0), 1.0,
+            )
+            P_now = beta_bar * g_hard_now * np.log(Theta_for_p_now)
+            P_now = np.where(P_now >= 0.0, P_now, 0.0)
+            Pmax_now = float(P_now.max())
+            cav_now = float(np.mean(g_state[1:-1, 1:-1] < 0.5))
+            hist_Pmax.append(Pmax_now)
+            hist_cav.append(cav_now)
+            if len(hist_Pmax) > 30:
+                hist_Pmax.pop(0)
+                hist_cav.pop(0)
+
+            if verbose and (
+                pt_step % max(1, check_every // pt_max_inner) == 0
+                or quiescent_streak >= n_quiescent
+            ):
+                fluid_area = float(np.mean(g_state[1:-1, 1:-1] > 0.5))
                 print(
-                    f"    iter={k}: ΔΘ={max_dth:.3e}, "
-                    f"Δg={max_dg:.3e}, "
-                    f"Θ=[{Theta.min():.4f}, {Theta.max():.4f}], "
-                    f"g_soft=[{g_soft.min():.3f}, {g_soft.max():.3f}], "
-                    f"cav={cav_frac:.3f}, flips={n_flips}, "
-                    f"quiescent={quiescent_streak}"
+                    f"    η={eta:.2f} pt_step={pt_step:4d} "
+                    f"inner_conv_at={inner_iter:3d} "
+                    f"ΔΘ_out={max_dth_outer:.2e} Δg_out={max_dg_outer:.2e} "
+                    f"flips={n_flips_outer:4d} "
+                    f"Θ=[{Theta.min():.3f},{Theta.max():.3f}] "
+                    f"cav={cav_now:.3f} fluid={fluid_area:.3f} "
+                    f"Pmax={Pmax_now:.3e} "
+                    f"quies={quiescent_streak}"
                 )
+
+            # Global iteration cap (total inner sweeps)
+            if total_inner_sweeps >= max_iter:
+                break
 
             if quiescent_streak >= n_quiescent:
                 if verbose:
                     print(
-                        f"  [Elrod-Θ-VK] CONVERGED at iter={k} "
-                        f"(quiescent {quiescent_streak} samples)"
+                        f"  [Elrod-Θ-VK] η={eta:.2f} CONVERGED at "
+                        f"pt_step={pt_step}, inner sweeps={total_inner_sweeps}"
                     )
                 break
+        # end pt_step loop
+
+        if total_inner_sweeps >= max_iter:
+            break
+    # end eta loop
 
     # Pressure recovery from HARD topology
     g_hard = g_state
@@ -1587,5 +1997,5 @@ def _solve_elrod_theta_vk(
     P = np.where(P >= 0.0, P, 0.0)
 
     theta_out = np.clip(Theta, theta_min, None)
-
-    return P, theta_out, max_dth, n_iter
+    # Report outer ΔΘ as the residual (convergence-meaningful)
+    return P, theta_out, max_dth_outer, total_inner_sweeps
