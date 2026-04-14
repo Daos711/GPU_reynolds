@@ -92,10 +92,12 @@ class JournalBenchmarkResult:
     converged: np.ndarray
     P_last: np.ndarray
     theta_last: np.ndarray
+    # Full restart state (pass to `run_journal_benchmark(state=...)`).
+    final_state: object = None
     # Settings
-    N1: int
-    N2: int
-    dt: float
+    N1: int = 0
+    N2: int = 0
+    dt: float = 0.0
 
 
 def run_journal_benchmark(
@@ -116,6 +118,7 @@ def run_journal_benchmark(
     tol_inner: float = 1e-6,
     max_inner: int = 5000,
     scheme: str = "rb",
+    state=None,
     verbose: bool = False,
 ) -> JournalBenchmarkResult:
     """
@@ -149,6 +152,7 @@ def run_journal_benchmark(
         omega_p=omega_p, omega_theta=omega_theta,
         tol_inner=tol_inner, max_inner=max_inner,
         scheme=scheme,
+        state=state,
         verbose=verbose,
     )
 
@@ -157,13 +161,17 @@ def run_journal_benchmark(
     WaY = np.array([WaY_of_t(float(tt)) for tt in result.t])
 
     eccentricity = np.sqrt(result.X ** 2 + result.Y ** 2)
+    # Prefer the solver's own WaX/WaY histories if populated (Phase 4.3);
+    # fall back to the hand-evaluated arrays for older callers.
+    WaX_out = result.WaX if result.WaX is not None else WaX
+    WaY_out = result.WaY if result.WaY is not None else WaY
 
     return JournalBenchmarkResult(
         t=result.t,
         X=result.X, Y=result.Y,
         U=result.U, V=result.V,
         WX=result.WX, WY=result.WY,
-        WaX=WaX, WaY=WaY,
+        WaX=WaX_out, WaY=WaY_out,
         eccentricity=eccentricity,
         p_max=result.p_max,
         h_min=result.h_min,
@@ -172,6 +180,7 @@ def run_journal_benchmark(
         converged=result.converged,
         P_last=result.P_last,
         theta_last=result.theta_last,
+        final_state=result.final_state,
         N1=N1, N2=N2, dt=dt,
     )
 

@@ -31,6 +31,7 @@ from reynolds_solver.cavitation.ausas.kernels_dynamic import (
     get_unsteady_ausas_bc_phi_kernel,
     get_unsteady_ausas_bc_z_kernel,
 )
+from reynolds_solver.cavitation.ausas.state_io import AusasState
 
 
 # ===========================================================================
@@ -341,6 +342,12 @@ class AusasTransientResult:
     V: Optional[np.ndarray] = None
     WX: Optional[np.ndarray] = None
     WY: Optional[np.ndarray] = None
+    # --- Optional applied-load histories (journal only) ---
+    WaX: Optional[np.ndarray] = None
+    WaY: Optional[np.ndarray] = None
+    # --- Final-state snapshot ready to be passed back into the solver
+    # via the `state=` kwarg for a seamless restart. ---
+    final_state: Optional["AusasState"] = None
 
 
 def solve_ausas_prescribed_h_gpu(
@@ -372,11 +379,22 @@ def solve_ausas_prescribed_h_gpu(
     field_callback: Optional[Callable[[int, float, np.ndarray, np.ndarray], None]] = None,
     check_every: int = 10,
     scheme: str = "rb",
+    state: Optional[AusasState] = None,
     verbose: bool = False,
 ) -> AusasTransientResult:
     """
-    Full time loop: for n = 1..NT advance (P, θ) under a prescribed gap
+    Full time loop: for n = 1..NT advance (P, theta) under a prescribed gap
     h(t) supplied by `H_provider(n, t_n)`.
+
+    Restart
+    -------
+    Passing `state=AusasState(...)` resumes from a previous run. P0,
+    theta0, H_prev and (step_index, time) are taken from the state;
+    H_provider is called with the GLOBAL step index `state.step_index +
+    local_step` and the GLOBAL time `state.time + local_step * dt`, so
+    the user's H_provider sees a continuous time axis across restarts.
+    Histories also use global times. `result.final_state` is the state
+    snapshot ready to be passed to a subsequent call.
 
     Per step
     --------
@@ -414,12 +432,20 @@ def solve_ausas_prescribed_h_gpu(
     """
     if scheme not in ("rb", "jacobi"):
         raise ValueError(f"Unknown scheme {scheme!r}. Use 'rb' or 'jacobi'.")
-    # --- Initial gap and dimensions ----------------------------------------
-    H_prev_cpu = np.asarray(H_provider(0, 0.0), dtype=np.float64)
+    # --- Restart / initial gap / dimensions ---------------------------------
+    # Resume-from-state takes precedence; otherwise ask H_provider for H(0).
+    if state is not None:
+        H_prev_cpu = np.asarray(state.H_prev, dtype=np.float64)
+        t_offset = float(state.time)
+        n_offset = int(state.step_index)
+    else:
+        H_prev_cpu = np.asarray(H_provider(0, 0.0), dtype=np.float64)
+        t_offset = 0.0
+        n_offset = 0
     N_Z, N_phi = H_prev_cpu.shape
     if N_Z < 3 or N_phi < 3:
         raise ValueError(
-            f"Grid too small: ({N_Z}, {N_phi}) — need at least 3 on each axis."
+            f"Grid too small: ({N_Z}, {N_phi}) - need at least 3 on each axis."
         )
 
     shape = (N_Z, N_phi)
@@ -442,21 +468,25 @@ def solve_ausas_prescribed_h_gpu(
 
     _pack_ghosts(H_prev, periodic_phi, periodic_z)
 
-    # Initial (P, θ) ........................................................
-    if P0 is None:
-        P_old[:] = 0.0
+    # Initial (P, theta) — state takes precedence over the P0/theta0 kwargs.
+    if state is not None:
+        P_old[:] = cp.asarray(state.P, dtype=cp.float64)
+        theta_old[:] = cp.asarray(state.theta, dtype=cp.float64)
     else:
-        P_arr = np.asarray(P0, dtype=np.float64)
-        if P_arr.shape != shape:
-            raise ValueError(f"P0 shape {P_arr.shape} != {shape}")
-        P_old[:] = cp.asarray(P_arr)
-    if theta0 is None:
-        theta_old[:] = 1.0
-    else:
-        th_arr = np.asarray(theta0, dtype=np.float64)
-        if th_arr.shape != shape:
-            raise ValueError(f"theta0 shape {th_arr.shape} != {shape}")
-        theta_old[:] = cp.asarray(th_arr)
+        if P0 is None:
+            P_old[:] = 0.0
+        else:
+            P_arr = np.asarray(P0, dtype=np.float64)
+            if P_arr.shape != shape:
+                raise ValueError(f"P0 shape {P_arr.shape} != {shape}")
+            P_old[:] = cp.asarray(P_arr)
+        if theta0 is None:
+            theta_old[:] = 1.0
+        else:
+            th_arr = np.asarray(theta0, dtype=np.float64)
+            if th_arr.shape != shape:
+                raise ValueError(f"theta0 shape {th_arr.shape} != {shape}")
+            theta_old[:] = cp.asarray(th_arr)
     cp.maximum(P_old, 0.0, out=P_old)
     cp.clip(theta_old, 0.0, 1.0, out=theta_old)
 
@@ -493,8 +523,9 @@ def solve_ausas_prescribed_h_gpu(
         checkpoints = {0: (cp.asnumpy(P_old), cp.asnumpy(theta_old))}
 
     # --- Time loop ---------------------------------------------------------
-    for n in range(1, NT + 1):
-        t_n = n * dt
+    for step in range(1, NT + 1):
+        n = n_offset + step                     # global step index
+        t_n = t_offset + step * dt              # global time
 
         H_curr_cpu = np.asarray(H_provider(n, t_n), dtype=np.float64)
         if H_curr_cpu.shape != shape:
@@ -599,38 +630,50 @@ def solve_ausas_prescribed_h_gpu(
             if converged:
                 break
 
-        # Scalar history for this step.
-        t_hist[n - 1] = t_n
-        p_max_hist[n - 1] = float(cp.max(P_old))
-        h_min_hist[n - 1] = float(cp.min(H_curr[1:-1, 1:-1]))
-        cav_hist[n - 1] = float(
+        # Scalar history — LOCAL index (this run's 0..NT-1).
+        t_hist[step - 1] = t_n
+        p_max_hist[step - 1] = float(cp.max(P_old))
+        h_min_hist[step - 1] = float(cp.min(H_curr[1:-1, 1:-1]))
+        cav_hist[step - 1] = float(
             cp.mean((theta_old < 1.0 - 1e-6).astype(cp.float64))
         )
-        n_inner_hist[n - 1] = k_done
-        conv_hist[n - 1] = converged
+        n_inner_hist[step - 1] = k_done
+        conv_hist[step - 1] = converged
 
-        if verbose and (n <= 3 or n % max(NT // 20, 1) == 0):
+        if verbose and (step <= 3 or step % max(NT // 20, 1) == 0):
             print(
-                f"  [step {n:>6d}/{NT}] t={t_n:.5f} "
-                f"p_max={p_max_hist[n-1]:.4e} "
-                f"cav={cav_hist[n-1]:.3f} "
+                f"  [step {n:>6d}] t={t_n:.5f} "
+                f"p_max={p_max_hist[step-1]:.4e} "
+                f"cav={cav_hist[step-1]:.3f} "
                 f"inner={k_done:>4d} "
                 f"res={residual:.2e} "
                 f"conv={'Y' if converged else 'N'}"
             )
 
-        if checkpoints is not None and save_stride and (n % save_stride == 0 or n == NT):
+        if checkpoints is not None and save_stride and (
+            n % save_stride == 0 or step == NT
+        ):
             checkpoints[n] = (cp.asnumpy(P_old), cp.asnumpy(theta_old))
 
         if field_callback is not None:
             field_callback(n, t_n, cp.asnumpy(P_old), cp.asnumpy(theta_old))
 
-        # Advance H_prev ← H_curr (swap buffers so the next step overwrites
+        # Advance H_prev <- H_curr (swap buffers so the next step overwrites
         # the stale one).
         H_prev, H_curr = H_curr, H_prev
 
     P_last = cp.asnumpy(P_old)
     theta_last = cp.asnumpy(theta_old)
+    # H_prev (after the final swap) is H at the LAST completed step — the
+    # correct seed for a subsequent restart.
+    H_prev_last = cp.asnumpy(H_prev)
+    final_state = AusasState(
+        P=P_last,
+        theta=theta_last,
+        H_prev=H_prev_last,
+        step_index=n_offset + NT,
+        time=t_offset + NT * dt,
+    )
 
     return AusasTransientResult(
         t=t_hist,
@@ -642,6 +685,7 @@ def solve_ausas_prescribed_h_gpu(
         theta_last=theta_last,
         field_checkpoints=checkpoints,
         h_min=h_min_hist,
+        final_state=final_state,
     )
 
 
@@ -691,11 +735,22 @@ def solve_ausas_journal_dynamic_gpu(
     check_every: int = 10,
     save_stride: Optional[int] = None,
     field_callback: Optional[Callable[[int, float, np.ndarray, np.ndarray], None]] = None,
+    state: Optional[AusasState] = None,
     verbose: bool = False,
 ) -> AusasTransientResult:
     """
     Fully dynamical journal-bearing solver (Ausas, Jai, Buscaglia 2008,
     Table 2 / Section 5).
+
+    Restart
+    -------
+    Passing `state=AusasState(...)` resumes from a previous run: P0,
+    theta0, X0, Y0, U0, V0, H_prev and (step_index, time) are taken
+    from the state (overriding the matching kwargs). `load_fn` is
+    called with the GLOBAL time `state.time + local_step * dt`, so
+    the user's load_fn sees a continuous time axis across restarts.
+    Histories use global times. `result.final_state` is the state
+    snapshot ready to be passed to a subsequent call.
 
     Phase-4.1 performance notes
     ---------------------------
@@ -798,30 +853,56 @@ def solve_ausas_journal_dynamic_gpu(
     E = cp.empty(shape, dtype=cp.float64)
 
     # --- Initial state (state lives on device after this point) ---
-    X_dev = cp.array(float(X0), dtype=cp.float64)
-    Y_dev = cp.array(float(Y0), dtype=cp.float64)
-    U_dev = cp.array(float(U0), dtype=cp.float64)
-    V_dev = cp.array(float(V0), dtype=cp.float64)
+    if state is not None:
+        # Restart: all (X, Y, U, V, P, theta, H_prev) come from state.
+        X_init = float(state.X)
+        Y_init = float(state.Y)
+        U_init = float(state.U)
+        V_init = float(state.V)
+        t_offset = float(state.time)
+        n_offset = int(state.step_index)
+    else:
+        X_init = float(X0)
+        Y_init = float(Y0)
+        U_init = float(U0)
+        V_init = float(V0)
+        t_offset = 0.0
+        n_offset = 0
 
-    # Initial gap from the host-scalar X0/Y0 (one-off, not in hot loop).
-    _build_gap_inplace(H_prev, float(X0), float(Y0),
-                       cos_phi_1d, sin_phi_1d, texture_gpu)
+    X_dev = cp.array(X_init, dtype=cp.float64)
+    Y_dev = cp.array(Y_init, dtype=cp.float64)
+    U_dev = cp.array(U_init, dtype=cp.float64)
+    V_dev = cp.array(V_init, dtype=cp.float64)
+
+    if state is not None:
+        H_arr = np.asarray(state.H_prev, dtype=np.float64)
+        if H_arr.shape != shape:
+            raise ValueError(f"state.H_prev shape {H_arr.shape} != {shape}")
+        H_prev[:] = cp.asarray(H_arr)
+    else:
+        # Initial gap from the host-scalar X0/Y0 (one-off, not in hot loop).
+        _build_gap_inplace(H_prev, X_init, Y_init,
+                           cos_phi_1d, sin_phi_1d, texture_gpu)
     _pack_ghosts(H_prev, periodic_phi=True, periodic_z=False)
 
-    if P0 is None:
-        P_old[:] = 0.0
+    if state is not None:
+        P_old[:] = cp.asarray(state.P, dtype=cp.float64)
+        theta_old[:] = cp.asarray(state.theta, dtype=cp.float64)
     else:
-        P_arr = np.asarray(P0, dtype=np.float64)
-        if P_arr.shape != shape:
-            raise ValueError(f"P0 shape {P_arr.shape} != {shape}")
-        P_old[:] = cp.asarray(P_arr)
-    if theta0 is None:
-        theta_old[:] = 1.0
-    else:
-        th_arr = np.asarray(theta0, dtype=np.float64)
-        if th_arr.shape != shape:
-            raise ValueError(f"theta0 shape {th_arr.shape} != {shape}")
-        theta_old[:] = cp.asarray(th_arr)
+        if P0 is None:
+            P_old[:] = 0.0
+        else:
+            P_arr = np.asarray(P0, dtype=np.float64)
+            if P_arr.shape != shape:
+                raise ValueError(f"P0 shape {P_arr.shape} != {shape}")
+            P_old[:] = cp.asarray(P_arr)
+        if theta0 is None:
+            theta_old[:] = 1.0
+        else:
+            th_arr = np.asarray(theta0, dtype=np.float64)
+            if th_arr.shape != shape:
+                raise ValueError(f"theta0 shape {th_arr.shape} != {shape}")
+            theta_old[:] = cp.asarray(th_arr)
     cp.maximum(P_old, 0.0, out=P_old)
     cp.clip(theta_old, 0.0, 1.0, out=theta_old)
 
@@ -891,6 +972,8 @@ def solve_ausas_journal_dynamic_gpu(
     V_hist = np.empty(NT, dtype=np.float64)
     WX_hist = np.empty(NT, dtype=np.float64)
     WY_hist = np.empty(NT, dtype=np.float64)
+    WaX_hist = np.empty(NT, dtype=np.float64)
+    WaY_hist = np.empty(NT, dtype=np.float64)
     p_max_hist = np.empty(NT, dtype=np.float64)
     h_min_hist = np.empty(NT, dtype=np.float64)
     cav_hist = np.empty(NT, dtype=np.float64)
@@ -907,8 +990,9 @@ def solve_ausas_journal_dynamic_gpu(
     WX_dev = cp.array(0.0, dtype=cp.float64)
     WY_dev = cp.array(0.0, dtype=cp.float64)
 
-    for n in range(1, NT + 1):
-        t_n = n * dt
+    for step in range(1, NT + 1):
+        n = n_offset + step                   # global step index
+        t_n = t_offset + step * dt            # global time
         WaX_n, WaY_n = load_fn(t_n)
         WaX_n = float(WaX_n)
         WaY_n = float(WaY_n)
@@ -1058,42 +1142,58 @@ def solve_ausas_journal_dynamic_gpu(
         H_prev, H_curr = H_curr, H_prev
 
         # --- Scalar history: transfer to host ONCE per step, not per iter.
-        t_hist[n - 1] = t_n
-        X_hist[n - 1] = float(X_dev)
-        Y_hist[n - 1] = float(Y_dev)
-        U_hist[n - 1] = float(U_dev)
-        V_hist[n - 1] = float(V_dev)
-        WX_hist[n - 1] = float(WX_dev)
-        WY_hist[n - 1] = float(WY_dev)
-        p_max_hist[n - 1] = float(cp.max(P_old))
-        h_min_hist[n - 1] = float(cp.min(H_prev[1:-1, 1:-1]))
-        cav_hist[n - 1] = float(
+        t_hist[step - 1] = t_n
+        X_hist[step - 1] = float(X_dev)
+        Y_hist[step - 1] = float(Y_dev)
+        U_hist[step - 1] = float(U_dev)
+        V_hist[step - 1] = float(V_dev)
+        WX_hist[step - 1] = float(WX_dev)
+        WY_hist[step - 1] = float(WY_dev)
+        WaX_hist[step - 1] = WaX_n
+        WaY_hist[step - 1] = WaY_n
+        p_max_hist[step - 1] = float(cp.max(P_old))
+        h_min_hist[step - 1] = float(cp.min(H_prev[1:-1, 1:-1]))
+        cav_hist[step - 1] = float(
             cp.mean((theta_old < 1.0 - 1e-6).astype(cp.float64))
         )
-        n_inner_hist[n - 1] = k_done
-        conv_hist[n - 1] = converged
+        n_inner_hist[step - 1] = k_done
+        conv_hist[step - 1] = converged
 
-        if verbose and (n <= 3 or n % max(NT // 20, 1) == 0):
-            Xh = X_hist[n - 1]; Yh = Y_hist[n - 1]
+        if verbose and (step <= 3 or step % max(NT // 20, 1) == 0):
+            Xh = X_hist[step - 1]; Yh = Y_hist[step - 1]
             e_now = np.sqrt(Xh * Xh + Yh * Yh)
             print(
-                f"  [step {n:>6d}/{NT}] t={t_n:.4f} "
+                f"  [step {n:>6d}] t={t_n:.4f} "
                 f"X={Xh:+.3f} Y={Yh:+.3f} e={e_now:.3f} "
-                f"WX={WX_hist[n-1]:+.2e} WY={WY_hist[n-1]:+.2e} "
-                f"p_max={p_max_hist[n-1]:.3e} "
-                f"h_min={h_min_hist[n-1]:.3e} "
-                f"cav={cav_hist[n-1]:.3f} "
+                f"WX={WX_hist[step-1]:+.2e} WY={WY_hist[step-1]:+.2e} "
+                f"p_max={p_max_hist[step-1]:.3e} "
+                f"h_min={h_min_hist[step-1]:.3e} "
+                f"cav={cav_hist[step-1]:.3f} "
                 f"inner={k_done:>4d} res={residual:.2e} "
                 f"conv={'Y' if converged else 'N'}"
             )
 
         if checkpoints is not None and save_stride and (
-            n % save_stride == 0 or n == NT
+            n % save_stride == 0 or step == NT
         ):
             checkpoints[n] = (cp.asnumpy(P_old), cp.asnumpy(theta_old))
 
         if field_callback is not None:
             field_callback(n, t_n, cp.asnumpy(P_old), cp.asnumpy(theta_old))
+
+    # Build final state for restart (host copies of the last iterate).
+    P_last = cp.asnumpy(P_old)
+    theta_last = cp.asnumpy(theta_old)
+    H_prev_last = cp.asnumpy(H_prev)
+    final_state = AusasState(
+        P=P_last,
+        theta=theta_last,
+        H_prev=H_prev_last,
+        X=float(X_dev), Y=float(Y_dev),
+        U=float(U_dev), V=float(V_dev),
+        step_index=n_offset + NT,
+        time=t_offset + NT * dt,
+    )
 
     return AusasTransientResult(
         t=t_hist,
@@ -1101,11 +1201,13 @@ def solve_ausas_journal_dynamic_gpu(
         cav_frac=cav_hist,
         n_inner=n_inner_hist,
         converged=conv_hist,
-        P_last=cp.asnumpy(P_old),
-        theta_last=cp.asnumpy(theta_old),
+        P_last=P_last,
+        theta_last=theta_last,
         field_checkpoints=checkpoints,
         h_min=h_min_hist,
         X=X_hist, Y=Y_hist,
         U=U_hist, V=V_hist,
         WX=WX_hist, WY=WY_hist,
+        WaX=WaX_hist, WaY=WaY_hist,
+        final_state=final_state,
     )

@@ -157,6 +157,7 @@ def run_squeeze_benchmark(
     scheme: str = "rb",
     save_stride: Optional[int] = None,
     field_callback=None,
+    state=None,
     verbose: bool = False,
 ) -> SqueezeBenchmarkResult:
     """
@@ -217,6 +218,7 @@ def run_squeeze_benchmark(
         scheme=scheme,
         save_stride=save_stride,
         field_callback=field_callback,
+        state=state,
         verbose=verbose,
     )
 
