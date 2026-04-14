@@ -32,6 +32,7 @@ from reynolds_solver.cavitation.ausas.kernels_dynamic import (
     get_unsteady_ausas_bc_z_kernel,
 )
 from reynolds_solver.cavitation.ausas.state_io import AusasState
+from reynolds_solver.cavitation.ausas.accel_options import AusasAccelerationOptions
 
 
 # ===========================================================================
@@ -736,6 +737,7 @@ def solve_ausas_journal_dynamic_gpu(
     save_stride: Optional[int] = None,
     field_callback: Optional[Callable[[int, float, np.ndarray, np.ndarray], None]] = None,
     state: Optional[AusasState] = None,
+    accel: Optional[AusasAccelerationOptions] = None,
     verbose: bool = False,
 ) -> AusasTransientResult:
     """
@@ -751,6 +753,17 @@ def solve_ausas_journal_dynamic_gpu(
     the user's load_fn sees a continuous time axis across restarts.
     Histories use global times. `result.final_state` is the state
     snapshot ready to be passed to a subsequent call.
+
+    Acceleration (Phase 5 Part 1 — lagged mechanics)
+    ------------------------------------------------
+    `accel=AusasAccelerationOptions(mech_update_every=K, ...)` switches
+    the inner loop to lagged-mechanics mode: forces, Newmark predictor,
+    gap H and coefficients A..E are rebuilt only every K iterations,
+    while the RB/Jacobi sweep runs every iteration. Guards force an
+    out-of-schedule refresh when the residual stalls, the cavitation
+    fraction jumps, or the loop is approaching max_inner. Leaving
+    `accel=None` (or `mech_update_every=1`) preserves the baseline
+    behaviour bit-for-bit.
 
     Phase-4.1 performance notes
     ---------------------------
@@ -984,6 +997,20 @@ def solve_ausas_journal_dynamic_gpu(
     if save_stride is not None and save_stride > 0:
         checkpoints = {0: (cp.asnumpy(P_old), cp.asnumpy(theta_old))}
 
+    # --- Acceleration options (Phase 5 Part 1) -----------------------
+    # None means "run the baseline code path". A provided dataclass
+    # with mech_update_every == 1 also reduces to baseline (need_refresh
+    # is True every iteration), but we still take the fast path so the
+    # host-side guard bookkeeping is skipped.
+    _accel = accel if accel is not None else AusasAccelerationOptions()
+    mech_K = max(1, int(_accel.mech_update_every))
+    lagged_mode_active = mech_K > 1
+    mech_force_first = int(_accel.mech_force_first_iters)
+    stall_enabled = bool(_accel.mech_force_if_residual_stalls)
+    cav_jump_enabled = bool(_accel.mech_force_if_cav_jumps)
+    stall_ratio = float(_accel.mech_residual_stall_ratio)
+    cav_tol = float(_accel.mech_cav_jump_tol)
+
     # --- Time loop ---
     # Running values of WX, WY held on device; initialised to 0 for the
     # first step's "before any iteration" diagnostic.
@@ -1011,50 +1038,87 @@ def solve_ausas_journal_dynamic_gpu(
         converged = False
         k_done = 0
 
+        # --- Lagged-mechanics bookkeeping (only non-trivial when
+        #     lagged_mode_active = mech_update_every > 1) ---
+        last_residual = float("inf")
+        residual_at_last_refresh = float("inf")
+        cav_at_last_refresh = float("nan")
+        cav_jump_pending = False
+        did_mech_refresh = False
+
         for k in range(max_inner):
             check_iter = (k % check_every == 0) or (k < 3)
 
+            # --- Decide whether mechanics (forces, predictor, H, A..E)
+            #     get rebuilt this iteration. In baseline mode (K=1)
+            #     this always fires and the guarded-refresh path
+            #     collapses to the old code. ---
+            if lagged_mode_active:
+                residual_stalled = (
+                    stall_enabled
+                    and did_mech_refresh
+                    and np.isfinite(last_residual)
+                    and np.isfinite(residual_at_last_refresh)
+                    and last_residual > stall_ratio * residual_at_last_refresh
+                )
+                need_refresh = (
+                    k < mech_force_first
+                    or (k % mech_K == 0)
+                    or residual_stalled
+                    or cav_jump_pending
+                    or k >= max_inner - 3
+                )
+            else:
+                need_refresh = True
+
             # Snapshot BEFORE the sweep, for RB post-sweep residual.
-            # Jacobi writes to P_new in the kernel itself, no snapshot
-            # needed. Skipping this full-field copy on non-check iters
-            # is the bandwidth win that motivates Opt 2.
             if check_iter and scheme == "rb":
                 P_new[:] = P_old
                 theta_new[:] = theta_old
 
-            # (1) Hydrodynamic forces — reductions stay on device (0-d).
-            WX_dev = d_phi_d_Z * cp.sum(P_old[1:-1, 1:-1] * cos_phi_interior[None, :])
-            WY_dev = d_phi_d_Z * cp.sum(P_old[1:-1, 1:-1] * sin_phi_interior[None, :])
+            # --- Mechanics (1)-(4): executed only on refresh iters. ---
+            if need_refresh:
+                # (1) Hydrodynamic forces — device 0-d reductions.
+                WX_dev = d_phi_d_Z * cp.sum(P_old[1:-1, 1:-1] * cos_phi_interior[None, :])
+                WY_dev = d_phi_d_Z * cp.sum(P_old[1:-1, 1:-1] * sin_phi_interior[None, :])
 
-            # (2) Newmark predictor — device 0-d arithmetic.
-            X_k_dev = X_dev + dt * U_dev + dt_sq_half * (WX_dev + WaX_n)
-            Y_k_dev = Y_dev + dt * V_dev + dt_sq_half * (WY_dev + WaY_n)
+                # (2) Newmark predictor — device 0-d arithmetic.
+                X_k_dev = X_dev + dt * U_dev + dt_sq_half * (WX_dev + WaX_n)
+                Y_k_dev = Y_dev + dt * V_dev + dt_sq_half * (WY_dev + WaY_n)
 
-            # (3) Rebuild gap via single-launch kernel; reads X_k_dev,
-            # Y_k_dev as device pointers (no host sync).
-            build_gap_kernel(
-                full_grid, block,
-                (
-                    H_curr, X_k_dev, Y_k_dev,
-                    cos_phi_1d, sin_phi_1d,
-                    texture_for_kernel,
-                    np.int32(N_Z), np.int32(N_phi),
-                    np.int32(has_texture_flag),
-                ),
-            )
-            # Ghost pack is exact by construction (cos/sin sampled at
-            # shifted positions), so the defensive _pack_ghosts call
-            # that was needed for the CuPy expression builder is gone.
-
-            # (4) Rebuild coefficients A..E via single-launch kernel.
-            build_coeffs_kernel(
-                full_grid, block,
-                (
-                    H_curr, A, B, C, D, E,
-                    np.float64(alpha_sq),
-                    np.int32(N_Z), np.int32(N_phi),
-                ),
-            )
+                # (3) Rebuild gap via single-launch kernel.
+                build_gap_kernel(
+                    full_grid, block,
+                    (
+                        H_curr, X_k_dev, Y_k_dev,
+                        cos_phi_1d, sin_phi_1d,
+                        texture_for_kernel,
+                        np.int32(N_Z), np.int32(N_phi),
+                        np.int32(has_texture_flag),
+                    ),
+                )
+                # (4) Rebuild coefficients A..E via single-launch kernel.
+                build_coeffs_kernel(
+                    full_grid, block,
+                    (
+                        H_curr, A, B, C, D, E,
+                        np.float64(alpha_sq),
+                        np.int32(N_Z), np.int32(N_phi),
+                    ),
+                )
+                # Refresh bookkeeping (cheap host scalars).
+                if lagged_mode_active:
+                    residual_at_last_refresh = last_residual
+                    cav_jump_pending = False
+                    did_mech_refresh = True
+                    if cav_jump_enabled:
+                        # Capture current cav to measure future drift
+                        # at check_iters. One extra sync per refresh.
+                        cav_at_last_refresh = float(
+                            cp.mean(
+                                (theta_old < 1.0 - 1e-6).astype(cp.float64)
+                            )
+                        )
 
             # (5) + (6) One relaxation sweep + BC.
             if scheme == "jacobi":
@@ -1115,8 +1179,26 @@ def solve_ausas_journal_dynamic_gpu(
                 dY_dev = cp.abs(Y_k_dev - Y_k_prev_dev)
                 # Single host sync per check (was 2 per iter before).
                 residual = float(dP_dev + dth_dev + dX_dev + dY_dev)
+                last_residual = residual
                 if residual < tol_inner and k > 2:
                     converged = True
+
+                # Cav-jump guard (lagged mode only): one extra sync
+                # per check iter to decide whether mechanics drifted
+                # enough to warrant an out-of-schedule refresh.
+                if (
+                    lagged_mode_active
+                    and cav_jump_enabled
+                    and did_mech_refresh
+                    and np.isfinite(cav_at_last_refresh)
+                ):
+                    cav_now = float(
+                        cp.mean(
+                            (theta_old < 1.0 - 1e-6).astype(cp.float64)
+                        )
+                    )
+                    if abs(cav_now - cav_at_last_refresh) > cav_tol:
+                        cav_jump_pending = True
 
             # (8) Jacobi swap (no snapshot).
             if scheme == "jacobi":

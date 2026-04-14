@@ -45,6 +45,9 @@ from reynolds_solver.cavitation.ausas.state_io import (
     save_state,
     load_state,
 )
+from reynolds_solver.cavitation.ausas.accel_options import (
+    AusasAccelerationOptions,
+)
 
 __all__ = [
     "solve_reynolds",
@@ -56,5 +59,6 @@ __all__ = [
     "AusasState",
     "save_state",
     "load_state",
+    "AusasAccelerationOptions",
 ]
-__version__ = "1.5.0"
+__version__ = "1.6.0"
