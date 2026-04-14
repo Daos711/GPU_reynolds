@@ -79,6 +79,7 @@ def solve_reynolds(
     tol_outer: float = 1e-3,
     max_outer_pv: int = 20,
     relax_pv: float = 0.7,
+    phi_bc: str = "periodic",
 ) -> tuple:
     """
     Solve the Reynolds equation on GPU (Red-Black SOR).
@@ -170,10 +171,6 @@ def solve_reynolds(
 
     # --- Piezoviscous path (overrides normal dispatch) ---
     if alpha_pv is not None:
-        if cavitation != "half_sommerfeld":
-            raise NotImplementedError(
-                "Piezoviscosity only supported with cavitation='half_sommerfeld'."
-            )
         if closure != "laminar":
             raise NotImplementedError(
                 "Piezoviscosity only supported with closure='laminar'."
@@ -181,6 +178,20 @@ def solve_reynolds(
         if p_scale is None:
             raise ValueError(
                 "p_scale is required when alpha_pv is set."
+            )
+
+        if cavitation == "payvar_salant":
+            from reynolds_solver.piezoviscous.solver_pv_payvar_salant import (
+                solve_payvar_salant_piezoviscous,
+            )
+            return solve_payvar_salant_piezoviscous(
+                H, d_phi, d_Z, R, L,
+                alpha_pv=alpha_pv, p_scale=p_scale,
+                p0_roelands=p0_roelands, z_roelands=z_roelands,
+                tol_outer=tol_outer, max_outer=max_outer_pv,
+                relax_mu=relax_pv,
+                tol=tol, max_iter=max_iter,
+                phi_bc=phi_bc, verbose=verbose,
             )
 
         if pv_method == "transformed":
@@ -263,15 +274,28 @@ def solve_reynolds(
                 "closure='laminar'."
             )
 
-        from reynolds_solver.cavitation.payvar_salant import (
-            solve_payvar_salant_cpu,
-        )
-        P, theta, residual, n_iter = solve_payvar_salant_cpu(
-            H, d_phi, d_Z, R, L,
-            tol=tol,
-            max_iter=max_iter,
-            verbose=verbose,
-        )
+        try:
+            from reynolds_solver.cavitation.payvar_salant import (
+                solve_payvar_salant_gpu,
+            )
+            P, theta, residual, n_iter = solve_payvar_salant_gpu(
+                H, d_phi, d_Z, R, L,
+                tol=tol,
+                max_iter=max_iter,
+                phi_bc=phi_bc,
+                verbose=verbose,
+            )
+        except (ImportError, ModuleNotFoundError):
+            from reynolds_solver.cavitation.payvar_salant import (
+                solve_payvar_salant_cpu,
+            )
+            P, theta, residual, n_iter = solve_payvar_salant_cpu(
+                H, d_phi, d_Z, R, L,
+                tol=tol,
+                max_iter=max_iter,
+                phi_bc=phi_bc,
+                verbose=verbose,
+            )
         return P, theta, residual, n_iter
 
     else:

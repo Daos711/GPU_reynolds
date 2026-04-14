@@ -57,7 +57,7 @@ from numba import njit
 # ----------------------------------------------------------------------------
 # Coefficient build (same average-of-cubes as cavitation.ausas.solver_cpu)
 # ----------------------------------------------------------------------------
-def _build_coefficients(H, d_phi, d_Z, R, L):
+def _build_coefficients(H, d_phi, d_Z, R, L, groove=False):
     """
     Build A, B, C, D, E with average-of-cubes conductance.
 
@@ -68,8 +68,11 @@ def _build_coefficients(H, d_phi, d_Z, R, L):
         E = A + B + C + D
         alpha_sq = (2R/L · d_phi/d_Z)²
 
-    Requires H to be ghost-packed (H[:, 0] = H[:, N_phi-2],
-    H[:, N_phi-1] = H[:, 1]).
+    groove=False: expects H ghost-packed periodically; fills the ghost
+    columns of A, B with wrap-around face conductances.
+    groove=True : j=0 and j=N_phi-1 are Dirichlet boundaries; the
+    wrap-around ghost slots A[:, -1] and B[:, 0] are zeroed (never
+    read by the groove-mode stencil).
     """
     N_Z, N_phi = H.shape
     alpha_sq = (2.0 * R / L * d_phi / d_Z) ** 2
@@ -79,11 +82,17 @@ def _build_coefficients(H, d_phi, d_Z, R, L):
 
     A = np.zeros((N_Z, N_phi), dtype=np.float64)
     A[:, :-1] = Ah
-    A[:, -1] = Ah[:, 0]
+    if groove:
+        A[:, -1] = 0.0
+    else:
+        A[:, -1] = Ah[:, 0]
 
     B = np.zeros((N_Z, N_phi), dtype=np.float64)
     B[:, 1:] = Ah
-    B[:, 0] = Ah[:, -1]
+    if groove:
+        B[:, 0] = 0.0
+    else:
+        B[:, 0] = Ah[:, -1]
 
     # Z-direction face conductance
     H_jph3 = 0.5 * (H[:-1, :] ** 3 + H[1:, :] ** 3)  # (N_Z - 1, N_phi)
@@ -100,7 +109,7 @@ def _build_coefficients(H, d_phi, d_Z, R, L):
 # Half-Sommerfeld warmup (same discrete operator, θ ≡ 1, clamp P ≥ 0)
 # ----------------------------------------------------------------------------
 @njit(cache=True)
-def _hs_sor_sweep(P, A, B, C, D, E, F_hs, omega, N_Z, N_phi):
+def _hs_sor_sweep(P, A, B, C, D, E, F_hs, omega, N_Z, N_phi, groove=0):
     """
     One SOR sweep of the half-Sommerfeld problem with the same
     coefficients as the Payvar-Salant sweep:
@@ -110,19 +119,20 @@ def _hs_sor_sweep(P, A, B, C, D, E, F_hs, omega, N_Z, N_phi):
     with F_hs = d_phi·(h_{i,j} − h_{i,jm}) (the θ ≡ 1 Couette driver)
     and P clamped to ≥ 0 inside the sweep.
 
-    Used as a warm start for solve_payvar_salant_cpu. Without it, a
-    g ≡ 0 cold start tends to fall into the trivial "θ·h = const,
-    P ≈ 0" fixed point that also exists in the discrete system. With
-    it, the cavitated region of the HS field seeds g < 0 and the PS
-    iteration just polishes the rupture boundary.
+    groove: 0 = periodic φ (default), 1 = supply groove at φ=0,2π
+    (Dirichlet P=0 on j=0 and j=N_phi-1; stencil jp/jm without wrap).
 
     Returns max|ΔP| over interior nodes.
     """
     max_dP = 0.0
     for i in range(1, N_Z - 1):
         for j in range(1, N_phi - 1):
-            jp = j + 1 if j + 1 < N_phi - 1 else 1
-            jm = j - 1 if j - 1 >= 1 else N_phi - 2
+            if groove != 0:
+                jp = j + 1
+                jm = j - 1
+            else:
+                jp = j + 1 if j + 1 < N_phi - 1 else 1
+                jm = j - 1 if j - 1 >= 1 else N_phi - 2
 
             P_old = P[i, j]
             P_new = (
@@ -140,9 +150,14 @@ def _hs_sor_sweep(P, A, B, C, D, E, F_hs, omega, N_Z, N_phi):
             if dP > max_dP:
                 max_dP = dP
 
-    for i in range(N_Z):
-        P[i, 0] = P[i, N_phi - 2]
-        P[i, N_phi - 1] = P[i, 1]
+    if groove != 0:
+        for i in range(N_Z):
+            P[i, 0] = 0.0
+            P[i, N_phi - 1] = 0.0
+    else:
+        for i in range(N_Z):
+            P[i, 0] = P[i, N_phi - 2]
+            P[i, N_phi - 1] = P[i, 1]
     for j in range(N_phi):
         P[0, j] = 0.0
         P[N_Z - 1, j] = 0.0
@@ -157,7 +172,7 @@ def _hs_sor_sweep(P, A, B, C, D, E, F_hs, omega, N_Z, N_phi):
 def _ps_sor_sweep(
     g, H, A, B, C, D, E,
     cav_mask, pinned,
-    d_phi, omega, N_Z, N_phi,
+    d_phi, omega, N_Z, N_phi, groove=0,
 ):
     """
     One lexicographic SOR sweep of the Payvar-Salant unified variable g.
@@ -190,8 +205,12 @@ def _ps_sor_sweep(
 
     for i in range(1, N_Z - 1):
         for j in range(1, N_phi - 1):
-            jp = j + 1 if j + 1 < N_phi - 1 else 1
-            jm = j - 1 if j - 1 >= 1 else N_phi - 2
+            if groove != 0:
+                jp = j + 1
+                jm = j - 1
+            else:
+                jp = j + 1 if j + 1 < N_phi - 1 else 1
+                jm = j - 1 if j - 1 >= 1 else N_phi - 2
 
             g_old = g[i, j]
 
@@ -261,9 +280,14 @@ def _ps_sor_sweep(
             if delta > max_delta:
                 max_delta = delta
 
-    for i in range(N_Z):
-        g[i, 0] = g[i, N_phi - 2]
-        g[i, N_phi - 1] = g[i, 1]
+    if groove != 0:
+        for i in range(N_Z):
+            g[i, 0] = 0.0
+            g[i, N_phi - 1] = 0.0
+    else:
+        for i in range(N_Z):
+            g[i, 0] = g[i, N_phi - 2]
+            g[i, N_phi - 1] = g[i, 1]
 
     for j in range(N_phi):
         g[0, j] = 0.0
@@ -276,7 +300,7 @@ def _ps_sor_sweep(
 # PDE residual (same discretization and switch as the sweep)
 # ----------------------------------------------------------------------------
 @njit(cache=True)
-def _ps_pde_residual(g, H, A, B, C, D, E, d_phi, N_Z, N_phi):
+def _ps_pde_residual(g, H, A, B, C, D, E, d_phi, N_Z, N_phi, groove=0):
     """
     Maximum absolute residual of the discrete Ausas eq. (13) over
     interior nodes, measured with the SAME switch F(g) that the sweep
@@ -293,8 +317,12 @@ def _ps_pde_residual(g, H, A, B, C, D, E, d_phi, N_Z, N_phi):
 
     for i in range(1, N_Z - 1):
         for j in range(1, N_phi - 1):
-            jp = j + 1 if j + 1 < N_phi - 1 else 1
-            jm = j - 1 if j - 1 >= 1 else N_phi - 2
+            if groove != 0:
+                jp = j + 1
+                jm = j - 1
+            else:
+                jp = j + 1 if j + 1 < N_phi - 1 else 1
+                jm = j - 1 if j - 1 >= 1 else N_phi - 2
 
             g_ij = g[i, j]
             if g_ij >= 0.0:
@@ -348,13 +376,15 @@ def solve_payvar_salant_cpu(
     tol=1e-6,
     max_iter=50000,
     check_every=200,
-    hs_warmup_iter=2000,
-    hs_warmup_tol=1e-7,
-    hs_warmup_omega=1.7,
+    hs_warmup_iter=50000,
+    hs_warmup_tol=1e-5,
+    hs_warmup_omega=None,
     pin_active_set=True,
     max_outer_active_set=10,
     cav_threshold=1e-10,
     g_init=None,
+    coefficients_ext=None,
+    phi_bc="periodic",
     verbose=False,
 ):
     """
@@ -421,8 +451,11 @@ def solve_payvar_salant_cpu(
         (in which case you must supply `g_init`).
     hs_warmup_tol : float
         HS warmup convergence tolerance on max|ΔP|.
-    hs_warmup_omega : float
-        SOR ω for the linear HS warmup.
+    hs_warmup_omega : float or None
+        SOR ω for the linear HS warmup. If None (default), computed
+        automatically via ``compute_auto_omega`` — same formula as the
+        main HS solver, with cap=1.97. This is critical for large
+        grids where ω=1.7 is too slow to converge.
     pin_active_set : bool
         If True (default), freeze the cavitation mask inside each
         inner sweep. If False, fall back to the original nonlinear
@@ -449,12 +482,44 @@ def solve_payvar_salant_cpu(
     """
     N_Z, N_phi = H.shape
 
-    # Defensive ghost packing
-    H = np.ascontiguousarray(H, dtype=np.float64).copy()
-    H[:, 0] = H[:, N_phi - 2]
-    H[:, N_phi - 1] = H[:, 1]
+    if phi_bc not in ("periodic", "groove"):
+        raise ValueError(
+            f"phi_bc must be 'periodic' or 'groove', got {phi_bc!r}"
+        )
+    groove = 1 if phi_bc == "groove" else 0
 
-    A, B, C, D, E = _build_coefficients(H, d_phi, d_Z, R, L)
+    # Ghost packing of H (periodic wrap or zero-gradient at groove)
+    H = np.ascontiguousarray(H, dtype=np.float64).copy()
+    if groove:
+        H[:, 0] = H[:, 1]
+        H[:, N_phi - 1] = H[:, N_phi - 2]
+    else:
+        H[:, 0] = H[:, N_phi - 2]
+        H[:, N_phi - 1] = H[:, 1]
+
+    if coefficients_ext is not None:
+        if len(coefficients_ext) != 5:
+            raise ValueError(
+                "coefficients_ext must be tuple of 5 arrays (A,B,C,D,E)"
+            )
+        A, B, C, D, E = coefficients_ext
+        for name, arr in [("A", A), ("B", B), ("C", C), ("D", D), ("E", E)]:
+            if not isinstance(arr, np.ndarray):
+                raise TypeError(
+                    f"{name} in coefficients_ext must be numpy array"
+                )
+            if arr.shape != H.shape:
+                raise ValueError(
+                    f"{name} shape {arr.shape} != H shape {H.shape}"
+                )
+            if arr.dtype != np.float64:
+                raise TypeError(
+                    f"{name} dtype {arr.dtype} != float64"
+                )
+    else:
+        A, B, C, D, E = _build_coefficients(
+            H, d_phi, d_Z, R, L, groove=bool(groove),
+        )
 
     n_iter_total = 0
 
@@ -463,17 +528,29 @@ def solve_payvar_salant_cpu(
     # ------------------------------------------------------------------
     if g_init is not None:
         g = np.ascontiguousarray(g_init, dtype=np.float64).copy()
-        g[:, 0] = g[:, N_phi - 2]
-        g[:, N_phi - 1] = g[:, 1]
+        if groove:
+            g[:, 0] = 0.0
+            g[:, N_phi - 1] = 0.0
+        else:
+            g[:, 0] = g[:, N_phi - 2]
+            g[:, N_phi - 1] = g[:, 1]
         g[0, :] = 0.0
         g[-1, :] = 0.0
         if verbose:
             print("  [PS] warm start from g_init (HS warmup skipped)")
     elif hs_warmup_iter > 0:
+        # Auto-omega for HS warmup — same formula as the main HS solver
+        if hs_warmup_omega is None:
+            from reynolds_solver.utils import compute_auto_omega
+            hs_warmup_omega = compute_auto_omega(N_phi, N_Z, R, L, cap=1.97)
+
         F_hs = np.zeros((N_Z, N_phi), dtype=np.float64)
         for i in range(1, N_Z - 1):
             for j in range(1, N_phi - 1):
-                jm = j - 1 if j - 1 >= 1 else N_phi - 2
+                if groove:
+                    jm = j - 1
+                else:
+                    jm = j - 1 if j - 1 >= 1 else N_phi - 2
                 F_hs[i, j] = d_phi * (H[i, j] - H[i, jm])
 
         P_hs = np.zeros((N_Z, N_phi), dtype=np.float64)
@@ -481,7 +558,7 @@ def solve_payvar_salant_cpu(
         for k in range(hs_warmup_iter):
             hs_res = _hs_sor_sweep(
                 P_hs, A, B, C, D, E, F_hs,
-                hs_warmup_omega, N_Z, N_phi,
+                hs_warmup_omega, N_Z, N_phi, groove,
             )
             n_iter_total += 1
             if hs_res < hs_warmup_tol and k > 5:
@@ -489,12 +566,26 @@ def solve_payvar_salant_cpu(
         if verbose:
             print(
                 f"  [PS] HS warmup done: iter={n_iter_total}, "
-                f"res={hs_res:.3e}, maxP={P_hs.max():.4e}"
+                f"res={hs_res:.3e}, maxP={P_hs.max():.4e}, "
+                f"ω_hs={hs_warmup_omega:.4f}"
+            )
+        if hs_res > hs_warmup_tol:
+            import warnings
+            warnings.warn(
+                f"PS HS warmup did not converge: res={hs_res:.2e} > "
+                f"tol={hs_warmup_tol:.2e} after {hs_warmup_iter} iters "
+                f"(omega={hs_warmup_omega:.4f}). Solution may be "
+                f"unreliable. Consider increasing hs_warmup_iter.",
+                stacklevel=2,
             )
 
         g = P_hs
-        g[:, 0] = g[:, N_phi - 2]
-        g[:, N_phi - 1] = g[:, 1]
+        if groove:
+            g[:, 0] = 0.0
+            g[:, N_phi - 1] = 0.0
+        else:
+            g[:, 0] = g[:, N_phi - 2]
+            g[:, N_phi - 1] = g[:, 1]
         g[0, :] = 0.0
         g[-1, :] = 0.0
     else:
@@ -509,9 +600,13 @@ def solve_payvar_salant_cpu(
     # re-solved into negative g).
     cav_mask[0, :] = 0
     cav_mask[-1, :] = 0
-    # Ghost columns track the physical seam
-    cav_mask[:, 0] = cav_mask[:, N_phi - 2]
-    cav_mask[:, N_phi - 1] = cav_mask[:, 1]
+    # Phi boundaries: periodic ghost wrap, or Dirichlet full-film in groove
+    if groove:
+        cav_mask[:, 0] = 0
+        cav_mask[:, N_phi - 1] = 0
+    else:
+        cav_mask[:, 0] = cav_mask[:, N_phi - 2]
+        cav_mask[:, N_phi - 1] = cav_mask[:, 1]
 
     # Seed g = 0 inside the initial cavitation set (start of each inner
     # sweep from a clean mass-content state, not from P_hs clamping noise).
@@ -544,7 +639,7 @@ def solve_payvar_salant_cpu(
             residual = _ps_sor_sweep(
                 g, H, A, B, C, D, E,
                 cav_mask, pinned,
-                d_phi, omega, N_Z, N_phi,
+                d_phi, omega, N_Z, N_phi, groove,
             )
             n_iter_total += 1
             inner_k = k + 1
@@ -562,8 +657,12 @@ def solve_payvar_salant_cpu(
         ).astype(np.int32)
         new_cav[0, :] = 0
         new_cav[-1, :] = 0
-        new_cav[:, 0] = new_cav[:, N_phi - 2]
-        new_cav[:, N_phi - 1] = new_cav[:, 1]
+        if groove:
+            new_cav[:, 0] = 0
+            new_cav[:, N_phi - 1] = 0
+        else:
+            new_cav[:, 0] = new_cav[:, N_phi - 2]
+            new_cav[:, N_phi - 1] = new_cav[:, 1]
 
         flips = int(
             np.sum(new_cav[1:-1, 1:-1] != cav_mask[1:-1, 1:-1])
@@ -571,7 +670,7 @@ def solve_payvar_salant_cpu(
 
         if verbose:
             pde_res = _ps_pde_residual(
-                g, H, A, B, C, D, E, d_phi, N_Z, N_phi
+                g, H, A, B, C, D, E, d_phi, N_Z, N_phi, groove
             )
             maxP = float(np.maximum(g, 0.0).max())
             cav_frac = float(np.mean(g[1:-1, 1:-1] < 0.0))
