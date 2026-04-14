@@ -688,7 +688,7 @@ def solve_ausas_journal_dynamic_gpu(
     theta0=None,
     texture_relief=None,
     scheme: str = "rb",
-    check_every: int = 1,
+    check_every: int = 10,
     save_stride: Optional[int] = None,
     field_callback: Optional[Callable[[int, float, np.ndarray, np.ndarray], None]] = None,
     verbose: bool = False,
@@ -696,6 +696,20 @@ def solve_ausas_journal_dynamic_gpu(
     """
     Fully dynamical journal-bearing solver (Ausas, Jai, Buscaglia 2008,
     Table 2 / Section 5).
+
+    Phase-4.1 performance notes
+    ---------------------------
+    The inner loop keeps the entire (W_X, W_Y, X_k, Y_k, U, V) pipeline on
+    the GPU — no host sync per inner iteration. Host transfers are only
+    taken when a residual is actually being computed (every `check_every`
+    inner iterations plus the first three). Gap H and coefficients
+    A, B, C, D, E are rebuilt by dedicated single-launch RawKernels
+    (`build_gap_inplace`, `build_coefficients_inplace`) instead of a
+    multi-op CuPy pipeline. The RB-snapshot `P_new[:] = P_old` is only
+    taken when the residual check will actually read from P_new.
+
+    None of these change the Ausas discretization — they only reduce
+    kernel-launch count and GPU->host synchronisations.
 
     The shaft position (X, Y) is an unknown, determined together with the
     pressure / cavitation fields. Per time step n, every inner iteration:
@@ -783,15 +797,15 @@ def solve_ausas_journal_dynamic_gpu(
     D = cp.empty(shape, dtype=cp.float64)
     E = cp.empty(shape, dtype=cp.float64)
 
-    # --- Initial state ---
-    X = float(X0)
-    Y = float(Y0)
-    U = float(U0)
-    V = float(V0)
+    # --- Initial state (state lives on device after this point) ---
+    X_dev = cp.array(float(X0), dtype=cp.float64)
+    Y_dev = cp.array(float(Y0), dtype=cp.float64)
+    U_dev = cp.array(float(U0), dtype=cp.float64)
+    V_dev = cp.array(float(V0), dtype=cp.float64)
 
-    _build_gap_inplace(H_prev, X, Y, cos_phi_1d, sin_phi_1d, texture_gpu)
-    # Periodic phi is already exact from the shifted sampling above.
-    # Apply a defensive pack anyway (cheap).
+    # Initial gap from the host-scalar X0/Y0 (one-off, not in hot loop).
+    _build_gap_inplace(H_prev, float(X0), float(Y0),
+                       cos_phi_1d, sin_phi_1d, texture_gpu)
     _pack_ghosts(H_prev, periodic_phi=True, periodic_z=False)
 
     if P0 is None:
@@ -819,6 +833,8 @@ def solve_ausas_journal_dynamic_gpu(
         p_z0=0.0, p_zL=p_a,
         theta_z0=1.0, theta_zL=1.0,
     )
+    # P_new / theta_new are only used by RB as a pre-sweep snapshot for
+    # the residual check; by Jacobi as the "new iterate" target buffer.
     P_new[:] = P_old
     theta_new[:] = theta_old
 
@@ -831,7 +847,41 @@ def solve_ausas_journal_dynamic_gpu(
         rb_kernel = None
     bc_phi_kernel = get_unsteady_ausas_bc_phi_kernel()
     bc_z_kernel = get_unsteady_ausas_bc_z_kernel()
+    # Phase 4.1 kernels (single-launch gap + coeffs rebuild).
+    from reynolds_solver.cavitation.ausas.kernels_dynamic import (
+        get_build_coefficients_kernel,
+        get_build_gap_kernel,
+    )
+    build_coeffs_kernel = get_build_coefficients_kernel()
+    build_gap_kernel = get_build_gap_kernel()
+
     block, grid, bc_block, bc_grid_phi, bc_grid_z = _launch_configs(N_Z, N_phi)
+    # Grid covering the FULL (N_Z, N_phi) shape for the helper kernels.
+    full_grid = (
+        (N_phi + block[0] - 1) // block[0],
+        (N_Z + block[1] - 1) // block[1],
+        1,
+    )
+
+    # Helper kernel wants a valid texture pointer even when no texture is
+    # set; allocate a full-size zero buffer (single ~32 kB alloc) and pass
+    # has_texture = 0 so the kernel branch skips the load.
+    if texture_gpu is None:
+        texture_for_kernel = cp.zeros(shape, dtype=cp.float64)
+        has_texture_flag = 0
+    else:
+        texture_for_kernel = texture_gpu
+        has_texture_flag = 1
+
+    # Precomputed Python scalars used in the inner loop (host, broadcast
+    # into device expressions for free).
+    alpha_sq = (2.0 * R / L * d_phi / d_Z) ** 2
+    dt_sq_half = (dt * dt) / (2.0 * mass_M)
+    dt_over_M = dt / mass_M
+    d_phi_d_Z = d_phi * d_Z
+    # Views of the cos/sin over the interior for the force integrals.
+    cos_phi_interior = cos_phi_1d[1:-1]
+    sin_phi_interior = sin_phi_1d[1:-1]
 
     # --- History arrays ---
     t_hist = np.empty(NT, dtype=np.float64)
@@ -851,54 +901,75 @@ def solve_ausas_journal_dynamic_gpu(
     if save_stride is not None and save_stride > 0:
         checkpoints = {0: (cp.asnumpy(P_old), cp.asnumpy(theta_old))}
 
-    # Shorthand for the force-integral normalisation.
-    # Sum is over INTERIOR cells so we don't double-count ghost wraps.
-    def _compute_forces(Parr):
-        inner = Parr[1:-1, 1:-1]
-        cx = cos_phi_1d[1:-1][None, :]
-        sx = sin_phi_1d[1:-1][None, :]
-        WX = float(d_phi * d_Z * cp.sum(inner * cx))
-        WY = float(d_phi * d_Z * cp.sum(inner * sx))
-        return WX, WY
-
     # --- Time loop ---
+    # Running values of WX, WY held on device; initialised to 0 for the
+    # first step's "before any iteration" diagnostic.
+    WX_dev = cp.array(0.0, dtype=cp.float64)
+    WY_dev = cp.array(0.0, dtype=cp.float64)
+
     for n in range(1, NT + 1):
         t_n = n * dt
         WaX_n, WaY_n = load_fn(t_n)
         WaX_n = float(WaX_n)
         WaY_n = float(WaY_n)
 
-        # Freeze c_prev from the previous converged state.
+        # Freeze c_prev = theta^{n-1} * h^{n-1}.
         cp.multiply(theta_old, H_prev, out=C_prev)
 
-        # Iterative predictor: X_k evolves along with the pressure field.
-        X_k = X
-        Y_k = Y
-        X_k_prev = X_k
-        Y_k_prev = Y_k
+        # Iterative predictor, all on device.
+        # Start with X_k = X, Y_k = Y (no iteration yet).
+        X_k_dev = X_dev
+        Y_k_dev = Y_dev
+        X_k_prev_dev = X_dev
+        Y_k_prev_dev = Y_dev
 
         residual = float("inf")
         converged = False
         k_done = 0
-        WX = 0.0
-        WY = 0.0
 
         for k in range(max_inner):
-            # (1) Forces from the CURRENT P iterate.
-            WX, WY = _compute_forces(P_old)
+            check_iter = (k % check_every == 0) or (k < 3)
 
-            # (2) Predict shaft position with Newmark-type update.
-            X_k = X + dt * U + (dt * dt) / (2.0 * mass_M) * (WX + WaX_n)
-            Y_k = Y + dt * V + (dt * dt) / (2.0 * mass_M) * (WY + WaY_n)
+            # Snapshot BEFORE the sweep, for RB post-sweep residual.
+            # Jacobi writes to P_new in the kernel itself, no snapshot
+            # needed. Skipping this full-field copy on non-check iters
+            # is the bandwidth win that motivates Opt 2.
+            if check_iter and scheme == "rb":
+                P_new[:] = P_old
+                theta_new[:] = theta_old
 
-            # (3) Rebuild gap for this predicted position.
-            _build_gap_inplace(H_curr, X_k, Y_k, cos_phi_1d, sin_phi_1d, texture_gpu)
-            # Ghosts are exact by construction, but pack defensively.
-            _pack_ghosts(H_curr, periodic_phi=True, periodic_z=False)
+            # (1) Hydrodynamic forces — reductions stay on device (0-d).
+            WX_dev = d_phi_d_Z * cp.sum(P_old[1:-1, 1:-1] * cos_phi_interior[None, :])
+            WY_dev = d_phi_d_Z * cp.sum(P_old[1:-1, 1:-1] * sin_phi_interior[None, :])
 
-            # (4) Rebuild stencil coefficients.
-            A[:], B[:], C[:], D[:], E[:] = _build_coefficients_gpu(
-                H_curr, d_phi, d_Z, R, L
+            # (2) Newmark predictor — device 0-d arithmetic.
+            X_k_dev = X_dev + dt * U_dev + dt_sq_half * (WX_dev + WaX_n)
+            Y_k_dev = Y_dev + dt * V_dev + dt_sq_half * (WY_dev + WaY_n)
+
+            # (3) Rebuild gap via single-launch kernel; reads X_k_dev,
+            # Y_k_dev as device pointers (no host sync).
+            build_gap_kernel(
+                full_grid, block,
+                (
+                    H_curr, X_k_dev, Y_k_dev,
+                    cos_phi_1d, sin_phi_1d,
+                    texture_for_kernel,
+                    np.int32(N_Z), np.int32(N_phi),
+                    np.int32(has_texture_flag),
+                ),
+            )
+            # Ghost pack is exact by construction (cos/sin sampled at
+            # shifted positions), so the defensive _pack_ghosts call
+            # that was needed for the CuPy expression builder is gone.
+
+            # (4) Rebuild coefficients A..E via single-launch kernel.
+            build_coeffs_kernel(
+                full_grid, block,
+                (
+                    H_curr, A, B, C, D, E,
+                    np.float64(alpha_sq),
+                    np.int32(N_Z), np.int32(N_phi),
+                ),
             )
 
             # (5) + (6) One relaxation sweep + BC.
@@ -912,7 +983,7 @@ def solve_ausas_journal_dynamic_gpu(
                         np.float64(dt), np.float64(alpha),
                         np.float64(omega_p), np.float64(omega_theta),
                         np.int32(N_Z), np.int32(N_phi),
-                        np.int32(1), np.int32(0),   # periodic_phi=1, periodic_z=0
+                        np.int32(1), np.int32(0),
                     ),
                 )
                 _launch_bc(
@@ -948,52 +1019,52 @@ def solve_ausas_journal_dynamic_gpu(
                     )
             k_done = k + 1
 
-            # (7) Convergence measurement (L2 field norms + scalar shaft
-            #     position deltas, per Table 2 of the paper).
-            if k % check_every == 0 or k < 3:
+            # (7) Convergence measurement (only on check iters).
+            if check_iter:
                 if scheme == "jacobi":
-                    dP = float(cp.sqrt(cp.sum((P_new - P_old) ** 2)))
-                    dth = float(cp.sqrt(cp.sum((theta_new - theta_old) ** 2)))
+                    dP_dev = cp.sqrt(cp.sum((P_new - P_old) ** 2))
+                    dth_dev = cp.sqrt(cp.sum((theta_new - theta_old) ** 2))
                 else:
-                    dP = float(cp.sqrt(cp.sum((P_old - P_new) ** 2)))
-                    dth = float(cp.sqrt(cp.sum((theta_old - theta_new) ** 2)))
-                dX = abs(X_k - X_k_prev)
-                dY = abs(Y_k - Y_k_prev)
-                residual = dP + dth + dX + dY
+                    dP_dev = cp.sqrt(cp.sum((P_old - P_new) ** 2))
+                    dth_dev = cp.sqrt(cp.sum((theta_old - theta_new) ** 2))
+                dX_dev = cp.abs(X_k_dev - X_k_prev_dev)
+                dY_dev = cp.abs(Y_k_dev - Y_k_prev_dev)
+                # Single host sync per check (was 2 per iter before).
+                residual = float(dP_dev + dth_dev + dX_dev + dY_dev)
                 if residual < tol_inner and k > 2:
                     converged = True
 
-            # (8) Swap / snapshot.
+            # (8) Jacobi swap (no snapshot).
             if scheme == "jacobi":
                 P_old, P_new = P_new, P_old
                 theta_old, theta_new = theta_new, theta_old
-            else:
-                P_new[:] = P_old
-                theta_new[:] = theta_old
 
-            X_k_prev = X_k
-            Y_k_prev = Y_k
+            # Save current X_k for next iteration's |dX|/|dY| measure.
+            # Rename-only: the old object stays alive as X_k_prev_dev
+            # until the next rename overwrites it, then is GC'd.
+            X_k_prev_dev = X_k_dev
+            Y_k_prev_dev = Y_k_dev
 
             if converged:
                 break
 
-        # End-of-step velocity update using the CONVERGED W_X, W_Y.
-        U = U + dt / mass_M * (WX + WaX_n)
-        V = V + dt / mass_M * (WY + WaY_n)
-        X = X_k
-        Y = Y_k
+        # End-of-step velocity / position update — stays on device.
+        U_dev = U_dev + dt_over_M * (WX_dev + WaX_n)
+        V_dev = V_dev + dt_over_M * (WY_dev + WaY_n)
+        X_dev = X_k_dev
+        Y_dev = Y_k_dev
 
-        # Advance H_prev <- H_curr (buffer swap) for the next step's c_prev.
+        # Advance H_prev <- H_curr (buffer swap).
         H_prev, H_curr = H_curr, H_prev
 
-        # --- Scalar history ---
+        # --- Scalar history: transfer to host ONCE per step, not per iter.
         t_hist[n - 1] = t_n
-        X_hist[n - 1] = X
-        Y_hist[n - 1] = Y
-        U_hist[n - 1] = U
-        V_hist[n - 1] = V
-        WX_hist[n - 1] = WX
-        WY_hist[n - 1] = WY
+        X_hist[n - 1] = float(X_dev)
+        Y_hist[n - 1] = float(Y_dev)
+        U_hist[n - 1] = float(U_dev)
+        V_hist[n - 1] = float(V_dev)
+        WX_hist[n - 1] = float(WX_dev)
+        WY_hist[n - 1] = float(WY_dev)
         p_max_hist[n - 1] = float(cp.max(P_old))
         h_min_hist[n - 1] = float(cp.min(H_prev[1:-1, 1:-1]))
         cav_hist[n - 1] = float(
@@ -1003,11 +1074,12 @@ def solve_ausas_journal_dynamic_gpu(
         conv_hist[n - 1] = converged
 
         if verbose and (n <= 3 or n % max(NT // 20, 1) == 0):
-            e_now = np.sqrt(X * X + Y * Y)
+            Xh = X_hist[n - 1]; Yh = Y_hist[n - 1]
+            e_now = np.sqrt(Xh * Xh + Yh * Yh)
             print(
                 f"  [step {n:>6d}/{NT}] t={t_n:.4f} "
-                f"X={X:+.3f} Y={Y:+.3f} e={e_now:.3f} "
-                f"WX={WX:+.2e} WY={WY:+.2e} "
+                f"X={Xh:+.3f} Y={Yh:+.3f} e={e_now:.3f} "
+                f"WX={WX_hist[n-1]:+.2e} WY={WY_hist[n-1]:+.2e} "
                 f"p_max={p_max_hist[n-1]:.3e} "
                 f"h_min={h_min_hist[n-1]:.3e} "
                 f"cav={cav_hist[n-1]:.3f} "

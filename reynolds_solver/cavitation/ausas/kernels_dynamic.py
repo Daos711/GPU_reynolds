@@ -385,6 +385,124 @@ _unsteady_ausas_kernel = None
 _unsteady_ausas_rb_kernel = None
 _unsteady_ausas_bc_phi_kernel = None
 _unsteady_ausas_bc_z_kernel = None
+_build_coefficients_kernel = None
+_build_gap_kernel = None
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.1 : in-place coefficient builder (average-of-cubes)
+# ---------------------------------------------------------------------------
+#
+# Computes A, B, C, D, E in a single kernel launch, writing directly to
+# preallocated output arrays. Replaces a ~17-op CuPy pipeline (H^3,
+# Ah, H_jph3, zeros allocs, slice assigns, E sum) that was called once
+# per inner iteration in the Stage-3 journal solver.
+#
+# Layout matches _build_coefficients_gpu exactly, including the ghost
+# -column fill-ins (A[:, -1] = Ah[:, 0], B[:, 0] = Ah[:, -1]) and the
+# zeroed Z-ghost rows for C, D.
+_BUILD_COEFFICIENTS_KERNEL_CODE = r"""
+extern "C" __global__ void build_coefficients_inplace(
+    const double* __restrict__ H,
+    double* __restrict__ A,
+    double* __restrict__ B,
+    double* __restrict__ C,
+    double* __restrict__ D,
+    double* __restrict__ E,
+    const double alpha_sq,
+    const int N_Z,
+    const int N_phi
+)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= N_Z || j >= N_phi) return;
+
+    int idx = i * N_phi + j;
+    double h = H[idx];
+    double h3 = h * h * h;
+
+    // A[i, j] : plus-phi face (between j and j+1).
+    double A_val;
+    if (j < N_phi - 1) {
+        double h_jp = H[i * N_phi + (j + 1)];
+        A_val = 0.5 * (h3 + h_jp * h_jp * h_jp);
+    } else {
+        // Ghost col at j = N_phi - 1: copy of Ah[:, 0].
+        double h0 = H[i * N_phi + 0];
+        double h1 = H[i * N_phi + 1];
+        A_val = 0.5 * (h0 * h0 * h0 + h1 * h1 * h1);
+    }
+    A[idx] = A_val;
+
+    // B[i, j] : minus-phi face (between j-1 and j).
+    double B_val;
+    if (j > 0) {
+        double h_jm = H[i * N_phi + (j - 1)];
+        B_val = 0.5 * (h_jm * h_jm * h_jm + h3);
+    } else {
+        // Ghost col at j = 0: copy of Ah[:, -1].
+        double hn2 = H[i * N_phi + (N_phi - 2)];
+        double hn1 = H[i * N_phi + (N_phi - 1)];
+        B_val = 0.5 * (hn2 * hn2 * hn2 + hn1 * hn1 * hn1);
+    }
+    B[idx] = B_val;
+
+    // C[i, j] : plus-Z face, alpha_sq-weighted. Interior only (else 0).
+    double C_val = 0.0;
+    if (i >= 1 && i <= N_Z - 2) {
+        double h_ip = H[(i + 1) * N_phi + j];
+        C_val = alpha_sq * 0.5 * (h3 + h_ip * h_ip * h_ip);
+    }
+    C[idx] = C_val;
+
+    // D[i, j] : minus-Z face, alpha_sq-weighted. Interior only (else 0).
+    double D_val = 0.0;
+    if (i >= 1 && i <= N_Z - 2) {
+        double h_im = H[(i - 1) * N_phi + j];
+        D_val = alpha_sq * 0.5 * (h_im * h_im * h_im + h3);
+    }
+    D[idx] = D_val;
+
+    E[idx] = A_val + B_val + C_val + D_val;
+}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.1 : in-place gap builder with DEVICE-scalar X, Y
+# ---------------------------------------------------------------------------
+#
+# Evaluates H[i, j] = 1 + X * cos_phi[j] + Y * sin_phi[j] [+ texture[i, j]]
+# in a single kernel launch. Accepts X and Y as 0-d device buffers so the
+# journal solver can keep the full (W_X -> X_k -> H) pipeline on GPU
+# without a host sync per inner iteration.
+_BUILD_GAP_KERNEL_CODE = r"""
+extern "C" __global__ void build_gap_inplace(
+    double* __restrict__ H_out,
+    const double* __restrict__ X_ptr,
+    const double* __restrict__ Y_ptr,
+    const double* __restrict__ cos_phi,
+    const double* __restrict__ sin_phi,
+    const double* __restrict__ texture,
+    const int N_Z,
+    const int N_phi,
+    const int has_texture
+)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= N_Z || j >= N_phi) return;
+
+    double X = X_ptr[0];
+    double Y = Y_ptr[0];
+    double h = 1.0 + X * cos_phi[j] + Y * sin_phi[j];
+    if (has_texture) {
+        h += texture[i * N_phi + j];
+    }
+    H_out[i * N_phi + j] = h;
+}
+"""
 
 
 def get_unsteady_ausas_kernel():
@@ -425,6 +543,26 @@ def get_unsteady_ausas_bc_z_kernel():
             _UNSTEADY_AUSAS_BC_Z_KERNEL_CODE, "unsteady_ausas_bc_z"
         )
     return _unsteady_ausas_bc_z_kernel
+
+
+def get_build_coefficients_kernel():
+    """Returns compiled CUDA in-place coefficient builder kernel (cached)."""
+    global _build_coefficients_kernel
+    if _build_coefficients_kernel is None:
+        _build_coefficients_kernel = cp.RawKernel(
+            _BUILD_COEFFICIENTS_KERNEL_CODE, "build_coefficients_inplace"
+        )
+    return _build_coefficients_kernel
+
+
+def get_build_gap_kernel():
+    """Returns compiled CUDA in-place gap builder kernel (cached)."""
+    global _build_gap_kernel
+    if _build_gap_kernel is None:
+        _build_gap_kernel = cp.RawKernel(
+            _BUILD_GAP_KERNEL_CODE, "build_gap_inplace"
+        )
+    return _build_gap_kernel
 
 
 # Back-compat helper: old call site used a single BC kernel. Now we
