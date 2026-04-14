@@ -109,7 +109,7 @@ extern "C" __global__ void unsteady_ausas_step(
     double D_l = D_coeff[idx];
     double E_l = E_coeff[idx];
 
-    // Temporal coefficient β = 2 · dx1^2 / dt
+    // Temporal coefficient beta = 2 * dx1^2 / dt
     double beta = 2.0 * dx1 * dx1 / dt;
     double ad1  = alpha * dx1;
 
@@ -129,11 +129,11 @@ extern "C" __global__ void unsteady_ausas_step(
             th_cur = 1.0;
         } else {
             P_cur = 0.0;
-            // th_cur stays as th_old_ij — fall through to Branch 2
+            // th_cur stays as th_old_ij -- fall through to Branch 2
         }
     }
 
-    // ---- Branch 2 : θ update if cavitation or partial film ----
+    // ---- Branch 2 : theta update if cavitation or partial film ----
     if (P_cur <= 0.0 || th_cur < 1.0 - 1e-12) {
         double stencil_signed =
             A_l * Pjp + B_l * Pjm + C_l * Pip + D_l * Pim - E_l * P_cur;
@@ -186,7 +186,7 @@ extern "C" __global__ void unsteady_ausas_bc(
         theta[i * N_phi + (N_phi - 1)]  = theta[i * N_phi + 1];
     }
 
-    // Dirichlet Z-ends: prescribed P and θ.
+    // Dirichlet Z-ends: prescribed P and theta.
     if (tid < N_phi) {
         int j = tid;
         P[0 * N_phi + j]           = p_z0;
