@@ -1042,7 +1042,11 @@ def solve_ausas_journal_dynamic_gpu(
         #     lagged_mode_active = mech_update_every > 1) ---
         last_residual = float("inf")
         residual_at_last_refresh = float("inf")
-        cav_at_last_refresh = float("nan")
+        residual_updated_since_refresh = False   # prevents stall from
+        # firing immediately after a refresh (when last_residual is
+        # stale and equals residual_at_last_refresh by construction).
+        cav_at_last_check = float("nan")        # reference for drift
+        # detection BETWEEN check iters (no extra refresh-time sync).
         cav_jump_pending = False
         did_mech_refresh = False
 
@@ -1054,9 +1058,14 @@ def solve_ausas_journal_dynamic_gpu(
             #     this always fires and the guarded-refresh path
             #     collapses to the old code. ---
             if lagged_mode_active:
+                # Stall only fires if a FRESH residual measurement
+                # has been taken since the last refresh — otherwise
+                # last_residual == residual_at_last_refresh by
+                # construction and the test would spuriously fire.
                 residual_stalled = (
                     stall_enabled
                     and did_mech_refresh
+                    and residual_updated_since_refresh
                     and np.isfinite(last_residual)
                     and np.isfinite(residual_at_last_refresh)
                     and last_residual > stall_ratio * residual_at_last_refresh
@@ -1106,19 +1115,14 @@ def solve_ausas_journal_dynamic_gpu(
                         np.int32(N_Z), np.int32(N_phi),
                     ),
                 )
-                # Refresh bookkeeping (cheap host scalars).
+                # Refresh bookkeeping (cheap host scalars only — no
+                # GPU->host sync here; cav drift is tracked at
+                # check_iter instead).
                 if lagged_mode_active:
                     residual_at_last_refresh = last_residual
+                    residual_updated_since_refresh = False
                     cav_jump_pending = False
                     did_mech_refresh = True
-                    if cav_jump_enabled:
-                        # Capture current cav to measure future drift
-                        # at check_iters. One extra sync per refresh.
-                        cav_at_last_refresh = float(
-                            cp.mean(
-                                (theta_old < 1.0 - 1e-6).astype(cp.float64)
-                            )
-                        )
 
             # (5) + (6) One relaxation sweep + BC.
             if scheme == "jacobi":
@@ -1180,25 +1184,25 @@ def solve_ausas_journal_dynamic_gpu(
                 # Single host sync per check (was 2 per iter before).
                 residual = float(dP_dev + dth_dev + dX_dev + dY_dev)
                 last_residual = residual
+                residual_updated_since_refresh = True
                 if residual < tol_inner and k > 2:
                     converged = True
 
-                # Cav-jump guard (lagged mode only): one extra sync
-                # per check iter to decide whether mechanics drifted
-                # enough to warrant an out-of-schedule refresh.
-                if (
-                    lagged_mode_active
-                    and cav_jump_enabled
-                    and did_mech_refresh
-                    and np.isfinite(cav_at_last_refresh)
-                ):
+                # Cav-jump guard (lagged mode only): add ONE extra
+                # sync per check_iter (not per iter, not per refresh)
+                # to detect cav drift BETWEEN check iters.
+                if lagged_mode_active and cav_jump_enabled:
                     cav_now = float(
                         cp.mean(
                             (theta_old < 1.0 - 1e-6).astype(cp.float64)
                         )
                     )
-                    if abs(cav_now - cav_at_last_refresh) > cav_tol:
+                    if (
+                        np.isfinite(cav_at_last_check)
+                        and abs(cav_now - cav_at_last_check) > cav_tol
+                    ):
                         cav_jump_pending = True
+                    cav_at_last_check = cav_now
 
             # (8) Jacobi swap (no snapshot).
             if scheme == "jacobi":
