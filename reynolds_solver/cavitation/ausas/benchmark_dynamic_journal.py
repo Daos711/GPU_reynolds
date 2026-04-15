@@ -119,7 +119,6 @@ def run_journal_benchmark(
     max_inner: int = 5000,
     scheme: str = "rb",
     state=None,
-    accel=None,
     verbose: bool = False,
 ) -> JournalBenchmarkResult:
     """
@@ -154,7 +153,6 @@ def run_journal_benchmark(
         tol_inner=tol_inner, max_inner=max_inner,
         scheme=scheme,
         state=state,
-        accel=accel,
         verbose=verbose,
     )
 

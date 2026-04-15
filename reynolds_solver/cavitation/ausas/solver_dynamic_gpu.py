@@ -32,7 +32,6 @@ from reynolds_solver.cavitation.ausas.kernels_dynamic import (
     get_unsteady_ausas_bc_z_kernel,
 )
 from reynolds_solver.cavitation.ausas.state_io import AusasState
-from reynolds_solver.cavitation.ausas.accel_options import AusasAccelerationOptions
 
 
 # ===========================================================================
@@ -737,7 +736,6 @@ def solve_ausas_journal_dynamic_gpu(
     save_stride: Optional[int] = None,
     field_callback: Optional[Callable[[int, float, np.ndarray, np.ndarray], None]] = None,
     state: Optional[AusasState] = None,
-    accel: Optional[AusasAccelerationOptions] = None,
     verbose: bool = False,
 ) -> AusasTransientResult:
     """
@@ -753,17 +751,6 @@ def solve_ausas_journal_dynamic_gpu(
     the user's load_fn sees a continuous time axis across restarts.
     Histories use global times. `result.final_state` is the state
     snapshot ready to be passed to a subsequent call.
-
-    Acceleration (Phase 5 Part 1 — lagged mechanics)
-    ------------------------------------------------
-    `accel=AusasAccelerationOptions(mech_update_every=K, ...)` switches
-    the inner loop to lagged-mechanics mode: forces, Newmark predictor,
-    gap H and coefficients A..E are rebuilt only every K iterations,
-    while the RB/Jacobi sweep runs every iteration. Guards force an
-    out-of-schedule refresh when the residual stalls, the cavitation
-    fraction jumps, or the loop is approaching max_inner. Leaving
-    `accel=None` (or `mech_update_every=1`) preserves the baseline
-    behaviour bit-for-bit.
 
     Phase-4.1 performance notes
     ---------------------------
@@ -941,13 +928,21 @@ def solve_ausas_journal_dynamic_gpu(
         rb_kernel = None
     bc_phi_kernel = get_unsteady_ausas_bc_phi_kernel()
     bc_z_kernel = get_unsteady_ausas_bc_z_kernel()
-    # Phase 4.1 kernels (single-launch gap + coeffs rebuild).
+    # Phase 4.1 / 5.1B kernels (single-launch gap, coeffs, forces,
+    # predictor rebuilds).
     from reynolds_solver.cavitation.ausas.kernels_dynamic import (
         get_build_coefficients_kernel,
         get_build_gap_kernel,
+        get_forces_reduce_kernel,
+        get_newmark_predictor_kernel,
     )
     build_coeffs_kernel = get_build_coefficients_kernel()
     build_gap_kernel = get_build_gap_kernel()
+    forces_kernel = get_forces_reduce_kernel()
+    predictor_kernel = get_newmark_predictor_kernel()
+    # Single-block reduction for the forces kernel. 256 threads is
+    # plenty for all realistic grids (<= ~64k interior cells).
+    forces_block = (256, 1, 1)
 
     block, grid, bc_block, bc_grid_phi, bc_grid_z = _launch_configs(N_Z, N_phi)
     # Grid covering the FULL (N_Z, N_phi) shape for the helper kernels.
@@ -997,25 +992,17 @@ def solve_ausas_journal_dynamic_gpu(
     if save_stride is not None and save_stride > 0:
         checkpoints = {0: (cp.asnumpy(P_old), cp.asnumpy(theta_old))}
 
-    # --- Acceleration options (Phase 5 Part 1) -----------------------
-    # None means "run the baseline code path". A provided dataclass
-    # with mech_update_every == 1 also reduces to baseline (need_refresh
-    # is True every iteration), but we still take the fast path so the
-    # host-side guard bookkeeping is skipped.
-    _accel = accel if accel is not None else AusasAccelerationOptions()
-    mech_K = max(1, int(_accel.mech_update_every))
-    lagged_mode_active = mech_K > 1
-    mech_force_first = int(_accel.mech_force_first_iters)
-    stall_enabled = bool(_accel.mech_force_if_residual_stalls)
-    cav_jump_enabled = bool(_accel.mech_force_if_cav_jumps)
-    stall_ratio = float(_accel.mech_residual_stall_ratio)
-    cav_tol = float(_accel.mech_cav_jump_tol)
-
-    # --- Time loop ---
-    # Running values of WX, WY held on device; initialised to 0 for the
-    # first step's "before any iteration" diagnostic.
+    # --- Preallocated 0-d device buffers for the fused predictor +
+    #     forces kernels (Phase 5 Part 1 variant B). Using ping-pong
+    #     buffers for X_k / Y_k keeps the old-iter value alive for the
+    #     residual check while the new value is being written by the
+    #     predictor. WX, WY are overwritten in place each iter. ---
     WX_dev = cp.array(0.0, dtype=cp.float64)
     WY_dev = cp.array(0.0, dtype=cp.float64)
+    X_k_buf_a = cp.empty((), dtype=cp.float64)
+    X_k_buf_b = cp.empty((), dtype=cp.float64)
+    Y_k_buf_a = cp.empty((), dtype=cp.float64)
+    Y_k_buf_b = cp.empty((), dtype=cp.float64)
 
     for step in range(1, NT + 1):
         n = n_offset + step                   # global step index
@@ -1027,102 +1014,79 @@ def solve_ausas_journal_dynamic_gpu(
         # Freeze c_prev = theta^{n-1} * h^{n-1}.
         cp.multiply(theta_old, H_prev, out=C_prev)
 
-        # Iterative predictor, all on device.
-        # Start with X_k = X, Y_k = Y (no iteration yet).
-        X_k_dev = X_dev
-        Y_k_dev = Y_dev
-        X_k_prev_dev = X_dev
-        Y_k_prev_dev = Y_dev
+        # Ping-pong X_k / Y_k 0-d buffers: X_k_prev_dev keeps the value
+        # from the previous inner iteration alive for the residual
+        # check, X_k_dev is what the fused Newmark predictor writes
+        # into this iteration.
+        X_k_prev_dev = X_k_buf_a
+        X_k_dev = X_k_buf_b
+        Y_k_prev_dev = Y_k_buf_a
+        Y_k_dev = Y_k_buf_b
+        # Seed the prev buffer with this step's starting (X, Y) (one
+        # scalar copy per axis, per step — negligible).
+        X_k_prev_dev[...] = X_dev
+        Y_k_prev_dev[...] = Y_dev
 
         residual = float("inf")
         converged = False
         k_done = 0
 
-        # --- Lagged-mechanics bookkeeping (only non-trivial when
-        #     lagged_mode_active = mech_update_every > 1) ---
-        last_residual = float("inf")
-        residual_at_last_refresh = float("inf")
-        residual_updated_since_refresh = False   # prevents stall from
-        # firing immediately after a refresh (when last_residual is
-        # stale and equals residual_at_last_refresh by construction).
-        cav_at_last_check = float("nan")        # reference for drift
-        # detection BETWEEN check iters (no extra refresh-time sync).
-        cav_jump_pending = False
-        did_mech_refresh = False
-
         for k in range(max_inner):
             check_iter = (k % check_every == 0) or (k < 3)
-
-            # --- Decide whether mechanics (forces, predictor, H, A..E)
-            #     get rebuilt this iteration. In baseline mode (K=1)
-            #     this always fires and the guarded-refresh path
-            #     collapses to the old code. ---
-            if lagged_mode_active:
-                # Stall only fires if a FRESH residual measurement
-                # has been taken since the last refresh — otherwise
-                # last_residual == residual_at_last_refresh by
-                # construction and the test would spuriously fire.
-                residual_stalled = (
-                    stall_enabled
-                    and did_mech_refresh
-                    and residual_updated_since_refresh
-                    and np.isfinite(last_residual)
-                    and np.isfinite(residual_at_last_refresh)
-                    and last_residual > stall_ratio * residual_at_last_refresh
-                )
-                need_refresh = (
-                    k < mech_force_first
-                    or (k % mech_K == 0)
-                    or residual_stalled
-                    or cav_jump_pending
-                    or k >= max_inner - 3
-                )
-            else:
-                need_refresh = True
 
             # Snapshot BEFORE the sweep, for RB post-sweep residual.
             if check_iter and scheme == "rb":
                 P_new[:] = P_old
                 theta_new[:] = theta_old
 
-            # --- Mechanics (1)-(4): executed only on refresh iters. ---
-            if need_refresh:
-                # (1) Hydrodynamic forces — device 0-d reductions.
-                WX_dev = d_phi_d_Z * cp.sum(P_old[1:-1, 1:-1] * cos_phi_interior[None, :])
-                WY_dev = d_phi_d_Z * cp.sum(P_old[1:-1, 1:-1] * sin_phi_interior[None, :])
+            # (1) Hydrodynamic forces — single fused kernel writes WX,
+            # WY into preallocated 0-d device buffers (1 launch
+            # replaces ~4 CuPy ops).
+            forces_kernel(
+                (1, 1, 1), forces_block,
+                (
+                    P_old, cos_phi_1d, sin_phi_1d,
+                    WX_dev, WY_dev,
+                    np.float64(d_phi_d_Z),
+                    np.int32(N_Z), np.int32(N_phi),
+                ),
+                shared_mem=2 * forces_block[0] * 8,
+            )
 
-                # (2) Newmark predictor — device 0-d arithmetic.
-                X_k_dev = X_dev + dt * U_dev + dt_sq_half * (WX_dev + WaX_n)
-                Y_k_dev = Y_dev + dt * V_dev + dt_sq_half * (WY_dev + WaY_n)
+            # (2) Newmark predictor — single fused kernel writes X_k,
+            # Y_k into the ping-pong buffers (1 launch replaces ~8
+            # CuPy scalar ops).
+            predictor_kernel(
+                (1, 1, 1), (1, 1, 1),
+                (
+                    X_dev, Y_dev, U_dev, V_dev,
+                    WX_dev, WY_dev,
+                    X_k_dev, Y_k_dev,
+                    np.float64(dt), np.float64(dt_sq_half),
+                    np.float64(WaX_n), np.float64(WaY_n),
+                ),
+            )
 
-                # (3) Rebuild gap via single-launch kernel.
-                build_gap_kernel(
-                    full_grid, block,
-                    (
-                        H_curr, X_k_dev, Y_k_dev,
-                        cos_phi_1d, sin_phi_1d,
-                        texture_for_kernel,
-                        np.int32(N_Z), np.int32(N_phi),
-                        np.int32(has_texture_flag),
-                    ),
-                )
-                # (4) Rebuild coefficients A..E via single-launch kernel.
-                build_coeffs_kernel(
-                    full_grid, block,
-                    (
-                        H_curr, A, B, C, D, E,
-                        np.float64(alpha_sq),
-                        np.int32(N_Z), np.int32(N_phi),
-                    ),
-                )
-                # Refresh bookkeeping (cheap host scalars only — no
-                # GPU->host sync here; cav drift is tracked at
-                # check_iter instead).
-                if lagged_mode_active:
-                    residual_at_last_refresh = last_residual
-                    residual_updated_since_refresh = False
-                    cav_jump_pending = False
-                    did_mech_refresh = True
+            # (3) Rebuild gap via single-launch kernel.
+            build_gap_kernel(
+                full_grid, block,
+                (
+                    H_curr, X_k_dev, Y_k_dev,
+                    cos_phi_1d, sin_phi_1d,
+                    texture_for_kernel,
+                    np.int32(N_Z), np.int32(N_phi),
+                    np.int32(has_texture_flag),
+                ),
+            )
+            # (4) Rebuild coefficients A..E via single-launch kernel.
+            build_coeffs_kernel(
+                full_grid, block,
+                (
+                    H_curr, A, B, C, D, E,
+                    np.float64(alpha_sq),
+                    np.int32(N_Z), np.int32(N_phi),
+                ),
+            )
 
             # (5) + (6) One relaxation sweep + BC.
             if scheme == "jacobi":
@@ -1183,46 +1147,35 @@ def solve_ausas_journal_dynamic_gpu(
                 dY_dev = cp.abs(Y_k_dev - Y_k_prev_dev)
                 # Single host sync per check (was 2 per iter before).
                 residual = float(dP_dev + dth_dev + dX_dev + dY_dev)
-                last_residual = residual
-                residual_updated_since_refresh = True
                 if residual < tol_inner and k > 2:
                     converged = True
-
-                # Cav-jump guard (lagged mode only): add ONE extra
-                # sync per check_iter (not per iter, not per refresh)
-                # to detect cav drift BETWEEN check iters.
-                if lagged_mode_active and cav_jump_enabled:
-                    cav_now = float(
-                        cp.mean(
-                            (theta_old < 1.0 - 1e-6).astype(cp.float64)
-                        )
-                    )
-                    if (
-                        np.isfinite(cav_at_last_check)
-                        and abs(cav_now - cav_at_last_check) > cav_tol
-                    ):
-                        cav_jump_pending = True
-                    cav_at_last_check = cav_now
 
             # (8) Jacobi swap (no snapshot).
             if scheme == "jacobi":
                 P_old, P_new = P_new, P_old
                 theta_old, theta_new = theta_new, theta_old
 
-            # Save current X_k for next iteration's |dX|/|dY| measure.
-            # Rename-only: the old object stays alive as X_k_prev_dev
-            # until the next rename overwrites it, then is GC'd.
-            X_k_prev_dev = X_k_dev
-            Y_k_prev_dev = Y_k_dev
-
             if converged:
                 break
+
+            # Swap ping-pong buffers for the NEXT iteration. After the
+            # swap X_k_prev_dev points to the buffer we just wrote
+            # (holding this iter's X_k value), and X_k_dev points to
+            # the buffer whose contents we're free to overwrite with
+            # next iter's predictor output. Break happens BEFORE the
+            # swap so that outside the loop X_k_dev still points to
+            # the latest predictor output.
+            X_k_prev_dev, X_k_dev = X_k_dev, X_k_prev_dev
+            Y_k_prev_dev, Y_k_dev = Y_k_dev, Y_k_prev_dev
 
         # End-of-step velocity / position update — stays on device.
         U_dev = U_dev + dt_over_M * (WX_dev + WaX_n)
         V_dev = V_dev + dt_over_M * (WY_dev + WaY_n)
-        X_dev = X_k_dev
-        Y_dev = Y_k_dev
+        # Copy latest X_k / Y_k VALUES into dedicated X_dev / Y_dev
+        # buffers so the ping-pong buffers can be reused next step
+        # without aliasing.
+        X_dev[...] = X_k_dev
+        Y_dev[...] = Y_k_dev
 
         # Advance H_prev <- H_curr (buffer swap).
         H_prev, H_curr = H_curr, H_prev

@@ -387,6 +387,8 @@ _unsteady_ausas_bc_phi_kernel = None
 _unsteady_ausas_bc_z_kernel = None
 _build_coefficients_kernel = None
 _build_gap_kernel = None
+_forces_reduce_kernel = None
+_newmark_predictor_kernel = None
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +565,131 @@ def get_build_gap_kernel():
             _BUILD_GAP_KERNEL_CODE, "build_gap_inplace"
         )
     return _build_gap_kernel
+
+
+# ---------------------------------------------------------------------------
+# Phase 5.1B : fused hydrodynamic-forces reduction (single kernel)
+# ---------------------------------------------------------------------------
+#
+# Baseline code did
+#     WX = d_phi_d_Z * cp.sum(P[1:-1, 1:-1] * cos_phi[1:-1][None, :])
+#     WY = d_phi_d_Z * cp.sum(P[1:-1, 1:-1] * sin_phi[1:-1][None, :])
+# which launches 4-6 CuPy kernels per inner iteration (two element-wise
+# multiplications, two reductions, two scalar multiplies). This single
+# kernel performs the entire "elementwise multiply + reduce + scale"
+# pipeline in one launch, writing directly into preallocated 0-d output
+# buffers WX_out[0] and WY_out[0].
+#
+# Launch config: ONE block, 256 threads, shared memory = 2 * 256 * 8 B.
+# The grid is small (max ~65k interior cells in any realistic run),
+# so a single-block tree reduction is plenty.
+_FORCES_REDUCE_KERNEL_CODE = r"""
+extern "C" __global__ void forces_reduce_cos_sin(
+    const double* __restrict__ P,
+    const double* __restrict__ cos_phi,
+    const double* __restrict__ sin_phi,
+    double* __restrict__ WX_out,
+    double* __restrict__ WY_out,
+    const double scale,
+    const int N_Z,
+    const int N_phi
+)
+{
+    extern __shared__ double s_buf[];
+    double* s_wx = s_buf;
+    double* s_wy = s_buf + blockDim.x;
+
+    int tid = threadIdx.x;
+    int bs = blockDim.x;
+    int N_i = N_Z - 2;
+    int N_j = N_phi - 2;
+    int total = N_i * N_j;
+
+    double wx = 0.0;
+    double wy = 0.0;
+    for (int idx = tid; idx < total; idx += bs) {
+        int ii = idx / N_j;
+        int jj = idx - ii * N_j;
+        int i = 1 + ii;
+        int j = 1 + jj;
+        double p_val = P[i * N_phi + j];
+        wx += p_val * cos_phi[j];
+        wy += p_val * sin_phi[j];
+    }
+    s_wx[tid] = wx;
+    s_wy[tid] = wy;
+    __syncthreads();
+
+    for (int s = bs >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_wx[tid] += s_wx[tid + s];
+            s_wy[tid] += s_wy[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        WX_out[0] = s_wx[0] * scale;
+        WY_out[0] = s_wy[0] * scale;
+    }
+}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Phase 5.1B : fused Newmark predictor (single kernel, single thread)
+# ---------------------------------------------------------------------------
+#
+# Baseline code did
+#     X_k = X_prev + dt * U_prev + dt_sq_half * (WX + WaX)
+#     Y_k = Y_prev + dt * V_prev + dt_sq_half * (WY + WaY)
+# as chained CuPy 0-d arithmetic, which launches ~8 tiny kernels per
+# inner iteration. On Windows CUDA with ~15 us launch overhead this
+# was one of the two largest cost centres in the hot loop (Phase-4
+# profiling: 26.7 %). This single <<<1, 1>>> kernel reads WX, WY from
+# device pointers and writes X_k, Y_k into preallocated 0-d output
+# buffers in one launch.
+_NEWMARK_PREDICTOR_KERNEL_CODE = r"""
+extern "C" __global__ void newmark_predictor(
+    const double* __restrict__ X_prev,
+    const double* __restrict__ Y_prev,
+    const double* __restrict__ U_prev,
+    const double* __restrict__ V_prev,
+    const double* __restrict__ WX,
+    const double* __restrict__ WY,
+    double* __restrict__ X_k_out,
+    double* __restrict__ Y_k_out,
+    const double dt,
+    const double dt_sq_half,
+    const double WaX,
+    const double WaY
+)
+{
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        X_k_out[0] = X_prev[0] + dt * U_prev[0] + dt_sq_half * (WX[0] + WaX);
+        Y_k_out[0] = Y_prev[0] + dt * V_prev[0] + dt_sq_half * (WY[0] + WaY);
+    }
+}
+"""
+
+
+def get_forces_reduce_kernel():
+    """Returns compiled fused WX+WY reduction kernel (cached)."""
+    global _forces_reduce_kernel
+    if _forces_reduce_kernel is None:
+        _forces_reduce_kernel = cp.RawKernel(
+            _FORCES_REDUCE_KERNEL_CODE, "forces_reduce_cos_sin"
+        )
+    return _forces_reduce_kernel
+
+
+def get_newmark_predictor_kernel():
+    """Returns compiled fused Newmark predictor kernel (cached)."""
+    global _newmark_predictor_kernel
+    if _newmark_predictor_kernel is None:
+        _newmark_predictor_kernel = cp.RawKernel(
+            _NEWMARK_PREDICTOR_KERNEL_CODE, "newmark_predictor"
+        )
+    return _newmark_predictor_kernel
 
 
 # Back-compat helper: old call site used a single BC kernel. Now we
