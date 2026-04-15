@@ -1266,6 +1266,24 @@ def solve_ausas_journal_dynamic_gpu(
     Y_k_buf_a = cp.empty((), dtype=cp.float64)
     Y_k_buf_b = cp.empty((), dtype=cp.float64)
 
+    # --- Dynamic check cadence (Phase 5 Part 3) --------------------------
+    # When `accel.dynamic_check_every=True` the solver varies the
+    # residual-measurement cadence inside [check_every_min, check_every_max]
+    # based on the per-check residual drop ratio. When False (or no
+    # accel), the fixed `check_every` loop behaviour is preserved
+    # bit-for-bit.
+    _use_dynamic_check = (
+        accel is not None and getattr(accel, "dynamic_check_every", False)
+    )
+    if _use_dynamic_check:
+        _check_min = max(1, int(accel.check_every_min))
+        _check_max = max(_check_min, int(accel.check_every_max))
+        _check_every_init = min(max(check_every, _check_min), _check_max)
+    else:
+        _check_min = check_every
+        _check_max = check_every
+        _check_every_init = check_every
+
     # ==================================================================
     # Adaptive-dt branch (Phase 5 Part 2)
     # ==================================================================
@@ -1351,8 +1369,18 @@ def solve_ausas_journal_dynamic_gpu(
             converged = False
             k_done = 0
 
+            # Dynamic check-cadence bookkeeping (Phase 5.3). When
+            # `accel.dynamic_check_every=False` this degenerates to
+            # the fixed `check_every` behaviour.
+            _last_k_checked = -1
+            _last_residual_check = float("inf")
+            _check_cur = _check_every_init
+
             for k in range(max_inner):
-                check_iter = (k % check_every == 0) or (k < 3)
+                if _use_dynamic_check:
+                    check_iter = (k < 3) or (k - _last_k_checked >= _check_cur)
+                else:
+                    check_iter = (k % check_every == 0) or (k < 3)
                 if check_iter and scheme == "rb":
                     P_new[:] = P_old
                     theta_new[:] = theta_old
@@ -1457,6 +1485,21 @@ def solve_ausas_journal_dynamic_gpu(
                     dX_dev = cp.abs(X_k_dev - X_k_prev_dev)
                     dY_dev = cp.abs(Y_k_dev - Y_k_prev_dev)
                     residual = float(dP_dev + dth_dev + dX_dev + dY_dev)
+                    # Dynamic cadence adjustment (no-op if flag off).
+                    if _use_dynamic_check:
+                        if (
+                            _last_residual_check > 0.0
+                            and np.isfinite(_last_residual_check)
+                        ):
+                            drop = residual / _last_residual_check
+                            if drop < 0.5:
+                                # big drop: check LESS often
+                                _check_cur = min(_check_cur * 2, _check_max)
+                            elif drop > 0.9:
+                                # stall: check MORE often
+                                _check_cur = max(_check_cur // 2, _check_min)
+                        _last_residual_check = residual
+                        _last_k_checked = k
                     if residual < tol_inner and k > 2:
                         converged = True
 
@@ -1641,8 +1684,16 @@ def solve_ausas_journal_dynamic_gpu(
         converged = False
         k_done = 0
 
+        # Dynamic check-cadence bookkeeping (Phase 5.3).
+        _last_k_checked = -1
+        _last_residual_check = float("inf")
+        _check_cur = _check_every_init
+
         for k in range(max_inner):
-            check_iter = (k % check_every == 0) or (k < 3)
+            if _use_dynamic_check:
+                check_iter = (k < 3) or (k - _last_k_checked >= _check_cur)
+            else:
+                check_iter = (k % check_every == 0) or (k < 3)
 
             # Snapshot BEFORE the sweep, for RB post-sweep residual.
             if check_iter and scheme == "rb":
@@ -1757,6 +1808,18 @@ def solve_ausas_journal_dynamic_gpu(
                 dY_dev = cp.abs(Y_k_dev - Y_k_prev_dev)
                 # Single host sync per check (was 2 per iter before).
                 residual = float(dP_dev + dth_dev + dX_dev + dY_dev)
+                if _use_dynamic_check:
+                    if (
+                        _last_residual_check > 0.0
+                        and np.isfinite(_last_residual_check)
+                    ):
+                        drop = residual / _last_residual_check
+                        if drop < 0.5:
+                            _check_cur = min(_check_cur * 2, _check_max)
+                        elif drop > 0.9:
+                            _check_cur = max(_check_cur // 2, _check_min)
+                    _last_residual_check = residual
+                    _last_k_checked = k
                 if residual < tol_inner and k > 2:
                     converged = True
 
