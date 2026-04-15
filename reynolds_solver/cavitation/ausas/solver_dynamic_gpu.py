@@ -32,6 +32,7 @@ from reynolds_solver.cavitation.ausas.kernels_dynamic import (
     get_unsteady_ausas_bc_z_kernel,
 )
 from reynolds_solver.cavitation.ausas.state_io import AusasState
+from reynolds_solver.cavitation.ausas.accel_options import AusasAccelerationOptions
 
 
 # ===========================================================================
@@ -380,6 +381,7 @@ def solve_ausas_prescribed_h_gpu(
     check_every: int = 10,
     scheme: str = "rb",
     state: Optional[AusasState] = None,
+    accel: Optional["AusasAccelerationOptions"] = None,
     verbose: bool = False,
 ) -> AusasTransientResult:
     """
@@ -522,6 +524,246 @@ def solve_ausas_prescribed_h_gpu(
     if save_stride is not None and save_stride > 0:
         checkpoints = {0: (cp.asnumpy(P_old), cp.asnumpy(theta_old))}
 
+    # ==================================================================
+    # Adaptive-dt branch (Phase 5 Part 2)
+    # ==================================================================
+    if accel is not None and getattr(accel, "adaptive_dt", False):
+        import warnings
+
+        # (P, theta) rollback buffers.
+        P_rb_buf = cp.empty(shape, dtype=cp.float64)
+        theta_rb_buf = cp.empty(shape, dtype=cp.float64)
+
+        if state is not None and state.dt_last > 0.0:
+            dt_current = float(state.dt_last)
+        else:
+            dt_current = float(dt)
+        dt_current = min(max(dt_current, accel.dt_min), accel.dt_max)
+
+        t_hist_list: list = []
+        p_max_hist_list: list = []
+        h_min_hist_list: list = []
+        cav_hist_list: list = []
+        n_inner_hist_list: list = []
+        conv_hist_list: list = []
+        dt_hist_list: list = []
+
+        t_current = t_offset
+        t_end = t_offset + NT * dt
+        step_local = 0
+        rejected_steps = 0
+        consecutive_rejects = 0
+        last_successful_dt = dt_current
+
+        while t_current < t_end - 1e-14:
+            dt_step = min(dt_current, t_end - t_current)
+            if dt_step <= 0.0:
+                break
+            t_n = t_current + dt_step
+            n_global = n_offset + step_local + 1
+
+            H_curr_cpu = np.asarray(
+                H_provider(n_global, t_n), dtype=np.float64
+            )
+            if H_curr_cpu.shape != shape:
+                raise ValueError(
+                    f"H_provider returned shape {H_curr_cpu.shape}, "
+                    f"expected {shape}"
+                )
+
+            # Rollback snapshot.
+            P_rb_buf[:] = P_old
+            theta_rb_buf[:] = theta_old
+
+            H_curr[:] = cp.asarray(H_curr_cpu)
+            _pack_ghosts(H_curr, periodic_phi, periodic_z)
+
+            cp.multiply(theta_old, H_prev, out=C_prev)
+
+            A[:], B[:], C[:], D[:], E[:] = _build_coefficients_gpu(
+                H_curr, d_phi, d_Z, R, L
+            )
+
+            # Seed P_new / theta_new for the RB residual snapshot.
+            P_new[:] = P_old
+            theta_new[:] = theta_old
+
+            residual = float("inf")
+            converged = False
+            k_done = 0
+            for k in range(max_inner):
+                if scheme == "jacobi":
+                    jac_kernel(
+                        grid, block,
+                        (
+                            P_old, P_new, theta_old, theta_new,
+                            H_curr, C_prev, A, B, C, D, E,
+                            np.float64(d_phi), np.float64(d_Z),
+                            np.float64(dt_step), np.float64(alpha),
+                            np.float64(omega_p), np.float64(omega_theta),
+                            np.int32(N_Z), np.int32(N_phi),
+                            np.int32(pphi), np.int32(pz),
+                        ),
+                    )
+                    _launch_bc(
+                        bc_phi_kernel, bc_z_kernel,
+                        P_new, theta_new, N_Z, N_phi,
+                        bc_block, bc_grid_phi, bc_grid_z,
+                        periodic_phi, periodic_z,
+                        p_bc_phi0, p_bc_phiL, theta_bc_phi0, theta_bc_phiL,
+                        p_bc_z0, p_bc_zL, theta_bc_z0, theta_bc_zL,
+                    )
+                else:
+                    for color in (0, 1):
+                        rb_kernel(
+                            grid, block,
+                            (
+                                P_old, theta_old,
+                                H_curr, C_prev, A, B, C, D, E,
+                                np.float64(d_phi), np.float64(d_Z),
+                                np.float64(dt_step), np.float64(alpha),
+                                np.float64(omega_p), np.float64(omega_theta),
+                                np.int32(N_Z), np.int32(N_phi),
+                                np.int32(pphi), np.int32(pz),
+                                np.int32(color),
+                            ),
+                        )
+                        _launch_bc(
+                            bc_phi_kernel, bc_z_kernel,
+                            P_old, theta_old, N_Z, N_phi,
+                            bc_block, bc_grid_phi, bc_grid_z,
+                            periodic_phi, periodic_z,
+                            p_bc_phi0, p_bc_phiL, theta_bc_phi0, theta_bc_phiL,
+                            p_bc_z0, p_bc_zL, theta_bc_z0, theta_bc_zL,
+                        )
+                k_done = k + 1
+
+                if k % check_every == 0 or k < 3:
+                    if scheme == "jacobi":
+                        dP = float(cp.max(cp.abs(P_new - P_old)))
+                        dth = float(cp.max(cp.abs(theta_new - theta_old)))
+                    else:
+                        dP = float(cp.max(cp.abs(P_old - P_new)))
+                        dth = float(cp.max(cp.abs(theta_old - theta_new)))
+                    residual = dP + dth
+                    if residual < tol_inner and k > 2:
+                        converged = True
+
+                if scheme == "jacobi":
+                    P_old, P_new = P_new, P_old
+                    theta_old, theta_new = theta_new, theta_old
+                else:
+                    if (k + 1) % check_every == 0 or k + 1 < 3:
+                        P_new[:] = P_old
+                        theta_new[:] = theta_old
+
+                if converged:
+                    break
+
+            # Accept / reject
+            accepted = True
+            if accel.reject_if_not_converged and not converged:
+                accepted = False
+            h_min_step = float(cp.min(H_curr[1:-1, 1:-1]))
+            if accepted and h_min_step <= 0.0:
+                accepted = False
+
+            if not accepted:
+                P_old[:] = P_rb_buf
+                theta_old[:] = theta_rb_buf
+                rejected_steps += 1
+                consecutive_rejects += 1
+                if dt_current <= accel.dt_min * (1.0 + 1e-9):
+                    if consecutive_rejects >= 10:
+                        raise RuntimeError(
+                            "Adaptive dt (prescribed_h): 10 consecutive "
+                            f"rejects at dt_min {accel.dt_min:.3e} at "
+                            f"t={t_current:.4e}."
+                        )
+                    warnings.warn(
+                        f"Adaptive dt stuck at dt_min near t={t_current:.4e}",
+                        RuntimeWarning,
+                    )
+                else:
+                    dt_current = max(
+                        dt_current * accel.dt_shrink, accel.dt_min
+                    )
+                continue
+
+            # Commit
+            consecutive_rejects = 0
+            H_prev, H_curr = H_curr, H_prev
+            t_current = t_n
+            step_local += 1
+            last_successful_dt = dt_step
+
+            t_hist_list.append(t_n)
+            p_max_hist_list.append(float(cp.max(P_old)))
+            h_min_hist_list.append(h_min_step)
+            cav_hist_list.append(
+                float(cp.mean((theta_old < 1.0 - 1e-6).astype(cp.float64)))
+            )
+            n_inner_hist_list.append(k_done)
+            conv_hist_list.append(converged)
+            dt_hist_list.append(dt_step)
+
+            if verbose and (step_local <= 3 or step_local % 20 == 0):
+                print(
+                    f"  [step {n_global:>6d}] t={t_n:.5f} dt={dt_step:.2e} "
+                    f"p_max={p_max_hist_list[-1]:.4e} "
+                    f"cav={cav_hist_list[-1]:.3f} "
+                    f"inner={k_done} conv={'Y' if converged else 'N'}"
+                )
+
+            if checkpoints is not None and save_stride and (
+                n_global % save_stride == 0
+            ):
+                checkpoints[n_global] = (
+                    cp.asnumpy(P_old), cp.asnumpy(theta_old),
+                )
+            if field_callback is not None:
+                field_callback(
+                    n_global, t_n,
+                    cp.asnumpy(P_old), cp.asnumpy(theta_old),
+                )
+
+            if dt_step >= dt_current - 1e-15:
+                if k_done < accel.target_inner_low:
+                    dt_current = min(
+                        dt_current * accel.dt_grow, accel.dt_max
+                    )
+                elif k_done > accel.target_inner_high:
+                    dt_current = max(
+                        dt_current * accel.dt_shrink, accel.dt_min
+                    )
+
+        P_last = cp.asnumpy(P_old)
+        theta_last = cp.asnumpy(theta_old)
+        H_prev_last = cp.asnumpy(H_prev)
+        final_state = AusasState(
+            P=P_last,
+            theta=theta_last,
+            H_prev=H_prev_last,
+            step_index=n_offset + step_local,
+            time=t_current,
+            dt_last=last_successful_dt,
+        )
+        return AusasTransientResult(
+            t=np.asarray(t_hist_list, dtype=np.float64),
+            p_max=np.asarray(p_max_hist_list, dtype=np.float64),
+            cav_frac=np.asarray(cav_hist_list, dtype=np.float64),
+            n_inner=np.asarray(n_inner_hist_list, dtype=np.int32),
+            converged=np.asarray(conv_hist_list, dtype=bool),
+            P_last=P_last,
+            theta_last=theta_last,
+            field_checkpoints=checkpoints,
+            h_min=np.asarray(h_min_hist_list, dtype=np.float64),
+            final_state=final_state,
+        )
+
+    # ==================================================================
+    # Fixed-dt branch (Phase 4) — unchanged
+    # ==================================================================
     # --- Time loop ---------------------------------------------------------
     for step in range(1, NT + 1):
         n = n_offset + step                     # global step index
@@ -673,6 +915,7 @@ def solve_ausas_prescribed_h_gpu(
         H_prev=H_prev_last,
         step_index=n_offset + NT,
         time=t_offset + NT * dt,
+        dt_last=float(dt),
     )
 
     return AusasTransientResult(
@@ -736,6 +979,7 @@ def solve_ausas_journal_dynamic_gpu(
     save_stride: Optional[int] = None,
     field_callback: Optional[Callable[[int, float, np.ndarray, np.ndarray], None]] = None,
     state: Optional[AusasState] = None,
+    accel: Optional["AusasAccelerationOptions"] = None,
     verbose: bool = False,
 ) -> AusasTransientResult:
     """
@@ -751,6 +995,24 @@ def solve_ausas_journal_dynamic_gpu(
     the user's load_fn sees a continuous time axis across restarts.
     Histories use global times. `result.final_state` is the state
     snapshot ready to be passed to a subsequent call.
+
+    Adaptive dt (Phase 5 Part 2)
+    ----------------------------
+    Passing `accel=AusasAccelerationOptions(adaptive_dt=True, ...)`
+    enables variable-dt time marching with rollback. Instead of
+    stepping NT times at the caller's `dt`, the solver uses
+    `t_end = t_offset + NT * dt` as the target final time and varies
+    dt inside [dt_min, dt_max] based on the inner-iteration count
+    (target window: target_inner_low .. target_inner_high). A step is
+    REJECTED when `reject_if_not_converged=True` and the inner loop
+    did not converge, or when a physical invariant is violated
+    (h_min <= 0 or e >= 1); on reject the (P, theta) fields are
+    restored from a rollback snapshot, dt is shrunk by `dt_shrink`,
+    and the step is retried. The returned histories have variable
+    spacing; inspect `result.t` (1-D array of the accepted step times)
+    and `result.final_state.dt_last` to see the schedule.
+    With `accel=None` or `adaptive_dt=False` the solver runs the
+    classical fixed-dt loop bit-for-bit identical to Phase 4.
 
     Phase-4.1 performance notes
     ---------------------------
@@ -1004,6 +1266,354 @@ def solve_ausas_journal_dynamic_gpu(
     Y_k_buf_a = cp.empty((), dtype=cp.float64)
     Y_k_buf_b = cp.empty((), dtype=cp.float64)
 
+    # ==================================================================
+    # Adaptive-dt branch (Phase 5 Part 2)
+    # ==================================================================
+    adaptive_mode = (
+        accel is not None and getattr(accel, "adaptive_dt", False)
+    )
+    if adaptive_mode:
+        import math
+        import warnings
+
+        # Rollback buffers for (P, theta). U, V, X, Y, H_prev are only
+        # modified on COMMIT, so they don't need rollback.
+        P_rb_buf = cp.empty(shape, dtype=cp.float64)
+        theta_rb_buf = cp.empty(shape, dtype=cp.float64)
+
+        # Initial dt: resume from state.dt_last if available, else
+        # caller's dt. Clamp to [dt_min, dt_max].
+        if state is not None and state.dt_last > 0.0:
+            dt_current = float(state.dt_last)
+        else:
+            dt_current = float(dt)
+        dt_current = min(max(dt_current, accel.dt_min), accel.dt_max)
+
+        # Histories are Python lists — number of steps is unknown.
+        t_hist_list: list = []
+        X_hist_list: list = []
+        Y_hist_list: list = []
+        U_hist_list: list = []
+        V_hist_list: list = []
+        WX_hist_list: list = []
+        WY_hist_list: list = []
+        WaX_hist_list: list = []
+        WaY_hist_list: list = []
+        p_max_hist_list: list = []
+        h_min_hist_list: list = []
+        cav_hist_list: list = []
+        n_inner_hist_list: list = []
+        conv_hist_list: list = []
+        dt_hist_list: list = []
+
+        checkpoints = None
+        if save_stride is not None and save_stride > 0:
+            checkpoints = {0: (cp.asnumpy(P_old), cp.asnumpy(theta_old))}
+
+        t_current = t_offset
+        t_end = t_offset + NT * dt
+        step_local = 0
+        rejected_steps = 0
+        consecutive_rejects = 0
+        last_successful_dt = dt_current
+
+        while t_current < t_end - 1e-14:
+            # Clip dt to exactly land on t_end.
+            dt_step = min(dt_current, t_end - t_current)
+            if dt_step <= 0.0:
+                break
+            t_n = t_current + dt_step
+            n_global = n_offset + step_local + 1
+
+            WaX_n, WaY_n = load_fn(t_n)
+            WaX_n = float(WaX_n)
+            WaY_n = float(WaY_n)
+
+            # Save (P, theta) rollback state.
+            P_rb_buf[:] = P_old
+            theta_rb_buf[:] = theta_old
+
+            # Per-step dt-dependent scalars.
+            dt_sq_half_step = dt_step * dt_step / (2.0 * mass_M)
+            dt_over_M_step = dt_step / mass_M
+
+            cp.multiply(theta_old, H_prev, out=C_prev)
+
+            # Ping-pong X_k / Y_k init.
+            X_k_prev_dev = X_k_buf_a
+            X_k_dev = X_k_buf_b
+            Y_k_prev_dev = Y_k_buf_a
+            Y_k_dev = Y_k_buf_b
+            X_k_prev_dev[...] = X_dev
+            Y_k_prev_dev[...] = Y_dev
+
+            residual = float("inf")
+            converged = False
+            k_done = 0
+
+            for k in range(max_inner):
+                check_iter = (k % check_every == 0) or (k < 3)
+                if check_iter and scheme == "rb":
+                    P_new[:] = P_old
+                    theta_new[:] = theta_old
+
+                # (1) Forces (fused).
+                forces_kernel(
+                    (1, 1, 1), forces_block,
+                    (
+                        P_old, cos_phi_1d, sin_phi_1d,
+                        WX_dev, WY_dev,
+                        np.float64(d_phi_d_Z),
+                        np.int32(N_Z), np.int32(N_phi),
+                    ),
+                    shared_mem=2 * forces_block[0] * 8,
+                )
+                # (2) Newmark predictor (fused, uses dt_step).
+                predictor_kernel(
+                    (1, 1, 1), (1, 1, 1),
+                    (
+                        X_dev, Y_dev, U_dev, V_dev,
+                        WX_dev, WY_dev,
+                        X_k_dev, Y_k_dev,
+                        np.float64(dt_step),
+                        np.float64(dt_sq_half_step),
+                        np.float64(WaX_n), np.float64(WaY_n),
+                    ),
+                )
+                # (3) Rebuild gap.
+                build_gap_kernel(
+                    full_grid, block,
+                    (
+                        H_curr, X_k_dev, Y_k_dev,
+                        cos_phi_1d, sin_phi_1d,
+                        texture_for_kernel,
+                        np.int32(N_Z), np.int32(N_phi),
+                        np.int32(has_texture_flag),
+                    ),
+                )
+                # (4) Rebuild coefficients.
+                build_coeffs_kernel(
+                    full_grid, block,
+                    (
+                        H_curr, A, B, C, D, E,
+                        np.float64(alpha_sq),
+                        np.int32(N_Z), np.int32(N_phi),
+                    ),
+                )
+                # (5) + (6) Sweep + BC — use dt_step.
+                if scheme == "jacobi":
+                    jac_kernel(
+                        grid, block,
+                        (
+                            P_old, P_new, theta_old, theta_new,
+                            H_curr, C_prev, A, B, C, D, E,
+                            np.float64(d_phi), np.float64(d_Z),
+                            np.float64(dt_step), np.float64(alpha),
+                            np.float64(omega_p), np.float64(omega_theta),
+                            np.int32(N_Z), np.int32(N_phi),
+                            np.int32(1), np.int32(0),
+                        ),
+                    )
+                    _launch_bc(
+                        bc_phi_kernel, bc_z_kernel,
+                        P_new, theta_new, N_Z, N_phi,
+                        bc_block, bc_grid_phi, bc_grid_z,
+                        True, False,
+                        0.0, 0.0, 1.0, 1.0,
+                        0.0, p_a, 1.0, 1.0,
+                    )
+                else:
+                    for color in (0, 1):
+                        rb_kernel(
+                            grid, block,
+                            (
+                                P_old, theta_old,
+                                H_curr, C_prev, A, B, C, D, E,
+                                np.float64(d_phi), np.float64(d_Z),
+                                np.float64(dt_step), np.float64(alpha),
+                                np.float64(omega_p), np.float64(omega_theta),
+                                np.int32(N_Z), np.int32(N_phi),
+                                np.int32(1), np.int32(0),
+                                np.int32(color),
+                            ),
+                        )
+                        _launch_bc(
+                            bc_phi_kernel, bc_z_kernel,
+                            P_old, theta_old, N_Z, N_phi,
+                            bc_block, bc_grid_phi, bc_grid_z,
+                            True, False,
+                            0.0, 0.0, 1.0, 1.0,
+                            0.0, p_a, 1.0, 1.0,
+                        )
+                k_done = k + 1
+
+                if check_iter:
+                    if scheme == "jacobi":
+                        dP_dev = cp.sqrt(cp.sum((P_new - P_old) ** 2))
+                        dth_dev = cp.sqrt(cp.sum((theta_new - theta_old) ** 2))
+                    else:
+                        dP_dev = cp.sqrt(cp.sum((P_old - P_new) ** 2))
+                        dth_dev = cp.sqrt(cp.sum((theta_old - theta_new) ** 2))
+                    dX_dev = cp.abs(X_k_dev - X_k_prev_dev)
+                    dY_dev = cp.abs(Y_k_dev - Y_k_prev_dev)
+                    residual = float(dP_dev + dth_dev + dX_dev + dY_dev)
+                    if residual < tol_inner and k > 2:
+                        converged = True
+
+                if scheme == "jacobi":
+                    P_old, P_new = P_new, P_old
+                    theta_old, theta_new = theta_new, theta_old
+
+                if converged:
+                    break
+
+                X_k_prev_dev, X_k_dev = X_k_dev, X_k_prev_dev
+                Y_k_prev_dev, Y_k_dev = Y_k_dev, Y_k_prev_dev
+
+            # --- Accept / reject decision ---
+            accepted = True
+            if accel.reject_if_not_converged and not converged:
+                accepted = False
+
+            # Physical invariants (one sync batch for the three scalars).
+            h_min_step = float(cp.min(H_curr[1:-1, 1:-1]))
+            X_step = float(X_k_dev)
+            Y_step = float(Y_k_dev)
+            e_step = math.sqrt(X_step * X_step + Y_step * Y_step)
+            if accepted and (h_min_step <= 0.0 or e_step >= 1.0):
+                accepted = False
+
+            if not accepted:
+                # Rollback P, theta. U, V, X, Y, H_prev stay at
+                # pre-step state (they haven't been committed yet).
+                P_old[:] = P_rb_buf
+                theta_old[:] = theta_rb_buf
+                rejected_steps += 1
+                consecutive_rejects += 1
+
+                if dt_current <= accel.dt_min * (1.0 + 1e-9):
+                    # Already at floor — cannot shrink further.
+                    if consecutive_rejects >= 10:
+                        raise RuntimeError(
+                            "Adaptive dt: 10 consecutive rejects at "
+                            f"dt_min = {accel.dt_min:.3e} at t = "
+                            f"{t_current:.4e}. Increase max_inner or "
+                            "relax tol_inner."
+                        )
+                    warnings.warn(
+                        f"Adaptive dt stuck at dt_min {accel.dt_min:.3e} "
+                        f"near t={t_current:.4e} (retry {consecutive_rejects})",
+                        RuntimeWarning,
+                    )
+                else:
+                    dt_current = max(
+                        dt_current * accel.dt_shrink, accel.dt_min
+                    )
+                continue
+
+            # --- Commit ---
+            consecutive_rejects = 0
+            # End-of-step velocity update (uses dt_step).
+            U_dev = U_dev + dt_over_M_step * (WX_dev + WaX_n)
+            V_dev = V_dev + dt_over_M_step * (WY_dev + WaY_n)
+            X_dev[...] = X_k_dev
+            Y_dev[...] = Y_k_dev
+            H_prev, H_curr = H_curr, H_prev
+
+            t_current = t_n
+            step_local += 1
+            last_successful_dt = dt_step
+
+            # History (lists — variable spacing).
+            t_hist_list.append(t_n)
+            X_hist_list.append(X_step)
+            Y_hist_list.append(Y_step)
+            U_hist_list.append(float(U_dev))
+            V_hist_list.append(float(V_dev))
+            WX_hist_list.append(float(WX_dev))
+            WY_hist_list.append(float(WY_dev))
+            WaX_hist_list.append(WaX_n)
+            WaY_hist_list.append(WaY_n)
+            p_max_hist_list.append(float(cp.max(P_old)))
+            h_min_hist_list.append(h_min_step)
+            cav_hist_list.append(
+                float(cp.mean((theta_old < 1.0 - 1e-6).astype(cp.float64)))
+            )
+            n_inner_hist_list.append(k_done)
+            conv_hist_list.append(converged)
+            dt_hist_list.append(dt_step)
+
+            if verbose and (step_local <= 3 or step_local % 20 == 0):
+                print(
+                    f"  [step {n_global:>6d}] t={t_n:.4f} dt={dt_step:.2e} "
+                    f"X={X_step:+.3f} Y={Y_step:+.3f} "
+                    f"e={e_step:.3f} inner={k_done} "
+                    f"conv={'Y' if converged else 'N'}"
+                )
+
+            if checkpoints is not None and save_stride and (
+                n_global % save_stride == 0
+            ):
+                checkpoints[n_global] = (
+                    cp.asnumpy(P_old), cp.asnumpy(theta_old),
+                )
+            if field_callback is not None:
+                field_callback(
+                    n_global, t_n,
+                    cp.asnumpy(P_old), cp.asnumpy(theta_old),
+                )
+
+            # Adjust dt for next step. Skip the adjustment if this step
+            # was clipped to land on t_end (we're about to exit anyway).
+            if dt_step >= dt_current - 1e-15:
+                if k_done < accel.target_inner_low:
+                    dt_current = min(
+                        dt_current * accel.dt_grow, accel.dt_max
+                    )
+                elif k_done > accel.target_inner_high:
+                    dt_current = max(
+                        dt_current * accel.dt_shrink, accel.dt_min
+                    )
+                # else: keep dt
+
+        # --- Adaptive: assemble result ---
+        P_last = cp.asnumpy(P_old)
+        theta_last = cp.asnumpy(theta_old)
+        H_prev_last = cp.asnumpy(H_prev)
+        final_state = AusasState(
+            P=P_last,
+            theta=theta_last,
+            H_prev=H_prev_last,
+            X=float(X_dev), Y=float(Y_dev),
+            U=float(U_dev), V=float(V_dev),
+            step_index=n_offset + step_local,
+            time=t_current,
+            dt_last=last_successful_dt,
+        )
+        return AusasTransientResult(
+            t=np.asarray(t_hist_list, dtype=np.float64),
+            p_max=np.asarray(p_max_hist_list, dtype=np.float64),
+            cav_frac=np.asarray(cav_hist_list, dtype=np.float64),
+            n_inner=np.asarray(n_inner_hist_list, dtype=np.int32),
+            converged=np.asarray(conv_hist_list, dtype=bool),
+            P_last=P_last,
+            theta_last=theta_last,
+            field_checkpoints=checkpoints,
+            h_min=np.asarray(h_min_hist_list, dtype=np.float64),
+            X=np.asarray(X_hist_list, dtype=np.float64),
+            Y=np.asarray(Y_hist_list, dtype=np.float64),
+            U=np.asarray(U_hist_list, dtype=np.float64),
+            V=np.asarray(V_hist_list, dtype=np.float64),
+            WX=np.asarray(WX_hist_list, dtype=np.float64),
+            WY=np.asarray(WY_hist_list, dtype=np.float64),
+            WaX=np.asarray(WaX_hist_list, dtype=np.float64),
+            WaY=np.asarray(WaY_hist_list, dtype=np.float64),
+            final_state=final_state,
+        )
+
+    # ==================================================================
+    # Fixed-dt branch (Phase 4.1 / 5.1B) — unchanged from pre-Phase-5.2
+    # ==================================================================
     for step in range(1, NT + 1):
         n = n_offset + step                   # global step index
         t_n = t_offset + step * dt            # global time
@@ -1232,6 +1842,7 @@ def solve_ausas_journal_dynamic_gpu(
         U=float(U_dev), V=float(V_dev),
         step_index=n_offset + NT,
         time=t_offset + NT * dt,
+        dt_last=float(dt),
     )
 
     return AusasTransientResult(

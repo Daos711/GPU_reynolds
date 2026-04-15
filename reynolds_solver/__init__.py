@@ -45,16 +45,9 @@ from reynolds_solver.cavitation.ausas.state_io import (
     save_state,
     load_state,
 )
-
-# NOTE: `cavitation.ausas.accel_options.AusasAccelerationOptions` exists
-# as forward-compat scaffolding for future Phase-5 adaptive-dt and
-# dynamic-check-cadence features. The journal solver does NOT currently
-# consume it — the Phase 5 Part 1 lagged-mechanics scheme was found to
-# break convergence for the fully-coupled journal bearing (X_k and P
-# are not slow/fast as the TZ assumed; they co-vary per inner iter).
-# The variant that DOES help (Phase 5.1B) is two fused RawKernels
-# (`newmark_predictor` and `forces_reduce_cos_sin`) used by the solver
-# unconditionally — see `cavitation.ausas.kernels_dynamic`.
+from reynolds_solver.cavitation.ausas.accel_options import (
+    AusasAccelerationOptions,
+)
 
 __all__ = [
     "solve_reynolds",
@@ -66,5 +59,6 @@ __all__ = [
     "AusasState",
     "save_state",
     "load_state",
+    "AusasAccelerationOptions",
 ]
-__version__ = "1.6.1"
+__version__ = "1.7.0"

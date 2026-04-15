@@ -158,6 +158,7 @@ def run_squeeze_benchmark(
     save_stride: Optional[int] = None,
     field_callback=None,
     state=None,
+    accel=None,
     verbose: bool = False,
 ) -> SqueezeBenchmarkResult:
     """
@@ -219,6 +220,7 @@ def run_squeeze_benchmark(
         save_stride=save_stride,
         field_callback=field_callback,
         state=state,
+        accel=accel,
         verbose=verbose,
     )
 
