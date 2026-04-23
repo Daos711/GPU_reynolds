@@ -39,7 +39,10 @@ extern "C" __global__ void ps_rb_sor_step(
     const double omega,
     const int color,
     const int pinned,
-    const int groove
+    const int groove,
+    const int* __restrict__ dirichlet_mask,
+    const double g_bc,
+    const int have_mask
 )
 {
     int j = blockIdx.x * blockDim.x + threadIdx.x + 1;
@@ -49,6 +52,12 @@ extern "C" __global__ void ps_rb_sor_step(
     if ((i + j) % 2 != color) return;
 
     int idx = i * N_phi + j;
+
+    /* Pinned Dirichlet node: force value, skip the stencil update. */
+    if (have_mask && dirichlet_mask[idx]) {
+        g[idx] = g_bc;
+        return;
+    }
 
     /* phi neighbours: periodic (groove=0) or plain (groove=1) */
     int jp, jm;
@@ -131,7 +140,10 @@ extern "C" __global__ void apply_bc_ps(
     double* __restrict__ g,
     const int N_Z,
     const int N_phi,
-    const int groove
+    const int groove,
+    const int* __restrict__ dirichlet_mask,
+    const double g_bc,
+    const int have_mask
 )
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -146,6 +158,13 @@ extern "C" __global__ void apply_bc_ps(
             g[i * N_phi + 0]           = g[i * N_phi + (N_phi - 2)];
             g[i * N_phi + (N_phi - 1)] = g[i * N_phi + 1];
         }
+        /* User mask overrides built-in phi BC on the ghost columns. */
+        if (have_mask) {
+            int i0  = i * N_phi + 0;
+            int iN  = i * N_phi + (N_phi - 1);
+            if (dirichlet_mask[i0])  g[i0] = g_bc;
+            if (dirichlet_mask[iN])  g[iN] = g_bc;
+        }
     }
 
     /* Dirichlet Z ends: g=0 (flooded, P=0, theta=1) */
@@ -153,6 +172,12 @@ extern "C" __global__ void apply_bc_ps(
         int j = tid;
         g[0 * N_phi + j]           = 0.0;
         g[(N_Z - 1) * N_phi + j]   = 0.0;
+        if (have_mask) {
+            int j0 = 0 * N_phi + j;
+            int jN = (N_Z - 1) * N_phi + j;
+            if (dirichlet_mask[j0])  g[j0] = g_bc;
+            if (dirichlet_mask[jN])  g[jN] = g_bc;
+        }
     }
 }
 """
@@ -173,7 +198,10 @@ extern "C" __global__ void hs_rb_sor_step_pv(
     const int N_phi,
     const double omega_sor,
     const int color,
-    const int groove
+    const int groove,
+    const int* __restrict__ dirichlet_mask,
+    const double g_bc,
+    const int have_mask
 )
 {
     int j = blockIdx.x * blockDim.x + threadIdx.x + 1;
@@ -183,6 +211,12 @@ extern "C" __global__ void hs_rb_sor_step_pv(
     if ((i + j) % 2 != color) return;
 
     int idx = i * N_phi + j;
+
+    /* Pinned node: force value, skip stencil. */
+    if (have_mask && dirichlet_mask[idx]) {
+        P[idx] = g_bc;
+        return;
+    }
 
     int jp, jm;
     if (groove) {
@@ -213,7 +247,10 @@ extern "C" __global__ void hs_apply_bc_pv(
     double* __restrict__ P,
     const int N_Z,
     const int N_phi,
-    const int groove
+    const int groove,
+    const int* __restrict__ dirichlet_mask,
+    const double g_bc,
+    const int have_mask
 )
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -227,12 +264,24 @@ extern "C" __global__ void hs_apply_bc_pv(
             P[i * N_phi + 0]           = P[i * N_phi + (N_phi - 2)];
             P[i * N_phi + (N_phi - 1)] = P[i * N_phi + 1];
         }
+        if (have_mask) {
+            int i0 = i * N_phi + 0;
+            int iN = i * N_phi + (N_phi - 1);
+            if (dirichlet_mask[i0]) P[i0] = g_bc;
+            if (dirichlet_mask[iN]) P[iN] = g_bc;
+        }
     }
 
     if (tid < N_phi) {
         int j = tid;
         P[0 * N_phi + j]           = 0.0;
         P[(N_Z - 1) * N_phi + j]   = 0.0;
+        if (have_mask) {
+            int j0 = 0 * N_phi + j;
+            int jN = (N_Z - 1) * N_phi + j;
+            if (dirichlet_mask[j0]) P[j0] = g_bc;
+            if (dirichlet_mask[jN]) P[jN] = g_bc;
+        }
     }
 }
 """

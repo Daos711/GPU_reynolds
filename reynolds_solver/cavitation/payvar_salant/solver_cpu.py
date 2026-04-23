@@ -55,6 +55,54 @@ from numba import njit
 
 
 # ----------------------------------------------------------------------------
+# dirichlet_mask + g_bc validation/normalisation (Agent 1 TZ)
+# ----------------------------------------------------------------------------
+def _normalize_mask_cpu(dirichlet_mask, g_bc, shape):
+    """
+    Validate and normalise the dirichlet_mask + g_bc arguments.
+
+    Rules
+    -----
+    * None / None  -> (None, 0.0)            — old behaviour.
+    * One of them set, the other None -> ValueError.
+    * mask shape mismatch, g_bc not finite scalar -> ValueError.
+    * Returns (mask_uint8_contig, float_g_bc) on a valid mask.
+    """
+    if dirichlet_mask is None and g_bc is None:
+        return None, 0.0
+    if dirichlet_mask is None:
+        raise ValueError(
+            "dirichlet_mask is None but g_bc is set; both must be provided "
+            "together or both left as None."
+        )
+    if g_bc is None:
+        raise ValueError(
+            "g_bc is None but dirichlet_mask is set; both must be provided "
+            "together or both left as None."
+        )
+    if np.isscalar(g_bc):
+        try:
+            g_bc_val = float(g_bc)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"g_bc must be a scalar float, got {g_bc!r}"
+            ) from exc
+    else:
+        raise ValueError(
+            f"g_bc must be a scalar, got shape {np.asarray(g_bc).shape}"
+        )
+    if not np.isfinite(g_bc_val):
+        raise ValueError(f"g_bc must be finite, got {g_bc_val}")
+    m_np = np.asarray(dirichlet_mask)
+    if m_np.shape != shape:
+        raise ValueError(
+            f"dirichlet_mask shape {m_np.shape} does not match H shape {shape}"
+        )
+    mask_arr = np.ascontiguousarray(m_np.astype(np.uint8, copy=False))
+    return mask_arr, g_bc_val
+
+
+# ----------------------------------------------------------------------------
 # Coefficient build (same average-of-cubes as cavitation.ausas.solver_cpu)
 # ----------------------------------------------------------------------------
 def _build_coefficients(H, d_phi, d_Z, R, L, groove=False):
@@ -367,6 +415,257 @@ def _ps_pde_residual(g, H, A, B, C, D, E, d_phi, N_Z, N_phi, groove=0):
     return max_res
 
 
+# ============================================================================
+# Masked variants (Agent 1 TZ: arbitrary internal Dirichlet on `g`)
+# ============================================================================
+# Same discrete operator as the unmasked helpers above, but every pinned
+# interior node (dirichlet_mask[i,j] != 0) is:
+#   * skipped during the SOR update (no numerator/denominator work);
+#   * overwritten to g_bc both during the sweep and after the BC pass,
+#     so neighbours read the prescribed Dirichlet value everywhere;
+#   * excluded from the per-sweep max|delta| (delta is 0 by construction).
+# The masked-node's value is also enforced on the ghost rows / columns
+# where the mask overlaps them, so that the wrap / flood Dirichlet never
+# overrides the user pin.
+
+
+@njit(cache=True)
+def _hs_sor_sweep_masked(
+    P, A, B, C, D, E, F_hs,
+    omega, N_Z, N_phi, groove,
+    mask, g_bc,
+):
+    """HS warmup SOR sweep honouring `mask` (uint8)."""
+    max_dP = 0.0
+    for i in range(1, N_Z - 1):
+        for j in range(1, N_phi - 1):
+            if mask[i, j] != 0:
+                # Pinned node: force the Dirichlet value. Skip the
+                # stencil update entirely so this node cannot become
+                # a free unknown again mid-sweep.
+                if P[i, j] != g_bc:
+                    P[i, j] = g_bc
+                continue
+
+            if groove != 0:
+                jp = j + 1
+                jm = j - 1
+            else:
+                jp = j + 1 if j + 1 < N_phi - 1 else 1
+                jm = j - 1 if j - 1 >= 1 else N_phi - 2
+
+            P_old = P[i, j]
+            P_new = (
+                A[i, j] * P[i, jp] + B[i, j] * P[i, jm]
+                + C[i, j] * P[i + 1, j] + D[i, j] * P[i - 1, j]
+                - F_hs[i, j]
+            ) / (E[i, j] + 1e-30)
+            if P_new < 0.0:
+                P_new = 0.0
+            P[i, j] = P_old + omega * (P_new - P_old)
+
+            dP = P[i, j] - P_old
+            if dP < 0.0:
+                dP = -dP
+            if dP > max_dP:
+                max_dP = dP
+
+    # Built-in BC (same as unmasked).
+    if groove != 0:
+        for i in range(N_Z):
+            P[i, 0] = 0.0
+            P[i, N_phi - 1] = 0.0
+    else:
+        for i in range(N_Z):
+            P[i, 0] = P[i, N_phi - 2]
+            P[i, N_phi - 1] = P[i, 1]
+    for j in range(N_phi):
+        P[0, j] = 0.0
+        P[N_Z - 1, j] = 0.0
+
+    # Mask overrides BC (wins over wrap / flood).
+    for i in range(N_Z):
+        for j in range(N_phi):
+            if mask[i, j] != 0:
+                P[i, j] = g_bc
+
+    return max_dP
+
+
+@njit(cache=True)
+def _ps_sor_sweep_masked(
+    g, H, A, B, C, D, E,
+    cav_mask, pinned,
+    d_phi, omega, N_Z, N_phi, groove,
+    mask, g_bc,
+):
+    """PS SOR sweep with arbitrary internal Dirichlet mask."""
+    max_delta = 0.0
+
+    for i in range(1, N_Z - 1):
+        for j in range(1, N_phi - 1):
+            if mask[i, j] != 0:
+                if g[i, j] != g_bc:
+                    g[i, j] = g_bc
+                continue
+
+            if groove != 0:
+                jp = j + 1
+                jm = j - 1
+            else:
+                jp = j + 1 if j + 1 < N_phi - 1 else 1
+                jm = j - 1 if j - 1 >= 1 else N_phi - 2
+
+            g_old = g[i, j]
+
+            g_njp = g[i, jp]
+            g_njm = g[i, jm]
+            g_nip = g[i + 1, j]
+            g_nim = g[i - 1, j]
+
+            P_jp = g_njp if g_njp > 0.0 else 0.0
+            P_jm = g_njm if g_njm > 0.0 else 0.0
+            P_ip = g_nip if g_nip > 0.0 else 0.0
+            P_im = g_nim if g_nim > 0.0 else 0.0
+
+            if g_njm >= 0.0:
+                theta_jm = 1.0
+            else:
+                theta_jm = 1.0 + g_njm
+                if theta_jm < 0.0:
+                    theta_jm = 0.0
+
+            h_ij = H[i, j]
+            h_jm = H[i, jm]
+
+            diff = (
+                A[i, j] * P_jp + B[i, j] * P_jm
+                + C[i, j] * P_ip + D[i, j] * P_im
+            )
+            couette = d_phi * (h_ij - h_jm * theta_jm)
+            numerator = diff - couette
+
+            E_l = E[i, j]
+            cav_diag = d_phi * h_ij
+
+            if pinned != 0:
+                if cav_mask[i, j] != 0:
+                    g_new = numerator / (cav_diag + 1e-30)
+                    if g_new > 0.0:
+                        g_new = 0.0
+                    elif g_new < -1.0:
+                        g_new = -1.0
+                else:
+                    g_new = numerator / (E_l + 1e-30)
+                    if g_new < 0.0:
+                        g_new = 0.0
+            else:
+                g_trial_ff = numerator / (E_l + 1e-30)
+                if g_trial_ff >= 0.0:
+                    g_new = g_trial_ff
+                else:
+                    g_new = numerator / (cav_diag + 1e-30)
+                    if g_new < -1.0:
+                        g_new = -1.0
+
+            g_relax = g_old + omega * (g_new - g_old)
+            if g_relax < -1.0:
+                g_relax = -1.0
+
+            g[i, j] = g_relax
+
+            delta = g_relax - g_old
+            if delta < 0.0:
+                delta = -delta
+            if delta > max_delta:
+                max_delta = delta
+
+    # Built-in BC.
+    if groove != 0:
+        for i in range(N_Z):
+            g[i, 0] = 0.0
+            g[i, N_phi - 1] = 0.0
+    else:
+        for i in range(N_Z):
+            g[i, 0] = g[i, N_phi - 2]
+            g[i, N_phi - 1] = g[i, 1]
+    for j in range(N_phi):
+        g[0, j] = 0.0
+        g[N_Z - 1, j] = 0.0
+
+    # Mask wins over built-in BC.
+    for i in range(N_Z):
+        for j in range(N_phi):
+            if mask[i, j] != 0:
+                g[i, j] = g_bc
+
+    return max_delta
+
+
+@njit(cache=True)
+def _ps_pde_residual_masked(
+    g, H, A, B, C, D, E,
+    d_phi, N_Z, N_phi, groove,
+    mask,
+):
+    """PDE residual with masked nodes excluded from the max."""
+    max_res = 0.0
+
+    for i in range(1, N_Z - 1):
+        for j in range(1, N_phi - 1):
+            if mask[i, j] != 0:
+                continue
+
+            if groove != 0:
+                jp = j + 1
+                jm = j - 1
+            else:
+                jp = j + 1 if j + 1 < N_phi - 1 else 1
+                jm = j - 1 if j - 1 >= 1 else N_phi - 2
+
+            g_ij = g[i, j]
+            if g_ij >= 0.0:
+                P_ij = g_ij
+                theta_ij = 1.0
+            else:
+                P_ij = 0.0
+                theta_ij = 1.0 + g_ij
+                if theta_ij < 0.0:
+                    theta_ij = 0.0
+
+            g_njp = g[i, jp]
+            g_njm = g[i, jm]
+            g_nip = g[i + 1, j]
+            g_nim = g[i - 1, j]
+
+            P_jp = g_njp if g_njp > 0.0 else 0.0
+            P_jm = g_njm if g_njm > 0.0 else 0.0
+            P_ip = g_nip if g_nip > 0.0 else 0.0
+            P_im = g_nim if g_nim > 0.0 else 0.0
+
+            if g_njm >= 0.0:
+                theta_jm = 1.0
+            else:
+                theta_jm = 1.0 + g_njm
+                if theta_jm < 0.0:
+                    theta_jm = 0.0
+
+            lhs = (
+                A[i, j] * P_jp + B[i, j] * P_jm
+                + C[i, j] * P_ip + D[i, j] * P_im
+                - E[i, j] * P_ij
+            )
+            rhs = d_phi * (H[i, j] * theta_ij - H[i, jm] * theta_jm)
+
+            res = lhs - rhs
+            if res < 0.0:
+                res = -res
+            if res > max_res:
+                max_res = res
+
+    return max_res
+
+
 # ----------------------------------------------------------------------------
 # Public driver
 # ----------------------------------------------------------------------------
@@ -385,11 +684,23 @@ def solve_payvar_salant_cpu(
     g_init=None,
     coefficients_ext=None,
     phi_bc="periodic",
+    dirichlet_mask=None,
+    g_bc=None,
     verbose=False,
 ):
     """
     Steady-state mass-conserving JFO cavitation for a journal bearing
     via the Payvar-Salant / Elrod unified-variable approach.
+
+    Optional internal Dirichlet mask
+    --------------------------------
+    Nodes where ``dirichlet_mask[i, j]`` is truthy are pinned to
+    ``g[i, j] = g_bc`` at every stage of the solve (after g_init /
+    cold start, after HS warmup, after every SOR sweep, after the
+    wrap / flood BC, before the final P/theta recovery). Pinned
+    nodes are excluded from the active-set flip count, from the
+    SOR update, and from the residual max. The mask/g_bc pair must
+    be provided together or both left as None.
 
     Strategy
     --------
@@ -488,6 +799,17 @@ def solve_payvar_salant_cpu(
         )
     groove = 1 if phi_bc == "groove" else 0
 
+    # --- Arbitrary internal Dirichlet mask (Agent 1 TZ) ---
+    mask_arr, g_bc_val = _normalize_mask_cpu(
+        dirichlet_mask, g_bc, H.shape,
+    )
+    use_mask = mask_arr is not None
+
+    def _apply_pin(g_field):
+        """Overwrite g_field at masked positions with g_bc_val."""
+        if use_mask:
+            g_field[mask_arr.astype(bool)] = g_bc_val
+
     # Ghost packing of H (periodic wrap or zero-gradient at groove)
     H = np.ascontiguousarray(H, dtype=np.float64).copy()
     if groove:
@@ -536,6 +858,7 @@ def solve_payvar_salant_cpu(
             g[:, N_phi - 1] = g[:, 1]
         g[0, :] = 0.0
         g[-1, :] = 0.0
+        _apply_pin(g)
         if verbose:
             print("  [PS] warm start from g_init (HS warmup skipped)")
     elif hs_warmup_iter > 0:
@@ -554,12 +877,20 @@ def solve_payvar_salant_cpu(
                 F_hs[i, j] = d_phi * (H[i, j] - H[i, jm])
 
         P_hs = np.zeros((N_Z, N_phi), dtype=np.float64)
+        _apply_pin(P_hs)
         hs_res = 1.0
         for k in range(hs_warmup_iter):
-            hs_res = _hs_sor_sweep(
-                P_hs, A, B, C, D, E, F_hs,
-                hs_warmup_omega, N_Z, N_phi, groove,
-            )
+            if use_mask:
+                hs_res = _hs_sor_sweep_masked(
+                    P_hs, A, B, C, D, E, F_hs,
+                    hs_warmup_omega, N_Z, N_phi, groove,
+                    mask_arr, g_bc_val,
+                )
+            else:
+                hs_res = _hs_sor_sweep(
+                    P_hs, A, B, C, D, E, F_hs,
+                    hs_warmup_omega, N_Z, N_phi, groove,
+                )
             n_iter_total += 1
             if hs_res < hs_warmup_tol and k > 5:
                 break
@@ -588,8 +919,10 @@ def solve_payvar_salant_cpu(
             g[:, N_phi - 1] = g[:, 1]
         g[0, :] = 0.0
         g[-1, :] = 0.0
+        _apply_pin(g)
     else:
         g = np.zeros((N_Z, N_phi), dtype=np.float64)
+        _apply_pin(g)
 
     # ------------------------------------------------------------------
     # Cavitation mask from the initial state (used only when pinned)
@@ -616,6 +949,15 @@ def solve_payvar_salant_cpu(
                 if cav_mask[i, j] != 0:
                     g[i, j] = 0.0
 
+    # Pinned nodes are NOT free unknowns — they are Dirichlet with value
+    # g_bc, which is interpreted as full-film (cav_mask = 0). This
+    # prevents the cavitation / full-film flip counter from treating
+    # them as real flips and keeps the masked value stable across the
+    # outer active-set loop.
+    if use_mask:
+        cav_mask[mask_arr.astype(bool)] = 0
+        _apply_pin(g)
+
     pinned = 1 if pin_active_set else 0
     n_outer = max_outer_active_set if pin_active_set else 1
 
@@ -636,11 +978,19 @@ def solve_payvar_salant_cpu(
         # ---- Inner SOR with current cav_mask (or nonlinear dispatch) ----
         inner_k = 0
         for k in range(max_iter):
-            residual = _ps_sor_sweep(
-                g, H, A, B, C, D, E,
-                cav_mask, pinned,
-                d_phi, omega, N_Z, N_phi, groove,
-            )
+            if use_mask:
+                residual = _ps_sor_sweep_masked(
+                    g, H, A, B, C, D, E,
+                    cav_mask, pinned,
+                    d_phi, omega, N_Z, N_phi, groove,
+                    mask_arr, g_bc_val,
+                )
+            else:
+                residual = _ps_sor_sweep(
+                    g, H, A, B, C, D, E,
+                    cav_mask, pinned,
+                    d_phi, omega, N_Z, N_phi, groove,
+                )
             n_iter_total += 1
             inner_k = k + 1
             if residual < tol and k > 5:
@@ -664,14 +1014,24 @@ def solve_payvar_salant_cpu(
             new_cav[:, 0] = new_cav[:, N_phi - 2]
             new_cav[:, N_phi - 1] = new_cav[:, 1]
 
+        # Masked nodes are Dirichlet, never free unknowns.
+        if use_mask:
+            new_cav[mask_arr.astype(bool)] = 0
+
         flips = int(
             np.sum(new_cav[1:-1, 1:-1] != cav_mask[1:-1, 1:-1])
         )
 
         if verbose:
-            pde_res = _ps_pde_residual(
-                g, H, A, B, C, D, E, d_phi, N_Z, N_phi, groove
-            )
+            if use_mask:
+                pde_res = _ps_pde_residual_masked(
+                    g, H, A, B, C, D, E, d_phi, N_Z, N_phi, groove,
+                    mask_arr,
+                )
+            else:
+                pde_res = _ps_pde_residual(
+                    g, H, A, B, C, D, E, d_phi, N_Z, N_phi, groove,
+                )
             maxP = float(np.maximum(g, 0.0).max())
             cav_frac = float(np.mean(g[1:-1, 1:-1] < 0.0))
             print(
@@ -683,6 +1043,12 @@ def solve_payvar_salant_cpu(
         if flips == 0:
             break  # active set stable — converged
         cav_mask = new_cav
+
+    # Final mask enforcement before recovering (P, theta). The final
+    # SOR sweep's post-BC loop already handles this, but keep it here
+    # as a belt-and-braces guarantee that the caller NEVER sees a
+    # non-pinned value at a masked position.
+    _apply_pin(g)
 
     # ------------------------------------------------------------------
     # Recover P and θ from g

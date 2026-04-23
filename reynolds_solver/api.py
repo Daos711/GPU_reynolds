@@ -80,6 +80,9 @@ def solve_reynolds(
     max_outer_pv: int = 20,
     relax_pv: float = 0.7,
     phi_bc: str = "periodic",
+    # Arbitrary internal Dirichlet mask (payvar_salant only; Agent 1 TZ)
+    dirichlet_mask: np.ndarray = None,
+    g_bc: float = None,
 ) -> tuple:
     """
     Solve the Reynolds equation on GPU (Red-Black SOR).
@@ -137,6 +140,14 @@ def solve_reynolds(
         residual : float
         n_iter : int
     """
+    # --- Guard: dirichlet_mask is only defined for payvar_salant ---
+    if (dirichlet_mask is not None or g_bc is not None) \
+            and cavitation != "payvar_salant":
+        raise NotImplementedError(
+            "dirichlet_mask / g_bc are only supported with "
+            "cavitation='payvar_salant'."
+        )
+
     # --- Auto omega ---
     if omega is None:
         from reynolds_solver.utils import compute_auto_omega
@@ -181,6 +192,14 @@ def solve_reynolds(
             )
 
         if cavitation == "payvar_salant":
+            # Agent 1 TZ: PV + custom Dirichlet is not wired yet; fail
+            # loudly instead of silently dropping the mask.
+            if dirichlet_mask is not None or g_bc is not None:
+                raise NotImplementedError(
+                    "PV (alpha_pv) + custom Dirichlet (dirichlet_mask / "
+                    "g_bc) is not wired through the piezoviscous "
+                    "path yet."
+                )
             from reynolds_solver.piezoviscous.solver_pv_payvar_salant import (
                 solve_payvar_salant_piezoviscous,
             )
@@ -283,6 +302,8 @@ def solve_reynolds(
                 tol=tol,
                 max_iter=max_iter,
                 phi_bc=phi_bc,
+                dirichlet_mask=dirichlet_mask,
+                g_bc=g_bc,
                 verbose=verbose,
             )
         except (ImportError, ModuleNotFoundError):
@@ -294,6 +315,8 @@ def solve_reynolds(
                 tol=tol,
                 max_iter=max_iter,
                 phi_bc=phi_bc,
+                dirichlet_mask=dirichlet_mask,
+                g_bc=g_bc,
                 verbose=verbose,
             )
         return P, theta, residual, n_iter

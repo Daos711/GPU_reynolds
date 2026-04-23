@@ -23,6 +23,53 @@ from reynolds_solver.cavitation.payvar_salant.kernels import (
 )
 
 
+# ----------------------------------------------------------------------------
+# dirichlet_mask + g_bc validation (mirrors _normalize_mask_cpu)
+# ----------------------------------------------------------------------------
+def _normalize_mask_gpu(dirichlet_mask, g_bc, shape):
+    """
+    Validate and normalise the mask / g_bc pair. Returns
+    (mask_gpu_int32, float_g_bc, have_mask_int) where `mask_gpu_int32`
+    is a `(N_Z, N_phi)` int32 cupy array (real mask when provided, or
+    a zero-filled dummy when not — the kernels ignore it unless
+    have_mask is 1).
+    """
+    if dirichlet_mask is None and g_bc is None:
+        dummy = cp.zeros(shape, dtype=cp.int32)
+        return dummy, 0.0, 0
+    if dirichlet_mask is None:
+        raise ValueError(
+            "dirichlet_mask is None but g_bc is set; both must be provided "
+            "together or both left as None."
+        )
+    if g_bc is None:
+        raise ValueError(
+            "g_bc is None but dirichlet_mask is set; both must be provided "
+            "together or both left as None."
+        )
+    if np.isscalar(g_bc):
+        try:
+            g_bc_val = float(g_bc)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"g_bc must be a scalar float, got {g_bc!r}"
+            ) from exc
+    else:
+        raise ValueError(
+            f"g_bc must be a scalar, got shape {np.asarray(g_bc).shape}"
+        )
+    if not np.isfinite(g_bc_val):
+        raise ValueError(f"g_bc must be finite, got {g_bc_val}")
+    m_np = np.asarray(dirichlet_mask)
+    if m_np.shape != shape:
+        raise ValueError(
+            f"dirichlet_mask shape {m_np.shape} does not match H shape {shape}"
+        )
+    mask_host = np.ascontiguousarray(m_np.astype(np.int32, copy=False))
+    mask_gpu = cp.asarray(mask_host)
+    return mask_gpu, g_bc_val, 1
+
+
 # -----------------------------------------------------------------------
 # Coefficient build on GPU (average-of-cubes)
 # -----------------------------------------------------------------------
@@ -88,6 +135,8 @@ def solve_payvar_salant_gpu(
     g_init=None,
     coefficients_ext=None,
     phi_bc="periodic",
+    dirichlet_mask=None,
+    g_bc=None,
     verbose=False,
 ):
     """
@@ -119,6 +168,18 @@ def solve_payvar_salant_gpu(
 
     if omega is None:
         omega = DEFAULT_PS_OMEGA
+
+    # --- Arbitrary internal Dirichlet mask (Agent 1 TZ) ---
+    mask_gpu, g_bc_val, have_mask = _normalize_mask_gpu(
+        dirichlet_mask, g_bc, H.shape,
+    )
+    use_mask = have_mask != 0
+    mask_bool = mask_gpu.astype(cp.bool_) if use_mask else None
+
+    def _apply_pin(g_field):
+        """Overwrite g_field at masked positions with g_bc_val."""
+        if use_mask:
+            g_field[mask_bool] = g_bc_val
 
     # Ghost-pack H on host, then upload
     H = np.ascontiguousarray(H, dtype=np.float64).copy()
@@ -183,6 +244,7 @@ def solve_payvar_salant_gpu(
             g[:, N_phi - 1] = g[:, 1]
         g[0, :] = 0.0
         g[-1, :] = 0.0
+        _apply_pin(g)
         if verbose:
             print("  [PS-GPU] warm start from g_init (HS warmup skipped)")
     else:
@@ -207,6 +269,7 @@ def solve_payvar_salant_gpu(
             F_hs[:, 1] = d_phi * (H_gpu[:, 1] - H_gpu[:, N_phi - 2])
 
         P_hs = cp.zeros((N_Z, N_phi), dtype=cp.float64)
+        _apply_pin(P_hs)
         P_hs_prev = cp.zeros_like(P_hs)
 
         if verbose:
@@ -215,6 +278,9 @@ def solve_payvar_salant_gpu(
                 f"(ω_hs={hs_warmup_omega:.4f}, "
                 f"phi_bc={phi_bc})..."
             )
+
+        have_mask_i32 = np.int32(have_mask)
+        g_bc_f64 = np.float64(g_bc_val)
 
         hs_res = 1.0
         for k in range(hs_warmup_iter):
@@ -226,12 +292,14 @@ def solve_payvar_salant_gpu(
                         np.int32(N_Z), np.int32(N_phi),
                         np.float64(hs_warmup_omega), np.int32(color),
                         np.int32(groove),
+                        mask_gpu, g_bc_f64, have_mask_i32,
                     ),
                 )
             hs_bc_kernel(
                 bc_grid, bc_block,
                 (P_hs, np.int32(N_Z), np.int32(N_phi),
-                 np.int32(groove)),
+                 np.int32(groove),
+                 mask_gpu, g_bc_f64, have_mask_i32),
             )
             n_iter_total += 1
 
@@ -277,6 +345,12 @@ def solve_payvar_salant_gpu(
     if pin_active_set:
         g[cav_mask.astype(bool)] = 0.0
 
+    # User-pinned nodes are Dirichlet full-film (not cavitation cells)
+    # and must be re-pinned to g_bc after the cold-start seeding above.
+    if use_mask:
+        cav_mask[mask_bool] = 0
+        _apply_pin(g)
+
     # ------------------------------------------------------------------
     # PS iteration kernels
     # ------------------------------------------------------------------
@@ -285,6 +359,9 @@ def solve_payvar_salant_gpu(
 
     pinned_flag = np.int32(1 if pin_active_set else 0)
     n_outer = max_outer_active_set if pin_active_set else 1
+
+    have_mask_i32 = np.int32(have_mask)
+    g_bc_f64 = np.float64(g_bc_val)
 
     if verbose:
         cav0 = int(cav_mask[1:-1, 1:-1].sum())
@@ -314,6 +391,7 @@ def solve_payvar_salant_gpu(
                     np.int32(N_Z), np.int32(N_phi),
                     np.float64(d_phi), np.float64(omega),
                     np.int32(0), pinned_flag, np.int32(groove),
+                    mask_gpu, g_bc_f64, have_mask_i32,
                 ),
             )
             # Black pass
@@ -324,18 +402,22 @@ def solve_payvar_salant_gpu(
                     np.int32(N_Z), np.int32(N_phi),
                     np.float64(d_phi), np.float64(omega),
                     np.int32(1), pinned_flag, np.int32(groove),
+                    mask_gpu, g_bc_f64, have_mask_i32,
                 ),
             )
             # BC
             ps_bc_kernel(
                 bc_grid, bc_block,
-                (g, np.int32(N_Z), np.int32(N_phi), np.int32(groove)),
+                (g, np.int32(N_Z), np.int32(N_phi), np.int32(groove),
+                 mask_gpu, g_bc_f64, have_mask_i32),
             )
 
             inner_k = k + 1
             n_iter_total += 1
 
-            # Residual check
+            # Residual check — masked nodes contribute |Δg|=0 (pinned
+            # value held constant across iterations) so there is no
+            # need for an explicit mask multiply here.
             if k % check_every == 0 and k > 0:
                 residual = float(cp.max(cp.abs(g - g_old)))
                 if residual < tol:
@@ -365,6 +447,10 @@ def solve_payvar_salant_gpu(
             new_cav[:, 0] = new_cav[:, N_phi - 2]
             new_cav[:, N_phi - 1] = new_cav[:, 1]
 
+        # Masked nodes are Dirichlet, never free unknowns.
+        if use_mask:
+            new_cav[mask_bool] = 0
+
         flips = int(cp.sum(new_cav[1:-1, 1:-1] != cav_mask[1:-1, 1:-1]))
         if verbose:
             print(
@@ -374,6 +460,10 @@ def solve_payvar_salant_gpu(
         if flips == 0:
             break
         cav_mask = new_cav
+
+    # Belt-and-braces: ensure masked positions hold the Dirichlet value
+    # before we compute (P, theta) from g.
+    _apply_pin(g)
 
     # ------------------------------------------------------------------
     # Recover P, θ and transfer to host
