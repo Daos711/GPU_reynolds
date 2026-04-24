@@ -192,14 +192,6 @@ def solve_reynolds(
             )
 
         if cavitation == "payvar_salant":
-            # Agent 1 TZ: PV + custom Dirichlet is not wired yet; fail
-            # loudly instead of silently dropping the mask.
-            if dirichlet_mask is not None or g_bc is not None:
-                raise NotImplementedError(
-                    "PV (alpha_pv) + custom Dirichlet (dirichlet_mask / "
-                    "g_bc) is not wired through the piezoviscous "
-                    "path yet."
-                )
             from reynolds_solver.piezoviscous.solver_pv_payvar_salant import (
                 solve_payvar_salant_piezoviscous,
             )
@@ -210,7 +202,9 @@ def solve_reynolds(
                 tol_outer=tol_outer, max_outer=max_outer_pv,
                 relax_mu=relax_pv,
                 tol=tol, max_iter=max_iter,
-                phi_bc=phi_bc, verbose=verbose,
+                phi_bc=phi_bc,
+                dirichlet_mask=dirichlet_mask, g_bc=g_bc,
+                verbose=verbose,
             )
 
         if pv_method == "transformed":
