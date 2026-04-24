@@ -215,17 +215,19 @@ def test_repeated_relax_converges_to_static_target():
     gamma = 0.5
     T_target = global_static_target_C(T_in, P_loss, mdot, cp, gamma)
 
+    # Explicit-Euler decay: r = 1 - dt/tau = 0.9, error halves every
+    # ~6.6 steps. After 400 steps: r^400 ≈ 1e-18 → well below 1e-9.
     T = T_in
-    dt = 0.05
+    dt = 0.1
     tau = 1.0
-    for _ in range(200):
+    for _ in range(400):
         T = global_relax_step_C(T, T_target, dt, tau)
 
     err = abs(T - T_target)
     return _ok(
-        "200 steps converge within 1e-6",
-        err < 1e-6,
-        f"T_final={T:.6f}, T_target={T_target:.6f}, err={err:.2e}",
+        "400 steps (dt=0.1, tau=1.0) converge within 1e-9",
+        err < 1e-9,
+        f"T_final={T:.9f}, T_target={T_target:.9f}, err={err:.2e}",
     )
 
 
