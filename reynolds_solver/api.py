@@ -80,6 +80,9 @@ def solve_reynolds(
     max_outer_pv: int = 20,
     relax_pv: float = 0.7,
     phi_bc: str = "periodic",
+    # Arbitrary internal Dirichlet mask (payvar_salant only; Agent 1 TZ)
+    dirichlet_mask: np.ndarray = None,
+    g_bc: float = None,
 ) -> tuple:
     """
     Solve the Reynolds equation on GPU (Red-Black SOR).
@@ -137,6 +140,14 @@ def solve_reynolds(
         residual : float
         n_iter : int
     """
+    # --- Guard: dirichlet_mask is only defined for payvar_salant ---
+    if (dirichlet_mask is not None or g_bc is not None) \
+            and cavitation != "payvar_salant":
+        raise NotImplementedError(
+            "dirichlet_mask / g_bc are only supported with "
+            "cavitation='payvar_salant'."
+        )
+
     # --- Auto omega ---
     if omega is None:
         from reynolds_solver.utils import compute_auto_omega
@@ -191,7 +202,9 @@ def solve_reynolds(
                 tol_outer=tol_outer, max_outer=max_outer_pv,
                 relax_mu=relax_pv,
                 tol=tol, max_iter=max_iter,
-                phi_bc=phi_bc, verbose=verbose,
+                phi_bc=phi_bc,
+                dirichlet_mask=dirichlet_mask, g_bc=g_bc,
+                verbose=verbose,
             )
 
         if pv_method == "transformed":
@@ -283,6 +296,8 @@ def solve_reynolds(
                 tol=tol,
                 max_iter=max_iter,
                 phi_bc=phi_bc,
+                dirichlet_mask=dirichlet_mask,
+                g_bc=g_bc,
                 verbose=verbose,
             )
         except (ImportError, ModuleNotFoundError):
@@ -294,6 +309,8 @@ def solve_reynolds(
                 tol=tol,
                 max_iter=max_iter,
                 phi_bc=phi_bc,
+                dirichlet_mask=dirichlet_mask,
+                g_bc=g_bc,
                 verbose=verbose,
             )
         return P, theta, residual, n_iter
