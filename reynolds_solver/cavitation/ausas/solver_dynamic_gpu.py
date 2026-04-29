@@ -195,23 +195,59 @@ def ausas_unsteady_one_step_gpu(
     periodic_z=False,
     check_every=50,
     verbose=False,
+    scheme: str = "rb",
+    residual_norm: str = "linf",
+    legacy_return: bool = False,
 ):
     """
     Advance (P, θ) by one real time step Δt using the unsteady Ausas
-    Jacobi kernel. See module docstring for discretization details.
+    kernel. See module docstring for discretization details.
 
     Axis-BC semantics: each axis (φ, Z) is either periodic or Dirichlet.
     For a Dirichlet axis, (p_bc_<axis>0, p_bc_<axis>L) and the matching
     θ-Dirichlet values are written into the ghost row/column by the BC
     kernel after each sweep.
 
+    Parameters
+    ----------
+    scheme : {"rb", "jacobi"}
+        Inner-loop relaxation. "rb" (default) is the in-place Red-Black
+        SOR path used by the Stage-2 prescribed-h solver — converges in
+        O(N) sweeps and is the recommended path for diesel transients.
+        "jacobi" keeps the legacy frozen-iterate Jacobi sweep for
+        reference / regression checks.
+    residual_norm : {"linf", "rms"}
+        Stopping criterion. Both norms are computed and reported; this
+        flag selects which one is checked against `tol`. The legacy
+        absolute L2 sum (sqrt(sum dP^2) + sqrt(sum dtheta^2)) — which
+        scales with sqrt(N_interior) and is the source of false
+        non-convergence reports on finer grids — is reported as
+        `residual_l2_abs` for diagnostic comparison only and is NEVER
+        used as a stopping criterion.
+    legacy_return : bool
+        If True, return the historical 4-tuple
+        (P, theta, residual, n_inner) for callers that haven't been
+        migrated to the structured-dict API yet.
+
     Returns
     -------
-    P : (N_Z, N_phi) ndarray (CPU, float64)
-    theta : (N_Z, N_phi) ndarray (CPU, float64)
-    residual : float — last inner residual at time step n.
-    n_inner : int — Jacobi sweeps actually performed.
+    dict (default) with keys:
+        "P" : (N_Z, N_phi) ndarray (CPU, float64)
+        "theta" : (N_Z, N_phi) ndarray (CPU, float64)
+        "residual" : float — primary stopping-criterion residual.
+        "residual_linf" : float — max-abs of (dP, dtheta) over interior.
+        "residual_rms" : float — RMS of (dP, dtheta) over interior.
+        "residual_l2_abs" : float — legacy unnormalized L2-sum.
+        "n_inner" : int — sweeps actually performed.
+        "converged" : bool — explicit convergence flag.
     """
+    if scheme not in ("rb", "jacobi"):
+        raise ValueError(f"Unknown scheme {scheme!r}. Use 'rb' or 'jacobi'.")
+    if residual_norm not in ("linf", "rms"):
+        raise ValueError(
+            f"Unknown residual_norm {residual_norm!r}. Use 'linf' or 'rms'."
+        )
+
     H_curr = np.ascontiguousarray(H_curr, dtype=np.float64)
     H_prev = np.ascontiguousarray(H_prev, dtype=np.float64)
     P_prev = np.ascontiguousarray(P_prev, dtype=np.float64)
@@ -249,7 +285,12 @@ def ausas_unsteady_one_step_gpu(
     P_new = P_old.copy()
     theta_new = theta_old.copy()
 
-    kernel = get_unsteady_ausas_kernel()
+    if scheme == "jacobi":
+        jac_kernel = get_unsteady_ausas_kernel()
+        rb_kernel = None
+    else:
+        jac_kernel = None
+        rb_kernel = get_unsteady_ausas_rb_kernel()
     bc_phi_kernel = get_unsteady_ausas_bc_phi_kernel()
     bc_z_kernel = get_unsteady_ausas_bc_z_kernel()
     block, grid, bc_block, bc_grid_phi, bc_grid_z = _launch_configs(N_Z, N_phi)
@@ -257,56 +298,138 @@ def ausas_unsteady_one_step_gpu(
     pphi = 1 if periodic_phi else 0
     pz = 1 if periodic_z else 0
 
-    residual = float("inf")
+    # Interior cell count for the RMS denominator. For both periodic and
+    # Dirichlet boundaries the iterate-difference is well-defined on the
+    # interior slice [1:-1, 1:-1]; ghost rows/cols carry either a copy of
+    # the seam (periodic) or a constant (Dirichlet) and don't need to be
+    # included in the residual.
+    n_interior = max((N_Z - 2) * (N_phi - 2), 1)
+
+    residual_linf = float("inf")
+    residual_rms = float("inf")
+    residual_l2_abs = float("inf")
+    converged = False
     n_inner = 0
+
     for k in range(max_inner):
-        kernel(
-            grid, block,
-            (
-                P_old, P_new, theta_old, theta_new,
-                H_curr_gpu, C_prev,
-                A, B, C, D, E,
-                np.float64(d_phi), np.float64(d_Z),
-                np.float64(dt), np.float64(alpha),
-                np.float64(omega_p), np.float64(omega_theta),
-                np.int32(N_Z), np.int32(N_phi),
-                np.int32(pphi), np.int32(pz),
-            ),
-        )
-        _launch_bc(
-            bc_phi_kernel, bc_z_kernel,
-            P_new, theta_new, N_Z, N_phi,
-            bc_block, bc_grid_phi, bc_grid_z,
-            periodic_phi, periodic_z,
-            p_bc_phi0, p_bc_phiL, theta_bc_phi0, theta_bc_phiL,
-            p_bc_z0, p_bc_zL, theta_bc_z0, theta_bc_zL,
-        )
+        if scheme == "jacobi":
+            jac_kernel(
+                grid, block,
+                (
+                    P_old, P_new, theta_old, theta_new,
+                    H_curr_gpu, C_prev,
+                    A, B, C, D, E,
+                    np.float64(d_phi), np.float64(d_Z),
+                    np.float64(dt), np.float64(alpha),
+                    np.float64(omega_p), np.float64(omega_theta),
+                    np.int32(N_Z), np.int32(N_phi),
+                    np.int32(pphi), np.int32(pz),
+                ),
+            )
+            _launch_bc(
+                bc_phi_kernel, bc_z_kernel,
+                P_new, theta_new, N_Z, N_phi,
+                bc_block, bc_grid_phi, bc_grid_z,
+                periodic_phi, periodic_z,
+                p_bc_phi0, p_bc_phiL, theta_bc_phi0, theta_bc_phiL,
+                p_bc_z0, p_bc_zL, theta_bc_z0, theta_bc_zL,
+            )
+        else:
+            for color in (0, 1):
+                rb_kernel(
+                    grid, block,
+                    (
+                        P_old, theta_old,
+                        H_curr_gpu, C_prev,
+                        A, B, C, D, E,
+                        np.float64(d_phi), np.float64(d_Z),
+                        np.float64(dt), np.float64(alpha),
+                        np.float64(omega_p), np.float64(omega_theta),
+                        np.int32(N_Z), np.int32(N_phi),
+                        np.int32(pphi), np.int32(pz),
+                        np.int32(color),
+                    ),
+                )
+                _launch_bc(
+                    bc_phi_kernel, bc_z_kernel,
+                    P_old, theta_old, N_Z, N_phi,
+                    bc_block, bc_grid_phi, bc_grid_z,
+                    periodic_phi, periodic_z,
+                    p_bc_phi0, p_bc_phiL, theta_bc_phi0, theta_bc_phiL,
+                    p_bc_z0, p_bc_zL, theta_bc_z0, theta_bc_zL,
+                )
         n_inner += 1
 
         if k % check_every == 0 or k < 3:
-            dP = float(cp.sqrt(cp.sum((P_new - P_old) ** 2)))
-            dth = float(cp.sqrt(cp.sum((theta_new - theta_old) ** 2)))
-            residual = dP + dth
+            # For Jacobi the latest iterate is in (P_new, theta_new); for
+            # RB the latest iterate is in (P_old, theta_old) and the
+            # previous-iterate snapshot is in (P_new, theta_new).
+            if scheme == "jacobi":
+                dP_arr = P_new[1:-1, 1:-1] - P_old[1:-1, 1:-1]
+                dth_arr = theta_new[1:-1, 1:-1] - theta_old[1:-1, 1:-1]
+            else:
+                dP_arr = P_old[1:-1, 1:-1] - P_new[1:-1, 1:-1]
+                dth_arr = theta_old[1:-1, 1:-1] - theta_new[1:-1, 1:-1]
+
+            max_abs_dP = float(cp.max(cp.abs(dP_arr)))
+            max_abs_dth = float(cp.max(cp.abs(dth_arr)))
+            sum_dP2 = float(cp.sum(dP_arr * dP_arr))
+            sum_dth2 = float(cp.sum(dth_arr * dth_arr))
+
+            residual_linf = max(max_abs_dP, max_abs_dth)
+            residual_rms = float(np.sqrt((sum_dP2 + sum_dth2) / n_interior))
+            residual_l2_abs = float(np.sqrt(sum_dP2) + np.sqrt(sum_dth2))
+
+            primary = residual_linf if residual_norm == "linf" else residual_rms
             if verbose:
                 print(
-                    f"  [Ausas-dyn-GPU] inner={k:>5d}: residual={residual:.4e}, "
-                    f"dP={dP:.2e}, dth={dth:.2e}, maxP={float(cp.max(P_new)):.4e}"
+                    f"  [Ausas-dyn-GPU/{scheme}] inner={k:>5d}: "
+                    f"res_linf={residual_linf:.3e}  "
+                    f"res_rms={residual_rms:.3e}  "
+                    f"res_l2_abs={residual_l2_abs:.3e}  "
+                    f"maxP={float(cp.max(P_new if scheme == 'jacobi' else P_old)):.3e}"
                 )
+            if primary < tol and k > 2:
+                converged = True
 
-        P_old, P_new = P_new, P_old
-        theta_old, theta_new = theta_new, theta_old
+        if scheme == "jacobi":
+            P_old, P_new = P_new, P_old
+            theta_old, theta_new = theta_new, theta_old
+        else:
+            # Refresh the snapshot only when the NEXT iteration will run a
+            # residual check. Saves a full-array copy on every sweep.
+            if (k + 1) % check_every == 0 or (k + 1) < 3:
+                P_new[:] = P_old
+                theta_new[:] = theta_old
 
-        if residual < tol and k > 2:
+        if converged:
             if verbose:
                 print(
-                    f"  [Ausas-dyn-GPU] CONVERGED at inner={k}, "
-                    f"residual={residual:.4e}"
+                    f"  [Ausas-dyn-GPU/{scheme}] CONVERGED at inner={k}, "
+                    f"res_linf={residual_linf:.3e} res_rms={residual_rms:.3e}"
                 )
             break
 
     P_cpu = cp.asnumpy(P_old)
     theta_cpu = cp.asnumpy(theta_old)
-    return P_cpu, theta_cpu, float(residual), n_inner
+
+    primary_residual = (
+        residual_linf if residual_norm == "linf" else residual_rms
+    )
+
+    if legacy_return:
+        return P_cpu, theta_cpu, float(primary_residual), n_inner
+
+    return {
+        "P": P_cpu,
+        "theta": theta_cpu,
+        "residual": float(primary_residual),
+        "residual_linf": float(residual_linf),
+        "residual_rms": float(residual_rms),
+        "residual_l2_abs": float(residual_l2_abs),
+        "n_inner": int(n_inner),
+        "converged": bool(converged),
+    }
 
 
 # ===========================================================================
