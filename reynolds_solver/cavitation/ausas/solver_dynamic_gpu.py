@@ -168,6 +168,209 @@ def _launch_bc(
 # ===========================================================================
 # Stage 1 : one-step wrapper (unchanged semantics, extended BC)
 # ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Debug / nonfinite-trace helpers (Task 28). All gated by debug_checks=True
+# in the one-step wrapper so production path stays untouched.
+# ---------------------------------------------------------------------------
+def _classify_index(i: int, j: int, N_Z: int, N_phi: int):
+    """
+    Three-bool localization for a (i, j) cell on the padded one-step grid.
+
+    `first_nan_is_ghost`           — index is inside the phi ghost column
+                                     (j == 0 or j == N_phi - 1).
+    `first_nan_is_axial_boundary`  — index is on the z-boundary row
+                                     (i == 0 or i == N_Z - 1).
+    `first_nan_is_phi_seam`        — index is in the ghost column OR in a
+                                     physical seam-adjacent interior column
+                                     (j == 1 or j == N_phi - 2).
+    """
+    is_ghost = (j == 0) or (j == N_phi - 1)
+    is_axial_boundary = (i == 0) or (i == N_Z - 1)
+    is_phi_seam = is_ghost or (j == 1) or (j == N_phi - 2)
+    return bool(is_ghost), bool(is_axial_boundary), bool(is_phi_seam)
+
+
+def _npy_first_violation(arr, lo=None, hi=None):
+    """First (i, j) where `arr` is non-finite or out of [lo, hi], or None.
+
+    `arr` must be a numpy ndarray. Used for input-state validation before
+    we touch the GPU.
+    """
+    bad = ~np.isfinite(arr)
+    if lo is not None:
+        bad = bad | (arr < lo)
+    if hi is not None:
+        bad = bad | (arr > hi)
+    if not bool(np.any(bad)):
+        return None
+    flat = int(np.argmax(bad.astype(np.uint8)))
+    j = flat % arr.shape[1]
+    i = flat // arr.shape[1]
+    return (i, j)
+
+
+def _gpu_first_violation(arr_gpu, lo=None, hi=None):
+    """First (i, j) where `arr_gpu` is non-finite or out of [lo, hi], or None.
+
+    Mirrors `_npy_first_violation` but runs on a CuPy device array.
+    """
+    bad = ~cp.isfinite(arr_gpu)
+    if lo is not None:
+        bad = bad | (arr_gpu < lo)
+    if hi is not None:
+        bad = bad | (arr_gpu > hi)
+    if not bool(cp.any(bad)):
+        return None
+    flat = int(cp.argmax(bad.astype(cp.uint8)))
+    j = flat % arr_gpu.shape[1]
+    i = flat // arr_gpu.shape[1]
+    return (i, j)
+
+
+def _empty_failure_metadata():
+    """Default (no-failure) values for the debug metadata fields."""
+    return {
+        "failure_kind": None,
+        "first_nan_field": None,
+        "first_nan_index": None,
+        "first_nan_is_ghost": False,
+        "first_nan_is_axial_boundary": False,
+        "first_nan_is_phi_seam": False,
+        "nan_iter": None,
+    }
+
+
+def _validate_one_step_inputs(
+    H_curr,
+    H_prev,
+    P_prev,
+    theta_prev,
+    dt,
+    d_phi,
+    d_Z,
+    omega_p,
+    omega_theta,
+    p_eps,
+    theta_eps,
+):
+    """
+    Run on the host side before any GPU work. Returns (failure_meta, None)
+    on the first detected violation (no GPU side effects), or
+    (None, None) if everything is valid.
+
+    `failure_meta` matches the layout produced by
+    `_empty_failure_metadata` / consumed by the dict-return path.
+    """
+    N_Z, N_phi = H_curr.shape
+
+    # Scalar checks first — these don't have a (i, j) to report.
+    for name, val, lo in [
+        ("dt", dt, 0.0),
+        ("d_phi", d_phi, 0.0),
+        ("d_Z", d_Z, 0.0),
+    ]:
+        if not np.isfinite(val) or val <= lo:
+            meta = _empty_failure_metadata()
+            meta.update(
+                failure_kind="invalid_input",
+                first_nan_field=name,
+                nan_iter=0,
+            )
+            return meta
+    for name, val in [("omega_p", omega_p), ("omega_theta", omega_theta)]:
+        if not np.isfinite(val):
+            meta = _empty_failure_metadata()
+            meta.update(
+                failure_kind="invalid_input",
+                first_nan_field="omega",
+                nan_iter=0,
+            )
+            return meta
+
+    # Field checks — H must be finite and strictly positive, P must be
+    # >= -p_eps, theta must be in [-theta_eps, 1 + theta_eps].
+    for name, arr in [
+        ("H_prev", H_prev),
+        ("H_curr", H_curr),
+    ]:
+        idx = _npy_first_violation(arr, lo=0.0)
+        if idx is not None:
+            i, j = idx
+            is_ghost, is_axial, is_seam = _classify_index(i, j, N_Z, N_phi)
+            meta = _empty_failure_metadata()
+            meta.update(
+                failure_kind="invalid_input",
+                first_nan_field=name,
+                first_nan_index=(int(i), int(j)),
+                first_nan_is_ghost=is_ghost,
+                first_nan_is_axial_boundary=is_axial,
+                first_nan_is_phi_seam=is_seam,
+                nan_iter=0,
+            )
+            return meta
+
+    idx = _npy_first_violation(P_prev, lo=-p_eps)
+    if idx is not None:
+        i, j = idx
+        is_ghost, is_axial, is_seam = _classify_index(i, j, N_Z, N_phi)
+        meta = _empty_failure_metadata()
+        meta.update(
+            failure_kind="invalid_input",
+            first_nan_field="P_prev",
+            first_nan_index=(int(i), int(j)),
+            first_nan_is_ghost=is_ghost,
+            first_nan_is_axial_boundary=is_axial,
+            first_nan_is_phi_seam=is_seam,
+            nan_iter=0,
+        )
+        return meta
+
+    idx = _npy_first_violation(theta_prev, lo=-theta_eps, hi=1.0 + theta_eps)
+    if idx is not None:
+        i, j = idx
+        is_ghost, is_axial, is_seam = _classify_index(i, j, N_Z, N_phi)
+        meta = _empty_failure_metadata()
+        meta.update(
+            failure_kind="invalid_input",
+            first_nan_field="theta_prev",
+            first_nan_index=(int(i), int(j)),
+            first_nan_is_ghost=is_ghost,
+            first_nan_is_axial_boundary=is_axial,
+            first_nan_is_phi_seam=is_seam,
+            nan_iter=0,
+        )
+        return meta
+
+    return None
+
+
+def _check_state_gpu(P_gpu, theta_gpu, p_eps, theta_eps):
+    """
+    Locate the first violation on the GPU latest-iterate buffer.
+
+    Returns (failure_kind, field_name, (i, j)) on the first violation, or
+    None if everything is finite and within bounds. Priority order:
+        1. P non-finite                -> ("nonfinite_state", "P", idx)
+        2. theta non-finite            -> ("nonfinite_state", "theta", idx)
+        3. P out of [-p_eps, +inf]     -> ("out_of_range", "P", idx)
+        4. theta out of [-eps, 1+eps]  -> ("out_of_range", "theta", idx)
+    """
+    idx = _gpu_first_violation(P_gpu)
+    if idx is not None:
+        return "nonfinite_state", "P", idx
+    idx = _gpu_first_violation(theta_gpu)
+    if idx is not None:
+        return "nonfinite_state", "theta", idx
+    idx = _gpu_first_violation(P_gpu, lo=-p_eps)
+    if idx is not None:
+        return "out_of_range", "P", idx
+    idx = _gpu_first_violation(theta_gpu, lo=-theta_eps, hi=1.0 + theta_eps)
+    if idx is not None:
+        return "out_of_range", "theta", idx
+    return None
+
+
 def ausas_unsteady_one_step_gpu(
     H_curr,
     H_prev,
@@ -198,6 +401,14 @@ def ausas_unsteady_one_step_gpu(
     scheme: str = "rb",
     residual_norm: str = "linf",
     legacy_return: bool = False,
+    debug_checks: bool = False,
+    debug_check_every: int = 50,
+    debug_check_start_iter: int = 0,
+    debug_stop_on_nonfinite: bool = True,
+    debug_return_bad_state: bool = False,
+    debug_return_last_finite_state: bool = True,
+    debug_theta_eps: float = 1e-8,
+    debug_p_eps: float = 1e-12,
 ):
     """
     Advance (P, θ) by one real time step Δt using the unsteady Ausas
@@ -228,18 +439,59 @@ def ausas_unsteady_one_step_gpu(
         If True, return the historical 4-tuple
         (P, theta, residual, n_inner) for callers that haven't been
         migrated to the structured-dict API yet.
+    debug_checks : bool
+        Enable host-side input validation and periodic GPU-side
+        nonfinite / out-of-range checks during the inner loop. Default
+        False keeps the production path untouched. See Task 28 of the
+        diesel-debug ladder.
+    debug_check_every : int
+        How often (in inner-loop iterations) to run the GPU-side debug
+        check. The check is also run on iter 0. Has no effect when
+        ``debug_checks=False``.
+    debug_check_start_iter : int
+        Defer GPU debug checks until iteration index >= this value.
+        Default 0. Used by `scripts/replay_ausas_one_step_dump.py` to do
+        a coarse-then-fine refinement of `nan_iter` without paying the
+        per-sweep check cost on iterations preceding a known coarse
+        window.
+    debug_stop_on_nonfinite : bool
+        If True (default), abort the inner loop the moment a
+        non-finite or out-of-range cell is detected. The returned dict
+        carries the failure metadata; the inner loop does not continue.
+    debug_return_bad_state : bool
+        If True, snapshot the offending GPU state to CPU and return it
+        as ``P_bad`` / ``theta_bad`` in the result dict.
+    debug_return_last_finite_state : bool
+        If True (default), keep a CPU snapshot of the latest fully-finite
+        in-bounds state and return it as ``P`` / ``theta`` even when the
+        run aborts on a debug failure. Cannot silently propagate NaN
+        into the result.
+    debug_theta_eps, debug_p_eps : float
+        Numerical slack for the input/state validators.
 
     Returns
     -------
     dict (default) with keys:
-        "P" : (N_Z, N_phi) ndarray (CPU, float64)
-        "theta" : (N_Z, N_phi) ndarray (CPU, float64)
-        "residual" : float — primary stopping-criterion residual.
-        "residual_linf" : float — max-abs of (dP, dtheta) over interior.
-        "residual_rms" : float — RMS of (dP, dtheta) over interior.
-        "residual_l2_abs" : float — legacy unnormalized L2-sum.
+        "P", "theta" : (N_Z, N_phi) ndarray (CPU, float64) — last-finite
+            iterate when debug_return_last_finite_state is True and a
+            failure was detected; otherwise the latest iterate.
+        "residual", "residual_linf", "residual_rms",
+        "residual_l2_abs" : float
         "n_inner" : int — sweeps actually performed.
         "converged" : bool — explicit convergence flag.
+        "failure_kind" : Optional[str] — None on success, otherwise one
+            of {"invalid_input", "nonfinite_state", "out_of_range"}.
+        "first_nan_field" : Optional[str] — None on success, otherwise
+            one of {"P", "theta", "residual", "coeff", "H_prev",
+            "H_curr", "P_prev", "theta_prev", "input", "dt", "d_phi",
+            "d_Z", "omega"}.
+        "first_nan_index" : Optional[Tuple[int, int]]
+        "first_nan_is_ghost" : bool
+        "first_nan_is_axial_boundary" : bool
+        "first_nan_is_phi_seam" : bool
+        "nan_iter" : Optional[int]
+        "P_bad", "theta_bad" : present only when debug_return_bad_state
+            is True AND a failure was recorded.
     """
     if scheme not in ("rb", "jacobi"):
         raise ValueError(f"Unknown scheme {scheme!r}. Use 'rb' or 'jacobi'.")
@@ -260,6 +512,34 @@ def ausas_unsteady_one_step_gpu(
         raise ValueError("P_prev shape must match H_curr.")
     if theta_prev.shape != (N_Z, N_phi):
         raise ValueError("theta_prev shape must match H_curr.")
+
+    failure_meta = _empty_failure_metadata()
+
+    if debug_checks:
+        meta = _validate_one_step_inputs(
+            H_curr, H_prev, P_prev, theta_prev,
+            dt, d_phi, d_Z, omega_p, omega_theta,
+            debug_p_eps, debug_theta_eps,
+        )
+        if meta is not None and debug_stop_on_nonfinite:
+            # Bail out before allocating GPU memory. Return clean dict
+            # with NaN residuals — there were no iterations to measure.
+            zero_field = np.zeros((N_Z, N_phi), dtype=np.float64)
+            result = {
+                "P": zero_field,
+                "theta": zero_field.copy(),
+                "residual": float("nan"),
+                "residual_linf": float("nan"),
+                "residual_rms": float("nan"),
+                "residual_l2_abs": float("nan"),
+                "n_inner": 0,
+                "converged": False,
+            }
+            result.update(meta)
+            if debug_return_bad_state:
+                result["P_bad"] = P_prev.copy()
+                result["theta_bad"] = theta_prev.copy()
+            return result
 
     H_curr_gpu = cp.asarray(H_curr)
     H_prev_gpu = cp.asarray(H_prev)
