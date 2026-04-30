@@ -551,6 +551,44 @@ def ausas_unsteady_one_step_gpu(
 
     A, B, C, D, E = _build_coefficients_gpu(H_curr_gpu, d_phi, d_Z, R, L)
 
+    # Coefficient finite check (debug only). The CUDA kernel divides by E
+    # internally; a non-finite coefficient produces silent NaN propagation
+    # that shows up downstream as residual=NaN.
+    if debug_checks:
+        for cname, carr in (("A", A), ("B", B), ("C", C), ("D", D), ("E", E)):
+            idx = _gpu_first_violation(carr)
+            if idx is not None:
+                i, j = idx
+                is_ghost, is_axial, is_seam = _classify_index(
+                    i, j, N_Z, N_phi
+                )
+                failure_meta.update(
+                    failure_kind="nonfinite_state",
+                    first_nan_field="coeff",
+                    first_nan_index=(int(i), int(j)),
+                    first_nan_is_ghost=is_ghost,
+                    first_nan_is_axial_boundary=is_axial,
+                    first_nan_is_phi_seam=is_seam,
+                    nan_iter=0,
+                )
+                if debug_stop_on_nonfinite:
+                    zero_field = np.zeros((N_Z, N_phi), dtype=np.float64)
+                    result = {
+                        "P": zero_field,
+                        "theta": zero_field.copy(),
+                        "residual": float("nan"),
+                        "residual_linf": float("nan"),
+                        "residual_rms": float("nan"),
+                        "residual_l2_abs": float("nan"),
+                        "n_inner": 0,
+                        "converged": False,
+                    }
+                    result.update(failure_meta)
+                    if debug_return_bad_state:
+                        result["P_bad"] = P_prev.copy()
+                        result["theta_bad"] = theta_prev.copy()
+                    return result
+
     P_old = cp.asarray(P_prev)
     theta_old = cp.asarray(theta_prev)
     cp.maximum(P_old, 0.0, out=P_old)
@@ -590,6 +628,18 @@ def ausas_unsteady_one_step_gpu(
     residual_l2_abs = float("inf")
     converged = False
     n_inner = 0
+
+    # Last-finite-state snapshot machinery (Task 28). Initialised from the
+    # clamped/BC-corrected starting iterate; refreshed after every clean
+    # debug check.
+    last_finite_P_cpu = None
+    last_finite_theta_cpu = None
+    if debug_checks and debug_return_last_finite_state:
+        last_finite_P_cpu = cp.asnumpy(P_old)
+        last_finite_theta_cpu = cp.asnumpy(theta_old)
+    P_bad_cpu = None
+    theta_bad_cpu = None
+    debug_abort = False
 
     for k in range(max_inner):
         if scheme == "jacobi":
@@ -640,7 +690,9 @@ def ausas_unsteady_one_step_gpu(
                 )
         n_inner += 1
 
+        residual_just_computed = False
         if k % check_every == 0 or k < 3:
+            residual_just_computed = True
             # For Jacobi the latest iterate is in (P_new, theta_new); for
             # RB the latest iterate is in (P_old, theta_old) and the
             # previous-iterate snapshot is in (P_new, theta_new).
@@ -682,6 +734,67 @@ def ausas_unsteady_one_step_gpu(
                 P_new[:] = P_old
                 theta_new[:] = theta_old
 
+        # ------------------------------------------------------------------
+        # Debug-mode in-loop checks (Task 28). After the post-iteration
+        # swap (Jacobi) or in-place update (RB), the latest iterate is
+        # always in (P_old, theta_old) — so the check is buffer-uniform.
+        # ------------------------------------------------------------------
+        if debug_checks and not debug_abort:
+            do_debug_check = (
+                k >= debug_check_start_iter
+                and ((k - debug_check_start_iter) % debug_check_every == 0)
+            )
+
+            # Residual NaN/Inf is a real failure — flag it the moment it
+            # appears, regardless of debug_check_every cadence.
+            if residual_just_computed and not (
+                np.isfinite(residual_linf)
+                and np.isfinite(residual_rms)
+                and np.isfinite(residual_l2_abs)
+            ):
+                failure_meta.update(
+                    failure_kind="nonfinite_state",
+                    first_nan_field="residual",
+                    first_nan_index=None,
+                    first_nan_is_ghost=False,
+                    first_nan_is_axial_boundary=False,
+                    first_nan_is_phi_seam=False,
+                    nan_iter=int(k),
+                )
+                if debug_return_bad_state:
+                    P_bad_cpu = cp.asnumpy(P_old)
+                    theta_bad_cpu = cp.asnumpy(theta_old)
+                if debug_stop_on_nonfinite:
+                    debug_abort = True
+
+            if not debug_abort and do_debug_check:
+                state_violation = _check_state_gpu(
+                    P_old, theta_old, debug_p_eps, debug_theta_eps,
+                )
+                if state_violation is None:
+                    if debug_return_last_finite_state:
+                        last_finite_P_cpu = cp.asnumpy(P_old)
+                        last_finite_theta_cpu = cp.asnumpy(theta_old)
+                else:
+                    fkind, ffield, (fi, fj) = state_violation
+                    is_ghost, is_axial, is_seam = _classify_index(
+                        fi, fj, N_Z, N_phi
+                    )
+                    failure_meta.update(
+                        failure_kind=fkind,
+                        first_nan_field=ffield,
+                        first_nan_index=(int(fi), int(fj)),
+                        first_nan_is_ghost=is_ghost,
+                        first_nan_is_axial_boundary=is_axial,
+                        first_nan_is_phi_seam=is_seam,
+                        nan_iter=int(k),
+                    )
+                    if debug_return_bad_state:
+                        P_bad_cpu = cp.asnumpy(P_old)
+                        theta_bad_cpu = cp.asnumpy(theta_old)
+                    if debug_stop_on_nonfinite:
+                        debug_abort = True
+
         if converged:
             if verbose:
                 print(
@@ -690,8 +803,23 @@ def ausas_unsteady_one_step_gpu(
                 )
             break
 
-    P_cpu = cp.asnumpy(P_old)
-    theta_cpu = cp.asnumpy(theta_old)
+        if debug_abort:
+            break
+
+    # If we aborted on a debug failure with debug_return_last_finite_state
+    # set, prefer the snapshot to avoid leaking NaN into the result. Other
+    # paths return the latest GPU iterate.
+    if (
+        debug_checks
+        and failure_meta["failure_kind"] is not None
+        and debug_return_last_finite_state
+        and last_finite_P_cpu is not None
+    ):
+        P_cpu = last_finite_P_cpu
+        theta_cpu = last_finite_theta_cpu
+    else:
+        P_cpu = cp.asnumpy(P_old)
+        theta_cpu = cp.asnumpy(theta_old)
 
     primary_residual = (
         residual_linf if residual_norm == "linf" else residual_rms
@@ -700,7 +828,7 @@ def ausas_unsteady_one_step_gpu(
     if legacy_return:
         return P_cpu, theta_cpu, float(primary_residual), n_inner
 
-    return {
+    result = {
         "P": P_cpu,
         "theta": theta_cpu,
         "residual": float(primary_residual),
@@ -710,6 +838,11 @@ def ausas_unsteady_one_step_gpu(
         "n_inner": int(n_inner),
         "converged": bool(converged),
     }
+    result.update(failure_meta)
+    if debug_return_bad_state and P_bad_cpu is not None:
+        result["P_bad"] = P_bad_cpu
+        result["theta_bad"] = theta_bad_cpu
+    return result
 
 
 # ===========================================================================

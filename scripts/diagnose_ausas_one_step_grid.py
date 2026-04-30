@@ -78,9 +78,18 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from reynolds_solver.cavitation.ausas.solver_dynamic_gpu import (  # noqa: E402
-    ausas_unsteady_one_step_gpu,
-)
+# Solver import is deferred to keep ``--help`` usable on hosts without
+# CuPy / a CUDA device.
+def _import_solver():
+    from reynolds_solver.cavitation.ausas.solver_dynamic_gpu import (
+        ausas_unsteady_one_step_gpu,
+    )
+    return ausas_unsteady_one_step_gpu
+
+
+# Module-level placeholder so callers can `ausas_unsteady_one_step_gpu(...)`
+# after ``run_one`` / ``run_shape_lite_one`` resolve it lazily.
+ausas_unsteady_one_step_gpu = None
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +202,277 @@ GRIDS = [
 
 
 # ---------------------------------------------------------------------------
+# Shape-lite mode (Task 31)
+#
+# A coarse screen for shape-dependent kernel/ghost/BC bugs on synthetic H.
+# Passing --shape-lite is a NECESSARY-but-not-SUFFICIENT check: a clean
+# shape-lite run does NOT prove that real diesel transient dumps will
+# pass — it only filters the most obvious shape-dependent failures.
+# Real dumps must still go through scripts/replay_ausas_one_step_dump.py.
+# ---------------------------------------------------------------------------
+SHAPE_LITE_N_PHI = [159, 160, 161, 239, 240, 241, 319, 320, 321]
+SHAPE_LITE_N_Z   = [59,  60,  61,  79,  80,  81,  99,  100, 101]
+
+SHAPE_LITE_CASES = {
+    # name -> (case_detail, gap_builder, eps_prev, eps_curr)
+    "smooth_e06":  ("smooth",       smooth_gap,   0.55, 0.60),
+    "smooth_e085": ("smooth",       smooth_gap,   0.84, 0.85),
+    "g4_e06":      ("g4_synthetic", textured_gap, 0.55, 0.60),
+    "g4_e085":     ("g4_synthetic", textured_gap, 0.84, 0.85),
+}
+
+SHAPE_LITE_FIELDS = [
+    "N_phi", "N_z", "padded_width", "scheme", "case", "case_detail",
+    "converged", "failure_kind", "nan_iter", "first_nan_field",
+    "first_nan_i", "first_nan_j",
+    "first_nan_is_ghost", "first_nan_is_axial_boundary",
+    "first_nan_is_phi_seam",
+    "residual_linf", "residual_rms", "residual_l2_abs",
+    "n_inner",
+    "pmax_nd", "theta_min", "theta_max",
+    "nonfinite_count", "wall_time_s",
+]
+
+
+def _shape_lite_initial_state(N_phi: int, N_z: int, theta_perturb: float,
+                              rng: np.random.Generator):
+    """Finite, bounded initial state. P=0, theta in [0, 1]."""
+    P_prev = np.zeros((N_z, N_phi), dtype=np.float64)
+    theta_prev = np.ones((N_z, N_phi), dtype=np.float64)
+    if theta_perturb > 0.0:
+        delta = rng.uniform(
+            -theta_perturb, theta_perturb, size=theta_prev.shape
+        )
+        np.clip(theta_prev + delta, 0.0, 1.0, out=theta_prev)
+    return P_prev, theta_prev
+
+
+def _empty_shape_lite_row(*, N_phi, N_z, scheme, case, case_detail,
+                          failure_kind):
+    return {
+        "N_phi": N_phi,
+        "N_z": N_z,
+        "padded_width": N_phi + 2,
+        "scheme": scheme,
+        "case": case,
+        "case_detail": case_detail,
+        "converged": 0,
+        "failure_kind": failure_kind,
+        "nan_iter": "",
+        "first_nan_field": "",
+        "first_nan_i": "",
+        "first_nan_j": "",
+        "first_nan_is_ghost": "",
+        "first_nan_is_axial_boundary": "",
+        "first_nan_is_phi_seam": "",
+        "residual_linf": "",
+        "residual_rms": "",
+        "residual_l2_abs": "",
+        "n_inner": "",
+        "pmax_nd": "",
+        "theta_min": "",
+        "theta_max": "",
+        "nonfinite_count": "",
+        "wall_time_s": "",
+    }
+
+
+def run_shape_lite_one(
+    case_name: str,
+    case_detail: str,
+    gap_builder,
+    eps_prev: float,
+    eps_curr: float,
+    N_phi: int,
+    N_z: int,
+    *,
+    scheme: str,
+    tol: float,
+    max_inner: int,
+    dt: float,
+    debug_checks: bool,
+    rng: np.random.Generator,
+    theta_perturb: float,
+):
+    # On the padded one-step grid we want the *physical* phi count to be
+    # exactly the user's --n-phi-list value. The solver works in padded
+    # coordinates internally, so we feed shape (N_z, N_phi+2).
+    N_phi_padded = N_phi + 2
+
+    H_prev = gap_builder(N_phi_padded, N_z, eps_prev)
+    H_curr = gap_builder(N_phi_padded, N_z, eps_curr)
+    P_prev, theta_prev = _shape_lite_initial_state(
+        N_phi_padded, N_z, theta_perturb, rng,
+    )
+
+    _phi, _z, d_phi, d_Z = _phi_z_grids(N_phi_padded, N_z)
+    R = 1.0
+    L = 1.0
+
+    t0 = time.perf_counter()
+    out = ausas_unsteady_one_step_gpu(
+        H_curr, H_prev, P_prev, theta_prev,
+        dt, d_phi, d_Z, R, L,
+        alpha=1.0, omega_p=1.0, omega_theta=1.0,
+        tol=tol, max_inner=max_inner,
+        p_bc_z0=0.0, p_bc_zL=0.0,
+        theta_bc_z0=1.0, theta_bc_zL=1.0,
+        periodic_phi=True, periodic_z=False,
+        check_every=25,
+        scheme=scheme,
+        residual_norm="linf",
+        verbose=False,
+        debug_checks=debug_checks,
+        debug_check_every=50,
+        debug_stop_on_nonfinite=True,
+        debug_return_last_finite_state=True,
+        debug_return_bad_state=False,
+    )
+    wall = time.perf_counter() - t0
+
+    P = np.asarray(out["P"])
+    theta = np.asarray(out["theta"])
+    P_int = P[1:-1, 1:-1] if P.size else P
+    theta_int = theta[1:-1, 1:-1] if theta.size else theta
+    nonfinite = int(
+        np.sum(~np.isfinite(P_int)) + np.sum(~np.isfinite(theta_int))
+    )
+
+    idx = out.get("first_nan_index")
+    if idx is not None:
+        fi, fj = int(idx[0]), int(idx[1])
+    else:
+        fi = ""
+        fj = ""
+
+    return {
+        "N_phi": N_phi,
+        "N_z": N_z,
+        "padded_width": N_phi_padded,
+        "scheme": scheme,
+        "case": case_name,
+        "case_detail": case_detail,
+        "converged": int(bool(out.get("converged", False))),
+        "failure_kind": out.get("failure_kind") or "",
+        "nan_iter": (
+            "" if out.get("nan_iter") is None else int(out["nan_iter"])
+        ),
+        "first_nan_field": out.get("first_nan_field") or "",
+        "first_nan_i": fi,
+        "first_nan_j": fj,
+        "first_nan_is_ghost": int(bool(out.get(
+            "first_nan_is_ghost", False
+        ))),
+        "first_nan_is_axial_boundary": int(bool(out.get(
+            "first_nan_is_axial_boundary", False
+        ))),
+        "first_nan_is_phi_seam": int(bool(out.get(
+            "first_nan_is_phi_seam", False
+        ))),
+        "residual_linf": float(out.get("residual_linf", float("nan"))),
+        "residual_rms": float(out.get("residual_rms", float("nan"))),
+        "residual_l2_abs": float(out.get(
+            "residual_l2_abs", float("nan")
+        )),
+        "n_inner": int(out.get("n_inner", 0)),
+        "pmax_nd": float(np.nanmax(P_int)) if P_int.size else float("nan"),
+        "theta_min": float(np.nanmin(theta_int)) if theta_int.size
+                     else float("nan"),
+        "theta_max": float(np.nanmax(theta_int)) if theta_int.size
+                     else float("nan"),
+        "nonfinite_count": nonfinite,
+        "wall_time_s": wall,
+    }
+
+
+def run_shape_lite(args) -> int:
+    """Entry point for --shape-lite. Returns exit code."""
+    global ausas_unsteady_one_step_gpu
+    if ausas_unsteady_one_step_gpu is None:
+        ausas_unsteady_one_step_gpu = _import_solver()
+    n_phi_list = (
+        [int(x) for x in args.n_phi_list.split(",")]
+        if args.n_phi_list else SHAPE_LITE_N_PHI
+    )
+    n_z_list = (
+        [int(x) for x in args.n_z_list.split(",")]
+        if args.n_z_list else SHAPE_LITE_N_Z
+    )
+    case_names = (
+        [c.strip() for c in args.cases.split(",")]
+        if isinstance(args.cases, str) and args.cases
+        else list(SHAPE_LITE_CASES.keys())
+    )
+    bad = [c for c in case_names if c not in SHAPE_LITE_CASES]
+    if bad:
+        raise SystemExit(
+            f"unknown shape-lite case(s) {bad}. "
+            f"Allowed: {sorted(SHAPE_LITE_CASES)}"
+        )
+
+    schemes = (
+        [s.strip() for s in args.schemes_str.split(",")]
+        if args.schemes_str else ["rb", "jacobi"]
+    )
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    rng = np.random.default_rng(args.seed)
+    rows = []
+    print(
+        "shape-lite is a coarse screen only; real transient dumps are"
+        " still required to clear the solver."
+    )
+    for scheme in schemes:
+        for case_name in case_names:
+            case_detail, builder, eps_prev, eps_curr = SHAPE_LITE_CASES[
+                case_name
+            ]
+            for N_phi in n_phi_list:
+                for N_z in n_z_list:
+                    tag = (
+                        f"[{scheme}] {case_name:<11s} "
+                        f"{N_phi:>3d}/{N_z:<3d}"
+                    )
+                    try:
+                        row = run_shape_lite_one(
+                            case_name, case_detail, builder,
+                            eps_prev, eps_curr,
+                            N_phi, N_z,
+                            scheme=scheme,
+                            tol=args.tol,
+                            max_inner=args.max_inner,
+                            dt=args.dt_tau,
+                            debug_checks=args.debug_checks,
+                            rng=rng,
+                            theta_perturb=args.random_theta_perturb,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"  {tag}: EXC {type(exc).__name__}: {exc}")
+                        row = _empty_shape_lite_row(
+                            N_phi=N_phi, N_z=N_z, scheme=scheme,
+                            case=case_name, case_detail=case_detail,
+                            failure_kind=f"exception:{type(exc).__name__}",
+                        )
+                    rows.append(row)
+                    print(
+                        f"  {tag}: conv={row['converged']} "
+                        f"fk={row['failure_kind'] or '-'} "
+                        f"ni={row['nan_iter']} "
+                        f"linf={row['residual_linf']}"
+                    )
+
+    with out_path.open("w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=SHAPE_LITE_FIELDS)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    print(f"\nWrote {len(rows)} rows to {out_path}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 def run_one(
@@ -263,14 +543,14 @@ def main():
     p.add_argument(
         "--output",
         default=str(ROOT / "diagnose_ausas_one_step_grid.csv"),
-        help="Output CSV path.",
+        help="Output CSV path (legacy mode).",
     )
     p.add_argument(
         "--schemes",
         nargs="+",
         default=["rb", "jacobi"],
         choices=["rb", "jacobi"],
-        help="Schemes to evaluate. Default: both.",
+        help="Schemes to evaluate (legacy mode). Default: both.",
     )
     p.add_argument("--tol", type=float, default=1e-4)
     p.add_argument("--max-inner", type=int, default=5000)
@@ -282,15 +562,60 @@ def main():
     )
     p.add_argument(
         "--cases",
-        nargs="+",
         default=None,
-        help="Restrict to a subset of case names. Default: all.",
+        help="Comma-separated subset of case names. "
+             "Legacy mode default: all CASES; "
+             "--shape-lite default: all four shape-lite cases.",
+    )
+
+    # --- shape-lite mode (Task 31) ---------------------------------------
+    p.add_argument(
+        "--shape-lite", action="store_true",
+        help="Coarse screen for shape-dependent kernel/ghost/BC bugs on "
+             "synthetic H. Does NOT replace real dump replay.",
+    )
+    p.add_argument(
+        "--n-phi-list", default="",
+        help="Comma-separated physical N_phi list (shape-lite). Default: "
+             "159,160,161,239,240,241,319,320,321.",
+    )
+    p.add_argument(
+        "--n-z-list", default="",
+        help="Comma-separated N_z list (shape-lite). Default: "
+             "59,60,61,79,80,81,99,100,101.",
+    )
+    p.add_argument(
+        "--schemes-str", default="",
+        help="Comma-separated scheme list for shape-lite mode "
+             "(default: rb,jacobi). Distinct from --schemes to keep "
+             "legacy mode unaffected.",
+    )
+    p.add_argument(
+        "--debug-checks", action="store_true",
+        help="Enable debug_checks=True in shape-lite mode.",
+    )
+    p.add_argument(
+        "--random-theta-perturb", type=float, default=0.0,
+        help="Bounded random perturbation amplitude for theta_prev "
+             "(shape-lite). Default 0.0 (no perturbation).",
+    )
+    p.add_argument("--seed", type=int, default=12345)
+    p.add_argument(
+        "--out", default="shape_sweep_lite.csv",
+        help="CSV output path for shape-lite mode.",
     )
     args = p.parse_args()
 
+    if args.shape_lite:
+        return run_shape_lite(args)
+
+    global ausas_unsteady_one_step_gpu
+    if ausas_unsteady_one_step_gpu is None:
+        ausas_unsteady_one_step_gpu = _import_solver()
+
     cases = CASES
     if args.cases is not None:
-        keep = set(args.cases)
+        keep = {c.strip() for c in args.cases.split(",") if c.strip()}
         cases = [c for c in CASES if c[0] in keep]
         if not cases:
             raise SystemExit(f"No cases match {args.cases!r}")
