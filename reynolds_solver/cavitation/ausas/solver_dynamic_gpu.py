@@ -168,6 +168,209 @@ def _launch_bc(
 # ===========================================================================
 # Stage 1 : one-step wrapper (unchanged semantics, extended BC)
 # ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Debug / nonfinite-trace helpers (Task 28). All gated by debug_checks=True
+# in the one-step wrapper so production path stays untouched.
+# ---------------------------------------------------------------------------
+def _classify_index(i: int, j: int, N_Z: int, N_phi: int):
+    """
+    Three-bool localization for a (i, j) cell on the padded one-step grid.
+
+    `first_nan_is_ghost`           — index is inside the phi ghost column
+                                     (j == 0 or j == N_phi - 1).
+    `first_nan_is_axial_boundary`  — index is on the z-boundary row
+                                     (i == 0 or i == N_Z - 1).
+    `first_nan_is_phi_seam`        — index is in the ghost column OR in a
+                                     physical seam-adjacent interior column
+                                     (j == 1 or j == N_phi - 2).
+    """
+    is_ghost = (j == 0) or (j == N_phi - 1)
+    is_axial_boundary = (i == 0) or (i == N_Z - 1)
+    is_phi_seam = is_ghost or (j == 1) or (j == N_phi - 2)
+    return bool(is_ghost), bool(is_axial_boundary), bool(is_phi_seam)
+
+
+def _npy_first_violation(arr, lo=None, hi=None):
+    """First (i, j) where `arr` is non-finite or out of [lo, hi], or None.
+
+    `arr` must be a numpy ndarray. Used for input-state validation before
+    we touch the GPU.
+    """
+    bad = ~np.isfinite(arr)
+    if lo is not None:
+        bad = bad | (arr < lo)
+    if hi is not None:
+        bad = bad | (arr > hi)
+    if not bool(np.any(bad)):
+        return None
+    flat = int(np.argmax(bad.astype(np.uint8)))
+    j = flat % arr.shape[1]
+    i = flat // arr.shape[1]
+    return (i, j)
+
+
+def _gpu_first_violation(arr_gpu, lo=None, hi=None):
+    """First (i, j) where `arr_gpu` is non-finite or out of [lo, hi], or None.
+
+    Mirrors `_npy_first_violation` but runs on a CuPy device array.
+    """
+    bad = ~cp.isfinite(arr_gpu)
+    if lo is not None:
+        bad = bad | (arr_gpu < lo)
+    if hi is not None:
+        bad = bad | (arr_gpu > hi)
+    if not bool(cp.any(bad)):
+        return None
+    flat = int(cp.argmax(bad.astype(cp.uint8)))
+    j = flat % arr_gpu.shape[1]
+    i = flat // arr_gpu.shape[1]
+    return (i, j)
+
+
+def _empty_failure_metadata():
+    """Default (no-failure) values for the debug metadata fields."""
+    return {
+        "failure_kind": None,
+        "first_nan_field": None,
+        "first_nan_index": None,
+        "first_nan_is_ghost": False,
+        "first_nan_is_axial_boundary": False,
+        "first_nan_is_phi_seam": False,
+        "nan_iter": None,
+    }
+
+
+def _validate_one_step_inputs(
+    H_curr,
+    H_prev,
+    P_prev,
+    theta_prev,
+    dt,
+    d_phi,
+    d_Z,
+    omega_p,
+    omega_theta,
+    p_eps,
+    theta_eps,
+):
+    """
+    Run on the host side before any GPU work. Returns (failure_meta, None)
+    on the first detected violation (no GPU side effects), or
+    (None, None) if everything is valid.
+
+    `failure_meta` matches the layout produced by
+    `_empty_failure_metadata` / consumed by the dict-return path.
+    """
+    N_Z, N_phi = H_curr.shape
+
+    # Scalar checks first — these don't have a (i, j) to report.
+    for name, val, lo in [
+        ("dt", dt, 0.0),
+        ("d_phi", d_phi, 0.0),
+        ("d_Z", d_Z, 0.0),
+    ]:
+        if not np.isfinite(val) or val <= lo:
+            meta = _empty_failure_metadata()
+            meta.update(
+                failure_kind="invalid_input",
+                first_nan_field=name,
+                nan_iter=0,
+            )
+            return meta
+    for name, val in [("omega_p", omega_p), ("omega_theta", omega_theta)]:
+        if not np.isfinite(val):
+            meta = _empty_failure_metadata()
+            meta.update(
+                failure_kind="invalid_input",
+                first_nan_field="omega",
+                nan_iter=0,
+            )
+            return meta
+
+    # Field checks — H must be finite and strictly positive, P must be
+    # >= -p_eps, theta must be in [-theta_eps, 1 + theta_eps].
+    for name, arr in [
+        ("H_prev", H_prev),
+        ("H_curr", H_curr),
+    ]:
+        idx = _npy_first_violation(arr, lo=0.0)
+        if idx is not None:
+            i, j = idx
+            is_ghost, is_axial, is_seam = _classify_index(i, j, N_Z, N_phi)
+            meta = _empty_failure_metadata()
+            meta.update(
+                failure_kind="invalid_input",
+                first_nan_field=name,
+                first_nan_index=(int(i), int(j)),
+                first_nan_is_ghost=is_ghost,
+                first_nan_is_axial_boundary=is_axial,
+                first_nan_is_phi_seam=is_seam,
+                nan_iter=0,
+            )
+            return meta
+
+    idx = _npy_first_violation(P_prev, lo=-p_eps)
+    if idx is not None:
+        i, j = idx
+        is_ghost, is_axial, is_seam = _classify_index(i, j, N_Z, N_phi)
+        meta = _empty_failure_metadata()
+        meta.update(
+            failure_kind="invalid_input",
+            first_nan_field="P_prev",
+            first_nan_index=(int(i), int(j)),
+            first_nan_is_ghost=is_ghost,
+            first_nan_is_axial_boundary=is_axial,
+            first_nan_is_phi_seam=is_seam,
+            nan_iter=0,
+        )
+        return meta
+
+    idx = _npy_first_violation(theta_prev, lo=-theta_eps, hi=1.0 + theta_eps)
+    if idx is not None:
+        i, j = idx
+        is_ghost, is_axial, is_seam = _classify_index(i, j, N_Z, N_phi)
+        meta = _empty_failure_metadata()
+        meta.update(
+            failure_kind="invalid_input",
+            first_nan_field="theta_prev",
+            first_nan_index=(int(i), int(j)),
+            first_nan_is_ghost=is_ghost,
+            first_nan_is_axial_boundary=is_axial,
+            first_nan_is_phi_seam=is_seam,
+            nan_iter=0,
+        )
+        return meta
+
+    return None
+
+
+def _check_state_gpu(P_gpu, theta_gpu, p_eps, theta_eps):
+    """
+    Locate the first violation on the GPU latest-iterate buffer.
+
+    Returns (failure_kind, field_name, (i, j)) on the first violation, or
+    None if everything is finite and within bounds. Priority order:
+        1. P non-finite                -> ("nonfinite_state", "P", idx)
+        2. theta non-finite            -> ("nonfinite_state", "theta", idx)
+        3. P out of [-p_eps, +inf]     -> ("out_of_range", "P", idx)
+        4. theta out of [-eps, 1+eps]  -> ("out_of_range", "theta", idx)
+    """
+    idx = _gpu_first_violation(P_gpu)
+    if idx is not None:
+        return "nonfinite_state", "P", idx
+    idx = _gpu_first_violation(theta_gpu)
+    if idx is not None:
+        return "nonfinite_state", "theta", idx
+    idx = _gpu_first_violation(P_gpu, lo=-p_eps)
+    if idx is not None:
+        return "out_of_range", "P", idx
+    idx = _gpu_first_violation(theta_gpu, lo=-theta_eps, hi=1.0 + theta_eps)
+    if idx is not None:
+        return "out_of_range", "theta", idx
+    return None
+
+
 def ausas_unsteady_one_step_gpu(
     H_curr,
     H_prev,
@@ -195,23 +398,108 @@ def ausas_unsteady_one_step_gpu(
     periodic_z=False,
     check_every=50,
     verbose=False,
+    scheme: str = "rb",
+    residual_norm: str = "linf",
+    legacy_return: bool = False,
+    debug_checks: bool = False,
+    debug_check_every: int = 50,
+    debug_check_start_iter: int = 0,
+    debug_stop_on_nonfinite: bool = True,
+    debug_return_bad_state: bool = False,
+    debug_return_last_finite_state: bool = True,
+    debug_theta_eps: float = 1e-8,
+    debug_p_eps: float = 1e-12,
 ):
     """
     Advance (P, θ) by one real time step Δt using the unsteady Ausas
-    Jacobi kernel. See module docstring for discretization details.
+    kernel. See module docstring for discretization details.
 
     Axis-BC semantics: each axis (φ, Z) is either periodic or Dirichlet.
     For a Dirichlet axis, (p_bc_<axis>0, p_bc_<axis>L) and the matching
     θ-Dirichlet values are written into the ghost row/column by the BC
     kernel after each sweep.
 
+    Parameters
+    ----------
+    scheme : {"rb", "jacobi"}
+        Inner-loop relaxation. "rb" (default) is the in-place Red-Black
+        SOR path used by the Stage-2 prescribed-h solver — converges in
+        O(N) sweeps and is the recommended path for diesel transients.
+        "jacobi" keeps the legacy frozen-iterate Jacobi sweep for
+        reference / regression checks.
+    residual_norm : {"linf", "rms"}
+        Stopping criterion. Both norms are computed and reported; this
+        flag selects which one is checked against `tol`. The legacy
+        absolute L2 sum (sqrt(sum dP^2) + sqrt(sum dtheta^2)) — which
+        scales with sqrt(N_interior) and is the source of false
+        non-convergence reports on finer grids — is reported as
+        `residual_l2_abs` for diagnostic comparison only and is NEVER
+        used as a stopping criterion.
+    legacy_return : bool
+        If True, return the historical 4-tuple
+        (P, theta, residual, n_inner) for callers that haven't been
+        migrated to the structured-dict API yet.
+    debug_checks : bool
+        Enable host-side input validation and periodic GPU-side
+        nonfinite / out-of-range checks during the inner loop. Default
+        False keeps the production path untouched. See Task 28 of the
+        diesel-debug ladder.
+    debug_check_every : int
+        How often (in inner-loop iterations) to run the GPU-side debug
+        check. The check is also run on iter 0. Has no effect when
+        ``debug_checks=False``.
+    debug_check_start_iter : int
+        Defer GPU debug checks until iteration index >= this value.
+        Default 0. Used by `scripts/replay_ausas_one_step_dump.py` to do
+        a coarse-then-fine refinement of `nan_iter` without paying the
+        per-sweep check cost on iterations preceding a known coarse
+        window.
+    debug_stop_on_nonfinite : bool
+        If True (default), abort the inner loop the moment a
+        non-finite or out-of-range cell is detected. The returned dict
+        carries the failure metadata; the inner loop does not continue.
+    debug_return_bad_state : bool
+        If True, snapshot the offending GPU state to CPU and return it
+        as ``P_bad`` / ``theta_bad`` in the result dict.
+    debug_return_last_finite_state : bool
+        If True (default), keep a CPU snapshot of the latest fully-finite
+        in-bounds state and return it as ``P`` / ``theta`` even when the
+        run aborts on a debug failure. Cannot silently propagate NaN
+        into the result.
+    debug_theta_eps, debug_p_eps : float
+        Numerical slack for the input/state validators.
+
     Returns
     -------
-    P : (N_Z, N_phi) ndarray (CPU, float64)
-    theta : (N_Z, N_phi) ndarray (CPU, float64)
-    residual : float — last inner residual at time step n.
-    n_inner : int — Jacobi sweeps actually performed.
+    dict (default) with keys:
+        "P", "theta" : (N_Z, N_phi) ndarray (CPU, float64) — last-finite
+            iterate when debug_return_last_finite_state is True and a
+            failure was detected; otherwise the latest iterate.
+        "residual", "residual_linf", "residual_rms",
+        "residual_l2_abs" : float
+        "n_inner" : int — sweeps actually performed.
+        "converged" : bool — explicit convergence flag.
+        "failure_kind" : Optional[str] — None on success, otherwise one
+            of {"invalid_input", "nonfinite_state", "out_of_range"}.
+        "first_nan_field" : Optional[str] — None on success, otherwise
+            one of {"P", "theta", "residual", "coeff", "H_prev",
+            "H_curr", "P_prev", "theta_prev", "input", "dt", "d_phi",
+            "d_Z", "omega"}.
+        "first_nan_index" : Optional[Tuple[int, int]]
+        "first_nan_is_ghost" : bool
+        "first_nan_is_axial_boundary" : bool
+        "first_nan_is_phi_seam" : bool
+        "nan_iter" : Optional[int]
+        "P_bad", "theta_bad" : present only when debug_return_bad_state
+            is True AND a failure was recorded.
     """
+    if scheme not in ("rb", "jacobi"):
+        raise ValueError(f"Unknown scheme {scheme!r}. Use 'rb' or 'jacobi'.")
+    if residual_norm not in ("linf", "rms"):
+        raise ValueError(
+            f"Unknown residual_norm {residual_norm!r}. Use 'linf' or 'rms'."
+        )
+
     H_curr = np.ascontiguousarray(H_curr, dtype=np.float64)
     H_prev = np.ascontiguousarray(H_prev, dtype=np.float64)
     P_prev = np.ascontiguousarray(P_prev, dtype=np.float64)
@@ -225,6 +513,34 @@ def ausas_unsteady_one_step_gpu(
     if theta_prev.shape != (N_Z, N_phi):
         raise ValueError("theta_prev shape must match H_curr.")
 
+    failure_meta = _empty_failure_metadata()
+
+    if debug_checks:
+        meta = _validate_one_step_inputs(
+            H_curr, H_prev, P_prev, theta_prev,
+            dt, d_phi, d_Z, omega_p, omega_theta,
+            debug_p_eps, debug_theta_eps,
+        )
+        if meta is not None and debug_stop_on_nonfinite:
+            # Bail out before allocating GPU memory. Return clean dict
+            # with NaN residuals — there were no iterations to measure.
+            zero_field = np.zeros((N_Z, N_phi), dtype=np.float64)
+            result = {
+                "P": zero_field,
+                "theta": zero_field.copy(),
+                "residual": float("nan"),
+                "residual_linf": float("nan"),
+                "residual_rms": float("nan"),
+                "residual_l2_abs": float("nan"),
+                "n_inner": 0,
+                "converged": False,
+            }
+            result.update(meta)
+            if debug_return_bad_state:
+                result["P_bad"] = P_prev.copy()
+                result["theta_bad"] = theta_prev.copy()
+            return result
+
     H_curr_gpu = cp.asarray(H_curr)
     H_prev_gpu = cp.asarray(H_prev)
     _pack_ghosts(H_curr_gpu, periodic_phi, periodic_z)
@@ -234,6 +550,44 @@ def ausas_unsteady_one_step_gpu(
     C_prev = theta_prev_gpu * H_prev_gpu
 
     A, B, C, D, E = _build_coefficients_gpu(H_curr_gpu, d_phi, d_Z, R, L)
+
+    # Coefficient finite check (debug only). The CUDA kernel divides by E
+    # internally; a non-finite coefficient produces silent NaN propagation
+    # that shows up downstream as residual=NaN.
+    if debug_checks:
+        for cname, carr in (("A", A), ("B", B), ("C", C), ("D", D), ("E", E)):
+            idx = _gpu_first_violation(carr)
+            if idx is not None:
+                i, j = idx
+                is_ghost, is_axial, is_seam = _classify_index(
+                    i, j, N_Z, N_phi
+                )
+                failure_meta.update(
+                    failure_kind="nonfinite_state",
+                    first_nan_field="coeff",
+                    first_nan_index=(int(i), int(j)),
+                    first_nan_is_ghost=is_ghost,
+                    first_nan_is_axial_boundary=is_axial,
+                    first_nan_is_phi_seam=is_seam,
+                    nan_iter=0,
+                )
+                if debug_stop_on_nonfinite:
+                    zero_field = np.zeros((N_Z, N_phi), dtype=np.float64)
+                    result = {
+                        "P": zero_field,
+                        "theta": zero_field.copy(),
+                        "residual": float("nan"),
+                        "residual_linf": float("nan"),
+                        "residual_rms": float("nan"),
+                        "residual_l2_abs": float("nan"),
+                        "n_inner": 0,
+                        "converged": False,
+                    }
+                    result.update(failure_meta)
+                    if debug_return_bad_state:
+                        result["P_bad"] = P_prev.copy()
+                        result["theta_bad"] = theta_prev.copy()
+                    return result
 
     P_old = cp.asarray(P_prev)
     theta_old = cp.asarray(theta_prev)
@@ -249,7 +603,12 @@ def ausas_unsteady_one_step_gpu(
     P_new = P_old.copy()
     theta_new = theta_old.copy()
 
-    kernel = get_unsteady_ausas_kernel()
+    if scheme == "jacobi":
+        jac_kernel = get_unsteady_ausas_kernel()
+        rb_kernel = None
+    else:
+        jac_kernel = None
+        rb_kernel = get_unsteady_ausas_rb_kernel()
     bc_phi_kernel = get_unsteady_ausas_bc_phi_kernel()
     bc_z_kernel = get_unsteady_ausas_bc_z_kernel()
     block, grid, bc_block, bc_grid_phi, bc_grid_z = _launch_configs(N_Z, N_phi)
@@ -257,56 +616,233 @@ def ausas_unsteady_one_step_gpu(
     pphi = 1 if periodic_phi else 0
     pz = 1 if periodic_z else 0
 
-    residual = float("inf")
+    # Interior cell count for the RMS denominator. For both periodic and
+    # Dirichlet boundaries the iterate-difference is well-defined on the
+    # interior slice [1:-1, 1:-1]; ghost rows/cols carry either a copy of
+    # the seam (periodic) or a constant (Dirichlet) and don't need to be
+    # included in the residual.
+    n_interior = max((N_Z - 2) * (N_phi - 2), 1)
+
+    residual_linf = float("inf")
+    residual_rms = float("inf")
+    residual_l2_abs = float("inf")
+    converged = False
     n_inner = 0
+
+    # Last-finite-state snapshot machinery (Task 28). Initialised from the
+    # clamped/BC-corrected starting iterate; refreshed after every clean
+    # debug check.
+    last_finite_P_cpu = None
+    last_finite_theta_cpu = None
+    if debug_checks and debug_return_last_finite_state:
+        last_finite_P_cpu = cp.asnumpy(P_old)
+        last_finite_theta_cpu = cp.asnumpy(theta_old)
+    P_bad_cpu = None
+    theta_bad_cpu = None
+    debug_abort = False
+
     for k in range(max_inner):
-        kernel(
-            grid, block,
-            (
-                P_old, P_new, theta_old, theta_new,
-                H_curr_gpu, C_prev,
-                A, B, C, D, E,
-                np.float64(d_phi), np.float64(d_Z),
-                np.float64(dt), np.float64(alpha),
-                np.float64(omega_p), np.float64(omega_theta),
-                np.int32(N_Z), np.int32(N_phi),
-                np.int32(pphi), np.int32(pz),
-            ),
-        )
-        _launch_bc(
-            bc_phi_kernel, bc_z_kernel,
-            P_new, theta_new, N_Z, N_phi,
-            bc_block, bc_grid_phi, bc_grid_z,
-            periodic_phi, periodic_z,
-            p_bc_phi0, p_bc_phiL, theta_bc_phi0, theta_bc_phiL,
-            p_bc_z0, p_bc_zL, theta_bc_z0, theta_bc_zL,
-        )
+        if scheme == "jacobi":
+            jac_kernel(
+                grid, block,
+                (
+                    P_old, P_new, theta_old, theta_new,
+                    H_curr_gpu, C_prev,
+                    A, B, C, D, E,
+                    np.float64(d_phi), np.float64(d_Z),
+                    np.float64(dt), np.float64(alpha),
+                    np.float64(omega_p), np.float64(omega_theta),
+                    np.int32(N_Z), np.int32(N_phi),
+                    np.int32(pphi), np.int32(pz),
+                ),
+            )
+            _launch_bc(
+                bc_phi_kernel, bc_z_kernel,
+                P_new, theta_new, N_Z, N_phi,
+                bc_block, bc_grid_phi, bc_grid_z,
+                periodic_phi, periodic_z,
+                p_bc_phi0, p_bc_phiL, theta_bc_phi0, theta_bc_phiL,
+                p_bc_z0, p_bc_zL, theta_bc_z0, theta_bc_zL,
+            )
+        else:
+            for color in (0, 1):
+                rb_kernel(
+                    grid, block,
+                    (
+                        P_old, theta_old,
+                        H_curr_gpu, C_prev,
+                        A, B, C, D, E,
+                        np.float64(d_phi), np.float64(d_Z),
+                        np.float64(dt), np.float64(alpha),
+                        np.float64(omega_p), np.float64(omega_theta),
+                        np.int32(N_Z), np.int32(N_phi),
+                        np.int32(pphi), np.int32(pz),
+                        np.int32(color),
+                    ),
+                )
+                _launch_bc(
+                    bc_phi_kernel, bc_z_kernel,
+                    P_old, theta_old, N_Z, N_phi,
+                    bc_block, bc_grid_phi, bc_grid_z,
+                    periodic_phi, periodic_z,
+                    p_bc_phi0, p_bc_phiL, theta_bc_phi0, theta_bc_phiL,
+                    p_bc_z0, p_bc_zL, theta_bc_z0, theta_bc_zL,
+                )
         n_inner += 1
 
+        residual_just_computed = False
         if k % check_every == 0 or k < 3:
-            dP = float(cp.sqrt(cp.sum((P_new - P_old) ** 2)))
-            dth = float(cp.sqrt(cp.sum((theta_new - theta_old) ** 2)))
-            residual = dP + dth
+            residual_just_computed = True
+            # For Jacobi the latest iterate is in (P_new, theta_new); for
+            # RB the latest iterate is in (P_old, theta_old) and the
+            # previous-iterate snapshot is in (P_new, theta_new).
+            if scheme == "jacobi":
+                dP_arr = P_new[1:-1, 1:-1] - P_old[1:-1, 1:-1]
+                dth_arr = theta_new[1:-1, 1:-1] - theta_old[1:-1, 1:-1]
+            else:
+                dP_arr = P_old[1:-1, 1:-1] - P_new[1:-1, 1:-1]
+                dth_arr = theta_old[1:-1, 1:-1] - theta_new[1:-1, 1:-1]
+
+            max_abs_dP = float(cp.max(cp.abs(dP_arr)))
+            max_abs_dth = float(cp.max(cp.abs(dth_arr)))
+            sum_dP2 = float(cp.sum(dP_arr * dP_arr))
+            sum_dth2 = float(cp.sum(dth_arr * dth_arr))
+
+            residual_linf = max(max_abs_dP, max_abs_dth)
+            residual_rms = float(np.sqrt((sum_dP2 + sum_dth2) / n_interior))
+            residual_l2_abs = float(np.sqrt(sum_dP2) + np.sqrt(sum_dth2))
+
+            primary = residual_linf if residual_norm == "linf" else residual_rms
             if verbose:
                 print(
-                    f"  [Ausas-dyn-GPU] inner={k:>5d}: residual={residual:.4e}, "
-                    f"dP={dP:.2e}, dth={dth:.2e}, maxP={float(cp.max(P_new)):.4e}"
+                    f"  [Ausas-dyn-GPU/{scheme}] inner={k:>5d}: "
+                    f"res_linf={residual_linf:.3e}  "
+                    f"res_rms={residual_rms:.3e}  "
+                    f"res_l2_abs={residual_l2_abs:.3e}  "
+                    f"maxP={float(cp.max(P_new if scheme == 'jacobi' else P_old)):.3e}"
                 )
+            if primary < tol and k > 2:
+                converged = True
 
-        P_old, P_new = P_new, P_old
-        theta_old, theta_new = theta_new, theta_old
+        if scheme == "jacobi":
+            P_old, P_new = P_new, P_old
+            theta_old, theta_new = theta_new, theta_old
+        else:
+            # Refresh the snapshot only when the NEXT iteration will run a
+            # residual check. Saves a full-array copy on every sweep.
+            if (k + 1) % check_every == 0 or (k + 1) < 3:
+                P_new[:] = P_old
+                theta_new[:] = theta_old
 
-        if residual < tol and k > 2:
+        # ------------------------------------------------------------------
+        # Debug-mode in-loop checks (Task 28). After the post-iteration
+        # swap (Jacobi) or in-place update (RB), the latest iterate is
+        # always in (P_old, theta_old) — so the check is buffer-uniform.
+        # ------------------------------------------------------------------
+        if debug_checks and not debug_abort:
+            do_debug_check = (
+                k >= debug_check_start_iter
+                and ((k - debug_check_start_iter) % debug_check_every == 0)
+            )
+
+            # Residual NaN/Inf is a real failure — flag it the moment it
+            # appears, regardless of debug_check_every cadence.
+            if residual_just_computed and not (
+                np.isfinite(residual_linf)
+                and np.isfinite(residual_rms)
+                and np.isfinite(residual_l2_abs)
+            ):
+                failure_meta.update(
+                    failure_kind="nonfinite_state",
+                    first_nan_field="residual",
+                    first_nan_index=None,
+                    first_nan_is_ghost=False,
+                    first_nan_is_axial_boundary=False,
+                    first_nan_is_phi_seam=False,
+                    nan_iter=int(k),
+                )
+                if debug_return_bad_state:
+                    P_bad_cpu = cp.asnumpy(P_old)
+                    theta_bad_cpu = cp.asnumpy(theta_old)
+                if debug_stop_on_nonfinite:
+                    debug_abort = True
+
+            if not debug_abort and do_debug_check:
+                state_violation = _check_state_gpu(
+                    P_old, theta_old, debug_p_eps, debug_theta_eps,
+                )
+                if state_violation is None:
+                    if debug_return_last_finite_state:
+                        last_finite_P_cpu = cp.asnumpy(P_old)
+                        last_finite_theta_cpu = cp.asnumpy(theta_old)
+                else:
+                    fkind, ffield, (fi, fj) = state_violation
+                    is_ghost, is_axial, is_seam = _classify_index(
+                        fi, fj, N_Z, N_phi
+                    )
+                    failure_meta.update(
+                        failure_kind=fkind,
+                        first_nan_field=ffield,
+                        first_nan_index=(int(fi), int(fj)),
+                        first_nan_is_ghost=is_ghost,
+                        first_nan_is_axial_boundary=is_axial,
+                        first_nan_is_phi_seam=is_seam,
+                        nan_iter=int(k),
+                    )
+                    if debug_return_bad_state:
+                        P_bad_cpu = cp.asnumpy(P_old)
+                        theta_bad_cpu = cp.asnumpy(theta_old)
+                    if debug_stop_on_nonfinite:
+                        debug_abort = True
+
+        if converged:
             if verbose:
                 print(
-                    f"  [Ausas-dyn-GPU] CONVERGED at inner={k}, "
-                    f"residual={residual:.4e}"
+                    f"  [Ausas-dyn-GPU/{scheme}] CONVERGED at inner={k}, "
+                    f"res_linf={residual_linf:.3e} res_rms={residual_rms:.3e}"
                 )
             break
 
-    P_cpu = cp.asnumpy(P_old)
-    theta_cpu = cp.asnumpy(theta_old)
-    return P_cpu, theta_cpu, float(residual), n_inner
+        if debug_abort:
+            break
+
+    # If we aborted on a debug failure with debug_return_last_finite_state
+    # set, prefer the snapshot to avoid leaking NaN into the result. Other
+    # paths return the latest GPU iterate.
+    if (
+        debug_checks
+        and failure_meta["failure_kind"] is not None
+        and debug_return_last_finite_state
+        and last_finite_P_cpu is not None
+    ):
+        P_cpu = last_finite_P_cpu
+        theta_cpu = last_finite_theta_cpu
+    else:
+        P_cpu = cp.asnumpy(P_old)
+        theta_cpu = cp.asnumpy(theta_old)
+
+    primary_residual = (
+        residual_linf if residual_norm == "linf" else residual_rms
+    )
+
+    if legacy_return:
+        return P_cpu, theta_cpu, float(primary_residual), n_inner
+
+    result = {
+        "P": P_cpu,
+        "theta": theta_cpu,
+        "residual": float(primary_residual),
+        "residual_linf": float(residual_linf),
+        "residual_rms": float(residual_rms),
+        "residual_l2_abs": float(residual_l2_abs),
+        "n_inner": int(n_inner),
+        "converged": bool(converged),
+    }
+    result.update(failure_meta)
+    if debug_return_bad_state and P_bad_cpu is not None:
+        result["P_bad"] = P_bad_cpu
+        result["theta_bad"] = theta_bad_cpu
+    return result
 
 
 # ===========================================================================

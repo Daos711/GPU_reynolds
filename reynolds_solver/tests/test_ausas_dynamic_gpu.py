@@ -157,7 +157,7 @@ def test_one_step_gpu_vs_cpu():
     # --- GPU kernel under test ---
     # Force the GPU loop to run the exact same number of sweeps as the CPU
     # reference (tol = -1 so the early-exit never triggers).
-    P_gpu, theta_gpu, residual, n_inner = ausas_unsteady_one_step_gpu(
+    out = ausas_unsteady_one_step_gpu(
         H_curr, H_prev, P_prev, theta_prev,
         dt, d_phi, d_Z, R, L,
         alpha=1.0,
@@ -168,8 +168,13 @@ def test_one_step_gpu_vs_cpu():
         theta_bc_z0=1.0, theta_bc_zL=1.0,
         periodic_phi=True,
         check_every=max(n_sweeps // 4, 1),
+        scheme="jacobi",       # bit-for-bit match to the CPU Jacobi ref
         verbose=False,
     )
+    P_gpu = out["P"]
+    theta_gpu = out["theta"]
+    residual = out["residual"]
+    n_inner = out["n_inner"]
 
     assert n_inner == n_sweeps, f"expected {n_sweeps} sweeps, got {n_inner}"
 
