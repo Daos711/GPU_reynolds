@@ -294,7 +294,16 @@ def solve_ausas_unsteady_pv_one_step_gpu(
                 (1.0 - pv_relax) * log_mu_old + pv_relax * log_mu_raw
             )
             mu_new_gpu = cp.exp(log_mu_new)
-            delta_log_mu = float(cp.max(cp.abs(log_mu_new - log_mu_old)))
+            # ТЗ-2 §4: cavitated cells (P = 0) must not retain artificial
+            # viscosity growth from prior full-film iterations. Reset
+            # mu = 1 wherever the current P is zero — mu_raw is already 1
+            # there by construction, so this only undoes the log-space
+            # blending lag from a previous full-film state.
+            cav_mask = P_cur_gpu < 1e-12
+            mu_new_gpu = cp.where(cav_mask, 1.0, mu_new_gpu)
+            delta_log_mu = float(
+                cp.max(cp.abs(cp.log(mu_new_gpu) - log_mu_old))
+            )
 
             # 3. Re-solve with the relaxed mu.
             result = ausas_unsteady_one_step_gpu(
