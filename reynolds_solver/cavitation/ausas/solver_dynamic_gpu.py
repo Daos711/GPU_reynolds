@@ -409,6 +409,7 @@ def ausas_unsteady_one_step_gpu(
     debug_return_last_finite_state: bool = True,
     debug_theta_eps: float = 1e-8,
     debug_p_eps: float = 1e-12,
+    mu_ratio=None,
 ):
     """
     Advance (P, θ) by one real time step Δt using the unsteady Ausas
@@ -550,6 +551,22 @@ def ausas_unsteady_one_step_gpu(
     C_prev = theta_prev_gpu * H_prev_gpu
 
     A, B, C, D, E = _build_coefficients_gpu(H_curr_gpu, d_phi, d_Z, R, L)
+
+    # Optional piezoviscosity injection. When mu_ratio is None the solver
+    # is bit-for-bit identical to the baseline. When mu_ratio is a
+    # (N_Z, N_phi) cp.ndarray, the Poiseuille / pressure-flow coefficients
+    # are divided by the face-averaged μ_ratio (conductance ∝ 1/μ); the
+    # Couette mass-transport and squeeze terms are NOT modified.
+    if mu_ratio is not None:
+        from reynolds_solver.piezoviscous.solver_piezoviscous import (
+            _apply_piezoviscosity,
+        )
+        mu_ratio_gpu = cp.asarray(mu_ratio, dtype=cp.float64)
+        if mu_ratio_gpu.shape != (N_Z, N_phi):
+            raise ValueError(
+                f"mu_ratio shape {mu_ratio_gpu.shape} != ({N_Z}, {N_phi})"
+            )
+        E = _apply_piezoviscosity(A, B, C, D, E, mu_ratio_gpu, N_Z, N_phi)
 
     # Coefficient finite check (debug only). The CUDA kernel divides by E
     # internally; a non-finite coefficient produces silent NaN propagation
